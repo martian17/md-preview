@@ -1,0 +1,15 @@
+pkgbase = md-preview-git
+	pkgdesc = A tiny Rust-based GitHub-style markdown previewer that dies after use.
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/yourusername/md-preview
+	arch = x86_64
+	license = MIT
+	makedepends = rust
+	makedepends = cargo
+	makedepends = git
+	depends = gcc-libs
+	source = git+https://github.com/yourusername/md-preview.git
+	sha256sums = SKIP
+
+pkgname = md-preview-git
