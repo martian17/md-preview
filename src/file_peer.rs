@@ -32,13 +32,22 @@
 //! its own event loop; that refactor touches only how the session is stored, not
 //! the ingest logic.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::diff::diff;
 use crate::doc::DocSession;
+
+/// Default maximum size, in bytes, of a file `sync_from_disk` will read.
+///
+/// `read_to_string` loads the whole file into memory, so an unbounded read of
+/// an attacker-supplied (or accidentally huge) file is an OOM/DoS vector
+/// (Security #4). 8 MiB comfortably covers any realistic Markdown document
+/// while refusing pathological inputs. Adjustable per-peer via
+/// [`FilePeer::set_max_file_size`].
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 8 * 1024 * 1024;
 
 /// Bridges a single on-disk file with a [`DocSession`]: ingests external saves
 /// into the session and writes the session's text back to the file.
@@ -63,10 +72,26 @@ pub struct FilePeer<S: DocSession> {
     /// Sender handed to the watcher closure. Stored so [`FilePeer::watch`] can
     /// clone it into the closure; held here to keep the channel open.
     tx: mpsc::Sender<()>,
+    /// Confinement root, if this peer was built via [`FilePeer::within`]. When
+    /// `Some`, `target` is re-validated to be inside this canonical directory
+    /// before every read (Security #1–#3). `None` for the trusted-local
+    /// [`FilePeer::new`] constructor, which performs no confinement.
+    root: Option<PathBuf>,
+    /// Maximum size, in bytes, of a file `sync_from_disk` will read
+    /// (Security #4). Defaults to [`DEFAULT_MAX_FILE_SIZE`].
+    max_file_size: u64,
 }
 
 impl<S: DocSession> FilePeer<S> {
     /// Create a peer for `path`, taking ownership of `session`.
+    ///
+    /// **NON-CONFINING / trusted-local constructor.** This performs *no* path
+    /// confinement: it canonicalizes only the parent directory and re-attaches
+    /// the file name verbatim, so the final component is never fully resolved.
+    /// It is appropriate only when the path is already trusted (the Phase-1 CLI,
+    /// where the user names the file directly). A network-facing daemon serving
+    /// caller-supplied paths MUST use [`FilePeer::within`] instead, which
+    /// resolves and confines the full path (Security #1–#3).
     ///
     /// The file need not exist yet (a watch on the parent directory will pick up
     /// its later creation); only the parent directory must exist so the path can
@@ -103,7 +128,90 @@ impl<S: DocSession> FilePeer<S> {
             watcher: None,
             rx,
             tx,
+            root: None,
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
         })
+    }
+
+    /// Create a **confined** peer for `relative` resolved under `root`, taking
+    /// ownership of `session`.
+    ///
+    /// This is the confinement-aware constructor a network-facing daemon must
+    /// use for caller-supplied paths (Security #1–#3). `relative` is joined onto
+    /// `root` and the *fully resolved* path — including the final component — is
+    /// checked to stay inside the canonical `root`.
+    ///
+    /// ## Confinement guarantee
+    /// On success, the peer's [`target`](FilePeer::path) is guaranteed to denote
+    /// a location **inside the canonical `root`** at the moment of construction,
+    /// with no traversal or symlink escape:
+    /// - `root` itself must exist and is canonicalized (all symlinks and `..`
+    ///   resolved). A non-existent or non-directory root is rejected.
+    /// - If the target **exists**, it is canonicalized in full (final component
+    ///   included, so a symlink whose target lies outside `root` is rejected)
+    ///   and must be a strict descendant of the canonical `root`.
+    /// - If the target **does not exist yet** (it may be created later, e.g. by
+    ///   an atomic-rename save), its *parent* directory is canonicalized in full
+    ///   and must be inside `root`, and the final component is required to be a
+    ///   single plain file name (no `.`, `..`, or separators). Thus the path at
+    ///   which the file will appear cannot escape `root`.
+    /// - `..` components in `relative` that would climb above `root` are
+    ///   rejected, as are absolute `relative` paths that point elsewhere.
+    ///
+    /// ## What this does NOT guarantee (documented follow-up)
+    /// The check is a point-in-time validation against a path. It does **not**
+    /// close the TOCTOU window (Security #3): between this check and a later
+    /// read, an attacker with write access to an intermediate directory could
+    /// swap a component for a symlink. [`sync_from_disk`](FilePeer::sync_from_disk)
+    /// re-validates containment cheaply before each read to shrink that window,
+    /// but full hardening (holding a directory fd and using `openat` /
+    /// `O_NOFOLLOW` on the final component) is a deliberate follow-up, tracked in
+    /// the security findings.
+    pub fn within(
+        root: impl AsRef<Path>,
+        relative: impl AsRef<Path>,
+        session: S,
+    ) -> std::io::Result<Self> {
+        let root = root.as_ref().canonicalize()?;
+        if !root.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "confinement root is not a directory",
+            ));
+        }
+
+        let target = resolve_within(&root, relative.as_ref())?;
+
+        // The watched parent is the (canonical) directory containing the target.
+        // `target` is `root` or a descendant of it, so it always has a parent.
+        let parent = target
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.clone());
+
+        let (tx, rx) = mpsc::channel();
+
+        Ok(Self {
+            session,
+            target,
+            parent,
+            watcher: None,
+            rx,
+            tx,
+            root: Some(root),
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
+        })
+    }
+
+    /// Set the maximum size, in bytes, of a file [`sync_from_disk`] will read
+    /// (Security #4). Defaults to [`DEFAULT_MAX_FILE_SIZE`].
+    pub fn set_max_file_size(&mut self, max: u64) {
+        self.max_file_size = max;
+    }
+
+    /// The maximum file size, in bytes, this peer will read.
+    pub fn max_file_size(&self) -> u64 {
+        self.max_file_size
     }
 
     /// The canonical path of the watched file.
@@ -137,6 +245,40 @@ impl<S: DocSession> FilePeer<S> {
     /// change will arrive with the next event once the rename completes. Other
     /// I/O errors are propagated.
     pub fn sync_from_disk(&mut self) -> std::io::Result<bool> {
+        // Re-validate containment before every read (Security #3, cheap pass).
+        // For a confined peer, confirm the target still resolves inside `root`;
+        // a swapped symlink or moved parent is rejected rather than followed.
+        // This shrinks but does not fully close the TOCTOU window — see the
+        // `within` docs for the openat/O_NOFOLLOW follow-up.
+        if let Some(root) = &self.root {
+            match resolve_within(root, &self.target) {
+                Ok(_) => {}
+                // Target absent (mid atomic-rename / not yet created) is fine and
+                // handled by the read below; only a *containment* violation is an
+                // error here.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Size cap (Security #4): stat before reading so a multi-GB file cannot
+        // OOM us via `read_to_string`. A missing file is tolerated below.
+        match std::fs::metadata(&self.target) {
+            Ok(meta) if meta.len() > self.max_file_size => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::FileTooLarge,
+                    format!(
+                        "file is {} bytes, exceeds max of {} bytes",
+                        meta.len(),
+                        self.max_file_size
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        }
+
         let contents = match std::fs::read_to_string(&self.target) {
             Ok(c) => c,
             // File momentarily gone during a rename, or not yet created: not an
@@ -247,6 +389,78 @@ impl<S: DocSession> FilePeer<S> {
         }
         Ok(())
     }
+}
+
+/// Resolve `relative` under the already-canonical `root` and assert the result
+/// stays inside `root`. Returns the confined canonical target path.
+///
+/// `root` MUST already be canonical (as produced by [`Path::canonicalize`]).
+/// See [`FilePeer::within`] for the full confinement guarantee. On a
+/// containment violation this returns an `io::Error` with kind
+/// [`std::io::ErrorKind::PermissionDenied`]; a not-yet-existing *parent* surfaces
+/// as the underlying error (typically `NotFound`).
+fn resolve_within(root: &Path, relative: &Path) -> std::io::Result<PathBuf> {
+    let escaped = || {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path escapes the confinement root",
+        )
+    };
+
+    // Build the candidate path. An absolute `relative` is allowed only if it is
+    // itself under `root`; otherwise join it onto `root`. Lexically reject any
+    // `..` that would climb above `root` *before* touching the filesystem, so a
+    // traversal attempt never even gets canonicalized.
+    let joined: PathBuf = if relative.is_absolute() {
+        if !relative.starts_with(root) {
+            return Err(escaped());
+        }
+        relative.to_path_buf()
+    } else {
+        let mut p = root.to_path_buf();
+        let mut depth: isize = 0;
+        for comp in relative.components() {
+            match comp {
+                Component::Normal(c) => {
+                    depth += 1;
+                    p.push(c);
+                }
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return Err(escaped());
+                    }
+                    p.pop();
+                }
+                // A root/prefix component inside a "relative" path is malformed
+                // for our purposes — refuse rather than guess.
+                Component::RootDir | Component::Prefix(_) => return Err(escaped()),
+            }
+        }
+        p
+    };
+
+    // If the full target exists, canonicalize it (final component included, so a
+    // symlink pointing outside `root` is caught) and confirm containment.
+    if joined.exists() {
+        let canon = joined.canonicalize()?;
+        if canon == *root || canon.starts_with(root) {
+            return Ok(canon);
+        }
+        return Err(escaped());
+    }
+
+    // Target does not exist yet: canonicalize its parent (which must exist and
+    // be inside `root`) and require the final component to be a single plain
+    // file name, so the eventual path cannot escape.
+    let parent = joined.parent().ok_or_else(escaped)?;
+    let file_name = joined.file_name().ok_or_else(escaped)?;
+    let canon_parent = parent.canonicalize()?;
+    if canon_parent != *root && !canon_parent.starts_with(root) {
+        return Err(escaped());
+    }
+    Ok(canon_parent.join(file_name))
 }
 
 #[cfg(test)]
@@ -400,5 +614,82 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(converged, "watcher should converge within 2s");
+    }
+
+    // --- Confinement & size-cap tests (Security #1–#4) -------------------
+
+    /// `within` accepts a file that resolves inside the root.
+    #[test]
+    fn within_accepts_in_root_file() {
+        let dir = TempDir::new("within-ok");
+        std::fs::write(dir.file("doc.md"), "hi").unwrap();
+
+        let peer = FilePeer::within(&dir.path, "doc.md", YrsSession::from_text("")).unwrap();
+        // Target is the canonical in-root path.
+        assert_eq!(peer.path(), dir.path.canonicalize().unwrap().join("doc.md"));
+    }
+
+    /// `within` accepts a not-yet-existing file whose parent is in-root.
+    #[test]
+    fn within_accepts_nonexistent_in_root_file() {
+        let dir = TempDir::new("within-new");
+        let peer = FilePeer::within(&dir.path, "later.md", YrsSession::from_text("")).unwrap();
+        assert_eq!(peer.path(), dir.path.canonicalize().unwrap().join("later.md"));
+    }
+
+    /// `within` rejects a `../` traversal that climbs above the root.
+    #[test]
+    fn within_rejects_parent_traversal() {
+        let dir = TempDir::new("within-trav");
+        let err = match FilePeer::within(&dir.path, "../escape.md", YrsSession::from_text("")) {
+            Ok(_) => panic!("traversal must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    /// `within` rejects a symlink whose target lies outside the root.
+    #[test]
+    fn within_rejects_symlink_escape() {
+        let dir = TempDir::new("within-sym");
+        // An "outside" directory with a secret file, sibling to the root.
+        let outside = TempDir::new("within-sym-out");
+        let secret = outside.file("secret.md");
+        std::fs::write(&secret, "top secret").unwrap();
+
+        // A symlink *inside* root pointing at the outside file.
+        let link = dir.file("link.md");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let err = match FilePeer::within(&dir.path, "link.md", YrsSession::from_text("")) {
+            Ok(_) => panic!("symlink escape must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    /// The size cap refuses a file over the limit and allows one under it.
+    #[test]
+    fn size_cap_refuses_over_limit_allows_under() {
+        let dir = TempDir::new("cap");
+        let file = dir.file("doc.md");
+        std::fs::write(&file, "small").unwrap();
+
+        let mut peer = FilePeer::new(&file, YrsSession::from_text("")).unwrap();
+        peer.set_max_file_size(8);
+        assert_eq!(peer.max_file_size(), 8);
+
+        // 5 bytes <= 8: reads fine, ingests the change.
+        assert!(peer.sync_from_disk().unwrap());
+        assert_eq!(peer.session().text(), "small");
+
+        // Now exceed the cap (16 bytes > 8): refused, no OOM, clear error.
+        std::fs::write(&file, "0123456789abcdef").unwrap();
+        let err = peer
+            .sync_from_disk()
+            .expect_err("over-limit file must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+        // Session unchanged — the oversized contents were never applied.
+        assert_eq!(peer.session().text(), "small");
     }
 }
