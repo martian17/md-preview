@@ -1,8 +1,69 @@
 use pulldown_cmark::{Parser, Event, Tag, TagEnd};
 use pulldown_cmark::Options;
+use std::io::Cursor;
 use syntect::parsing::SyntaxSet;
-use syntect::html::highlighted_html_for_string;
-use syntect::highlighting::ThemeSet;
+use syntect::highlighting::{Color, ThemeSet};
+use syntect::html::{css_for_theme_with_class_style, ClassStyle, ClassedHTMLGenerator};
+use syntect::util::LinesWithEndings;
+
+/// Class prefix for syntect's highlight classes. Shared by the HTML generator
+/// and the generated CSS so the markup and stylesheet stay in sync.
+const HL_PREFIX: &str = "hl-";
+
+/// GitHub's official TextMate themes (from primer/github-textmate-theme),
+/// embedded so the binary stays self-contained. We only use them to generate
+/// CSS — class-based highlighting itself is theme-independent.
+const GITHUB_LIGHT_THEME: &str = include_str!("../themes/github-light.tmTheme");
+const GITHUB_DARK_THEME: &str = include_str!("../themes/github-dark.tmTheme");
+
+/// GitHub-style "copy code" button. Holds both the copy and check octicons; the
+/// `.copied` class (toggled by JS on click) swaps which one is visible. The
+/// click handler reads the sibling <pre><code> text, so no code is duplicated
+/// into an attribute.
+const COPY_BUTTON: &str = r##"<button class="copy-btn" type="button" aria-label="Copy code to clipboard" title="Copy">
+<svg class="octicon octicon-copy" aria-hidden="true" height="16" width="16" viewBox="0 0 16 16"><path d="M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z"></path><path d="M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z"></path></svg>
+<svg class="octicon octicon-check" aria-hidden="true" height="16" width="16" viewBox="0 0 16 16"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"></path></svg>
+</button>"##;
+
+/// Format a syntect color as `#rrggbb`, or `inherit` if the theme omits it.
+fn hex(c: Option<Color>) -> String {
+    match c {
+        Some(c) => format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b),
+        None => "inherit".to_string(),
+    }
+}
+
+/// Build the code-highlighting CSS: GitHub Light as the default, GitHub Dark
+/// inside a `prefers-color-scheme: dark` media query. Both themes emit the same
+/// `hl-` class names, so the dark block simply overrides in dark mode — one
+/// server render, theme chosen by the browser (the way GitHub itself does it).
+fn syntax_css() -> String {
+    let style = ClassStyle::SpacedPrefixed { prefix: HL_PREFIX };
+    let light = ThemeSet::load_from_reader(&mut Cursor::new(GITHUB_LIGHT_THEME))
+        .expect("bundled light theme is valid");
+    let dark = ThemeSet::load_from_reader(&mut Cursor::new(GITHUB_DARK_THEME))
+        .expect("bundled dark theme is valid");
+    let light_css =
+        css_for_theme_with_class_style(&light, style).expect("generate light CSS");
+    let dark_css =
+        css_for_theme_with_class_style(&dark, style).expect("generate dark CSS");
+    // Explicit <pre> background/foreground, specific enough to beat
+    // github-markdown-css's `.markdown-body pre` rule (syntect's own `.hl-code`
+    // rule has lower specificity and would otherwise lose).
+    //
+    // GitHub backs code blocks with --bgColor-muted (canvas-subtle), NOT the
+    // editor canvas baked into the tmTheme: #f6f8fa light / #161b22 dark, per
+    // github-markdown-css 5.x. We keep each theme's own text color.
+    let l_fg = hex(light.settings.foreground);
+    let d_fg = hex(dark.settings.foreground);
+    let (l_bg, d_bg) = ("#f6f8fa", "#161b22");
+    format!(
+        "{light_css}\n\
+         .markdown-body pre.hl-code {{ background-color: {l_bg}; color: {l_fg}; }}\n\
+         @media (prefers-color-scheme: dark) {{\n{dark_css}\n\
+         .markdown-body pre.hl-code {{ background-color: {d_bg}; color: {d_fg}; }}\n}}\n"
+    )
+}
 
 /// Minimal HTML escaping for text placed inside the <math-renderer> element.
 /// The frontend reads `this.textContent`, which decodes these back to raw TeX
@@ -31,9 +92,6 @@ fn math_renderer(tex: &str, display: bool) -> String {
 
 fn render_markdown(markdown_input: &str) -> String {
     let ps = SyntaxSet::load_defaults_newlines();
-    let ts = ThemeSet::load_defaults();
-    // Use a theme like "Base16 Ocean" or a custom GitHub-like theme
-    let theme = &ts.themes["base16-ocean.dark"];
 
     // GFM + math options. ENABLE_MATH turns `$...$` into Event::InlineMath
     // and `$$...$$` into Event::DisplayMath.
@@ -71,10 +129,31 @@ fn render_markdown(markdown_input: &str) -> String {
                         // TeX as text, not KaTeX. (Inline $...$ / display $$...$$
                         // are what get math-rendered.)
                         pulldown_cmark::CodeBlockKind::Fenced(lang) => {
-                            // Server-computed syntax highlighting
-                            let syntax = ps.find_syntax_by_token(lang).unwrap_or_else(|| ps.find_syntax_plain_text());
-                            let highlighted = highlighted_html_for_string(&text, &ps, syntax, theme).unwrap();
-                            Event::Html(highlighted.into())
+                            // GitHub-style class-based highlighting: emit
+                            // <span class="hl-..."> markup with NO inline colors.
+                            // The colors live in the light/dark CSS injected in
+                            // <head>, so code blocks follow prefers-color-scheme.
+                            let syntax = ps
+                                .find_syntax_by_token(lang)
+                                .unwrap_or_else(|| ps.find_syntax_plain_text());
+                            let mut hl = ClassedHTMLGenerator::new_with_class_style(
+                                syntax,
+                                &ps,
+                                ClassStyle::SpacedPrefixed { prefix: HL_PREFIX },
+                            );
+                            for line in LinesWithEndings::from(&text) {
+                                let _ = hl.parse_html_for_line_which_includes_newline(line);
+                            }
+                            // .code-wrap positions the copy button; the button's
+                            // click handler reads this <pre><code>'s text.
+                            Event::Html(
+                                format!(
+                                    "<div class=\"code-wrap\">{button}<pre class=\"hl-code\"><code>{code}</code></pre></div>",
+                                    button = COPY_BUTTON,
+                                    code = hl.finalize()
+                                )
+                                .into(),
+                            )
                         }
                         _ => Event::Text(text)
                     }
@@ -121,11 +200,37 @@ fn main() {
                     padding: 45px;
                 }}
                 @media (max-width: 767px) {{ .markdown-body {{ padding: 15px; }} }}
-                body {{ background-color: #0d1117; }} /* GitHub Dark Mode match */
+                /* Page background follows the system theme, like the code blocks. */
+                body {{ background-color: #ffffff; }}
+                @media (prefers-color-scheme: dark) {{ body {{ background-color: #0d1117; }} }}
+                /* Copy-code button, GitHub-style: top-right of each block,
+                   fades in on hover, swaps to a green check when copied. */
+                .code-wrap {{ position: relative; }}
+                .copy-btn {{
+                    position: absolute; top: 8px; right: 8px;
+                    display: inline-flex; align-items: center; justify-content: center;
+                    width: 28px; height: 28px; padding: 0;
+                    border: 1px solid transparent; border-radius: 6px;
+                    background: transparent; color: #656d76; cursor: pointer;
+                    opacity: 0; transition: opacity .1s, background-color .1s, border-color .1s;
+                }}
+                .code-wrap:hover .copy-btn, .copy-btn:focus {{ opacity: 1; }}
+                .copy-btn:hover {{ background-color: rgba(175,184,193,.2); border-color: rgba(175,184,193,.4); }}
+                .copy-btn .octicon-check {{ display: none; color: #1a7f37; }}
+                .copy-btn.copied {{ opacity: 1; }}
+                .copy-btn.copied .octicon-copy {{ display: none; }}
+                .copy-btn.copied .octicon-check {{ display: inline-block; }}
+                @media (prefers-color-scheme: dark) {{
+                    .copy-btn {{ color: #7d8590; }}
+                    .copy-btn:hover {{ background-color: rgba(99,110,123,.25); border-color: rgba(99,110,123,.4); }}
+                    .copy-btn .octicon-check {{ color: #3fb950; }}
+                }}
+                /* GitHub Light/Dark code highlighting, auto-switching. */
+{syntax_css}
             </style>
         </head>
         <body class="markdown-body">
-            {}
+            {content}
         <script type="module">
 import katex from 'https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.mjs';
 
@@ -149,10 +254,30 @@ class MathRenderer extends HTMLElement {{
 
 // Register the custom element
 customElements.define('math-renderer', MathRenderer);
+
+// Copy-code buttons: copy the sibling <pre><code> text, then flash the check.
+// navigator.clipboard works here because http://127.0.0.1 is a secure context.
+document.addEventListener('click', async (e) => {{
+    const btn = e.target.closest('.copy-btn');
+    if (!btn) return;
+    const code = btn.parentElement.querySelector('pre code');
+    try {{
+        await navigator.clipboard.writeText(code ? code.textContent : '');
+        btn.classList.add('copied');
+        btn.setAttribute('title', 'Copied!');
+        setTimeout(() => {{
+            btn.classList.remove('copied');
+            btn.setAttribute('title', 'Copy');
+        }}, 2000);
+    }} catch (err) {{
+        console.error('Copy failed:', err);
+    }}
+}});
         </script>
         </body>
         </html>"#,
-        html_output
+        syntax_css = syntax_css(),
+        content = html_output
     );
 
     let server = Server::http("127.0.0.1:0").unwrap();
