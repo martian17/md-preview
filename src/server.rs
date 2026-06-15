@@ -32,15 +32,29 @@
 //!   * an `Arc<Mutex<String>>` holding the latest rendered body so a fresh
 //!     `/view`/`/ws` can reflect the current state without touching the doc.
 //!
-//! ## Cross-file `.md` links
-//! The rendered HTML emits ordinary relative links (`<a href="other.md">`).
-//! Rather than rely on the browser resolving those against `/view?path=…` (which
-//! a query string breaks), the server rewrites in-document `.md` links to the
-//! `/view?path=<rel>` form in [`rewrite_md_links`]. Each link is resolved
+//! ## Cross-file `.md` links and local assets
+//! The rendered HTML emits ordinary relative URLs — both `<a href="other.md">`
+//! links and `<img src="pic.png">` (and other local) asset references. Rather
+//! than rely on the browser resolving those against `/view?path=…` (which a
+//! query string breaks), the server rewrites them in [`rewrite_doc_urls`]:
+//!   * relative `.md` links become `/view?path=<rel>` (a confined live page), and
+//!   * other relative asset URLs (`src="…"`, plus non-`.md` `href`s) become
+//!     `/asset?path=<rel>` (served read-only by the [`asset`](serve_asset) route).
+//!
+//! Both share one small attribute-rewrite pass: each candidate URL is resolved
 //! relative to the current document's directory and re-confined through
-//! [`FilePeer::within`]; a link that escapes the root is left untouched (it
-//! simply won't navigate to a confined view). The rewrite is the only post-
-//! processing of the otherwise-pure render; `render_markdown` stays unchanged.
+//! [`FilePeer::within`]; a URL that escapes the root is left untouched (it simply
+//! won't resolve to a confined target). The rewrite is the only post-processing
+//! of the otherwise-pure render; `render_markdown` stays unchanged.
+//!
+//! ## Sandboxed static assets
+//! [`GET /asset?path=<rel>`](serve_asset) serves local files referenced by the
+//! document (images, stylesheets, …) so they render in the live preview without
+//! a CDN. It mirrors `/view`'s confinement exactly: `<rel>` is resolved via
+//! [`FilePeer::within`] (traversal/symlink escapes are rejected), the existing
+//! [`DEFAULT_MAX_FILE_SIZE`] read cap is enforced, and the bytes are returned
+//! read-only with a `Content-Type` inferred from the file extension. It never
+//! follows a link outside the root and never writes.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -54,7 +68,7 @@ use warp::ws::{Message, WebSocket};
 use warp::Filter;
 
 use crate::doc::DocSession;
-use crate::file_peer::FilePeer;
+use crate::file_peer::{FilePeer, DEFAULT_MAX_FILE_SIZE};
 use crate::render_markdown;
 use crate::render_page_with;
 use crate::session::YrsSession;
@@ -174,6 +188,15 @@ fn routes(
         .and(warp::query::<PathQuery>())
         .map(move |q: PathQuery| view_page(&view_state, &q.path));
 
+    // GET /asset?path=<rel> -> raw bytes of a confined in-root file, read-only,
+    // with a Content-Type inferred from the extension (images, css, …).
+    let asset_state = state.clone();
+    let asset = warp::path("asset")
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<PathQuery>())
+        .map(move |q: PathQuery| serve_asset(&asset_state, &q.path));
+
     // GET /ws?path=<rel> -> WebSocket; forwards each new body fragment.
     let ws_state = state.clone();
     let ws = warp::path("ws")
@@ -185,7 +208,7 @@ fn routes(
             ws.on_upgrade(move |socket| client_ws(socket, st, q.path))
         });
 
-    health.or(view).or(ws)
+    health.or(view).or(asset).or(ws)
 }
 
 /// The `?path=<rel>` query both `/view` and `/ws` accept.
@@ -221,6 +244,90 @@ fn view_page(state: &AppState, rel: &str) -> warp::reply::Response {
     warp::reply::html(page).into_response()
 }
 
+/// Serve the raw bytes of a confined in-root file for `/asset?path=<rel>`.
+///
+/// Read-only, confined exactly like `/view`: `rel` is resolved through
+/// [`FilePeer::within`] (traversal/symlink escapes → 400, with no leak of
+/// whether a path exists), the existing [`DEFAULT_MAX_FILE_SIZE`] read cap is
+/// enforced (oversize → 413), and a missing file is a 404. On success the bytes
+/// are returned with a `Content-Type` inferred from the file extension
+/// ([`content_type_for`]). This never follows a link outside the root and never
+/// writes — it only lets local images/assets referenced by a document render in
+/// the live preview without a CDN.
+fn serve_asset(state: &AppState, rel: &str) -> warp::reply::Response {
+    use warp::http::StatusCode;
+    use warp::reply::Reply;
+
+    let status = |code| warp::reply::with_status("", code).into_response();
+
+    // Confine first: resolve the full path (final component included) under the
+    // root. A traversal/symlink escape is a 400, mirroring `/view`.
+    let canon = match FilePeer::within(&state.root, rel, YrsSession::from_text("")) {
+        Ok(peer) => peer.path().to_path_buf(),
+        Err(_) => return status(StatusCode::BAD_REQUEST),
+    };
+
+    // Size cap before reading (Security #4): stat so a huge file cannot OOM us.
+    match std::fs::metadata(&canon) {
+        Ok(meta) if meta.is_dir() => return status(StatusCode::NOT_FOUND),
+        Ok(meta) if meta.len() > DEFAULT_MAX_FILE_SIZE => {
+            return status(StatusCode::PAYLOAD_TOO_LARGE)
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return status(StatusCode::NOT_FOUND)
+        }
+        Err(_) => return status(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+
+    let bytes = match std::fs::read(&canon) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return status(StatusCode::NOT_FOUND)
+        }
+        Err(_) => return status(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+
+    warp::reply::with_header(bytes, "content-type", content_type_for(&canon)).into_response()
+}
+
+/// Infer a `Content-Type` from a file's extension (ASCII-case-insensitive).
+///
+/// Covers the common asset types a Markdown document references; anything
+/// unrecognised falls back to `application/octet-stream` (a safe default the
+/// browser will download rather than mis-render).
+fn content_type_for(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "bmp" => "image/bmp",
+        "avif" => "image/avif",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json",
+        "txt" => "text/plain; charset=utf-8",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "pdf" => "application/pdf",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        _ => "application/octet-stream",
+    }
+}
+
 /// The relative spelling to embed in the WS-client URL and link rewrites for a
 /// given canonical path: prefer the path relative to `root`, falling back to the
 /// caller's `rel` if (unexpectedly) the canonical path is not under root.
@@ -238,44 +345,59 @@ fn wrap_doc(body: &str) -> String {
     format!("<div id=\"doc\">{body}</div>")
 }
 
-/// Rewrite in-document links to other `.md` files into the `/view?path=<rel>`
-/// form so cross-file navigation lands on a confined live-preview page.
+/// Rewrite in-document relative URLs so cross-file links and local assets
+/// resolve to confined daemon routes:
+///   * a relative `href="…"` to a local `.md` file becomes
+///     `href="/view?path=<rel>"` (a confined live-preview page), and
+///   * a relative `src="…"`, or a relative non-`.md` `href="…"`, becomes
+///     `src/href="/asset?path=<rel>"` (the read-only [`serve_asset`] route).
 ///
 /// `body` is a rendered HTML fragment; `doc_rel` is the current document's path
-/// relative to `root` (e.g. `sub/a.md`). Each `href="…"` whose target is a
-/// local `.md` file is resolved **relative to the current document's directory**
-/// and re-confined via [`FilePeer::within`]. On success it becomes
-/// `href="/view?path=<confined-rel>"`; on a confinement failure (escape) or for
-/// non-`.md`/absolute/external links it is left exactly as-is.
+/// relative to `root` (e.g. `sub/a.md`). Each candidate URL is resolved
+/// **relative to the current document's directory** and re-confined via
+/// [`FilePeer::within`]. On a confinement failure (escape), or for
+/// absolute/external/`data:`/fragment-only URLs, the value is left exactly
+/// as-is.
 ///
 /// This is deliberately a small, targeted string rewrite over the pure render
 /// rather than a change to `render_markdown`: the renderer stays web-agnostic
-/// and byte-identical for the standalone use case.
-fn rewrite_md_links(body: &str, root: &Path, doc_rel: &str) -> String {
-    // Directory of the current document, relative to root, used to resolve the
-    // link target the same way a browser would resolve a relative href.
+/// and byte-identical for the standalone use case. `href` and `src` share one
+/// pass ([`rewrite_attr`]); they differ only in which daemon route a resolved
+/// URL maps to ([`rewritten_doc_url`]).
+fn rewrite_doc_urls(body: &str, root: &Path, doc_rel: &str) -> String {
+    // Directory of the current document, relative to root, used to resolve a
+    // URL the same way a browser would resolve a relative href/src.
     let doc_dir = Path::new(doc_rel).parent().map(Path::to_path_buf).unwrap_or_default();
+    // `src` always targets an asset; `href` may target a `.md` view or an asset.
+    let out = rewrite_attr(body, "href=\"", |u| rewritten_doc_url(u, root, &doc_dir, false));
+    rewrite_attr(&out, "src=\"", |u| rewritten_doc_url(u, root, &doc_dir, true))
+}
 
-    let needle = "href=\"";
+/// Find every `<attr>="<value>"` occurrence (`attr_open` is e.g. `href="`),
+/// run `f` on the value, and substitute its `Some(_)` replacement (leaving the
+/// value untouched on `None`). A malformed/unterminated value is emitted
+/// verbatim. Shared by the `href`/`src` rewrites so the scanning logic lives in
+/// one place.
+fn rewrite_attr(body: &str, attr_open: &str, mut f: impl FnMut(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(body.len());
     let mut rest = body;
 
-    while let Some(i) = rest.find(needle) {
-        // Emit everything up to and including the opening `href="`.
-        let start = i + needle.len();
+    while let Some(i) = rest.find(attr_open) {
+        // Emit everything up to and including the opening `<attr>="`.
+        let start = i + attr_open.len();
         out.push_str(&rest[..start]);
         let after = &rest[start..];
-        // The href value runs up to the next double quote.
+        // The value runs up to the next double quote.
         let Some(end) = after.find('"') else {
             // Malformed; emit the remainder verbatim and stop.
             out.push_str(after);
             return out;
         };
-        let href = &after[..end];
+        let value = &after[..end];
 
-        match rewritten_md_href(href, root, &doc_dir) {
-            Some(new_href) => out.push_str(&new_href),
-            None => out.push_str(href),
+        match f(value) {
+            Some(new_value) => out.push_str(&new_value),
+            None => out.push_str(value),
         }
         out.push('"');
 
@@ -285,30 +407,41 @@ fn rewrite_md_links(body: &str, root: &Path, doc_rel: &str) -> String {
     out
 }
 
-/// If `href` is a local `.md` link that resolves to a confined file, return its
-/// `/view?path=<rel>` replacement; otherwise `None` (leave the href unchanged).
-fn rewritten_md_href(href: &str, root: &Path, doc_dir: &Path) -> Option<String> {
+/// If `url` is a local relative URL that resolves to a confined in-root file,
+/// return its rewritten form; otherwise `None` (leave it unchanged).
+///
+/// A local `.md` target maps to `/view?path=<rel>` (a confined live page).
+/// Anything else — and any URL reached via a `src` attribute (`src_attr` true) —
+/// maps to `/asset?path=<rel>` (the read-only asset route). Absolute,
+/// external (`scheme:`/protocol-relative), `data:`, and fragment-only URLs are
+/// rejected (returns `None`).
+fn rewritten_doc_url(url: &str, root: &Path, doc_dir: &Path, src_attr: bool) -> Option<String> {
     // Skip empties, fragments, absolute-path, scheme/protocol-relative, and
-    // already-rewritten links. Only plain relative links are candidates.
-    if href.is_empty()
-        || href.starts_with('#')
-        || href.starts_with('/')
-        || href.contains("://")
-        || href.starts_with("//")
-        || href.starts_with("mailto:")
+    // already-rewritten URLs. Only plain relative URLs are candidates. The
+    // `://`/`scheme:` checks also cover `data:`, `mailto:`, `http:`, etc.
+    if url.is_empty()
+        || url.starts_with('#')
+        || url.starts_with('/')
+        || url.starts_with("//")
+        || has_uri_scheme(url)
     {
         return None;
     }
 
     // Split off any #fragment / ?query so we resolve just the path part, then
     // re-attach the suffix to the rewritten URL.
-    let (path_part, suffix) = match href.find(['#', '?']) {
-        Some(p) => (&href[..p], &href[p..]),
-        None => (href, ""),
+    let (path_part, suffix) = match url.find(['#', '?']) {
+        Some(p) => (&url[..p], &url[p..]),
+        None => (url, ""),
     };
-    if !path_part.to_ascii_lowercase().ends_with(".md") {
+    if path_part.is_empty() {
         return None;
     }
+
+    // An `href` to a `.md` file is a cross-file *view* link; everything else
+    // (all `src`, and non-`.md` `href`s) is a static *asset*.
+    let is_md = path_part.to_ascii_lowercase().ends_with(".md");
+    let route = if is_md && !src_attr { "/view" } else { "/asset" };
 
     // Resolve relative to the current document's directory, then confine.
     let candidate = doc_dir.join(path_part);
@@ -321,9 +454,30 @@ fn rewritten_md_href(href: &str, root: &Path, doc_dir: &Path) -> Option<String> 
         return None;
     }
 
-    // Build /view?path=<rel>, percent-encoding the path value, then re-attach
+    // Build <route>?path=<rel>, percent-encoding the path value, then re-attach
     // any fragment/query suffix (the fragment lets in-page anchors keep working).
-    Some(format!("/view?path={}{}", encode_query_value(&rel), suffix))
+    Some(format!("{}?path={}{}", route, encode_query_value(&rel), suffix))
+}
+
+/// Whether `url` begins with a URI scheme (`scheme:` per RFC 3986: an ASCII
+/// letter followed by letters/digits/`+`/`-`/`.`, then `:`). Catches `http:`,
+/// `https:`, `data:`, `mailto:`, `tel:`, etc. without matching a relative path
+/// like `a:b/c.png` would *not* — but a leading drive-like `c:` is rare in web
+/// URLs and treating it as a scheme (left untouched) is the safe choice.
+fn has_uri_scheme(url: &str) -> bool {
+    let mut chars = url.char_indices();
+    match chars.next() {
+        Some((_, c)) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    for (_, c) in chars {
+        match c {
+            ':' => return true,
+            c if c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.' => {}
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// Minimal percent-encoding for a query-string *value*: keep the unreserved set
@@ -454,9 +608,10 @@ async fn client_ws(ws: WebSocket, state: Arc<AppState>, rel: String) {
 /// thread (not `spawn_blocking`) keeps the blocking `notify`/`sync_from_disk`
 /// loop off tokio's worker pool entirely.
 ///
-/// The rendered fragment has cross-file `.md` links rewritten relative to this
-/// document (via [`rewrite_md_links`]) before it is cached/broadcast, so every
-/// consumer (initial `/view`, initial `/ws` frame, live updates) is consistent.
+/// The rendered fragment has cross-file `.md` links and local asset URLs
+/// rewritten relative to this document (via [`rewrite_doc_urls`]) before it is
+/// cached/broadcast, so every consumer (initial `/view`, initial `/ws` frame,
+/// live updates) is consistent.
 fn spawn_watch(
     root: PathBuf,
     target: PathBuf,
@@ -487,7 +642,7 @@ fn spawn_watch(
                 return;
             }
 
-            let render = |text: &str| rewrite_md_links(&render_markdown(text), &root, &doc_rel);
+            let render = |text: &str| rewrite_doc_urls(&render_markdown(text), &root, &doc_rel);
 
             // Initial render after `watch`'s catch-up sync. We cache the
             // *fragment* (inner HTML of #doc): both the cached value and every
@@ -600,23 +755,42 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_md_links_rewrites_relative_md_only() {
+    fn rewrite_doc_urls_rewrites_relative_md_only_for_href() {
         let dir = temp_dir("rw");
         std::fs::write(dir.join("a.md"), "a").unwrap();
         std::fs::write(dir.join("b.md"), "b").unwrap();
+        std::fs::write(dir.join("img.png"), "PNG").unwrap();
 
         let body = r##"<a href="b.md">B</a> <a href="https://x/y.md">ext</a> <a href="#frag">f</a> <a href="img.png">i</a>"##;
-        let out = rewrite_md_links(body, &dir, "a.md");
-        assert!(out.contains(r#"href="/view?path=b.md""#), "local .md rewritten: {out}");
+        let out = rewrite_doc_urls(body, &dir, "a.md");
+        assert!(out.contains(r#"href="/view?path=b.md""#), "local .md href -> /view: {out}");
         assert!(out.contains(r#"href="https://x/y.md""#), "external left alone");
         assert!(out.contains(r##"href="#frag""##), "fragment left alone");
-        assert!(out.contains(r#"href="img.png""#), "non-md left alone");
+        // A non-.md href to an in-root file is an asset link, not a view link.
+        assert!(out.contains(r#"href="/asset?path=img.png""#), "non-md href -> /asset: {out}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn rewrite_md_links_resolves_relative_to_doc_dir_and_confines() {
+    fn rewrite_doc_urls_rewrites_img_src_to_asset() {
+        let dir = temp_dir("rwimg");
+        std::fs::write(dir.join("pic.png"), "PNG").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/inner.png"), "PNG").unwrap();
+
+        let body = r#"<img src="pic.png" alt="x"> <img src="sub/inner.png"> <img src="https://cdn/x.png"> <img src="data:image/png;base64,AAAA">"#;
+        let out = rewrite_doc_urls(body, &dir, "a.md");
+        assert!(out.contains(r#"src="/asset?path=pic.png""#), "relative img -> /asset: {out}");
+        assert!(out.contains(r#"src="/asset?path=sub/inner.png""#), "nested img -> /asset: {out}");
+        assert!(out.contains(r#"src="https://cdn/x.png""#), "external img left alone: {out}");
+        assert!(out.contains(r#"src="data:image/png;base64,AAAA""#), "data: URL left alone: {out}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewrite_doc_urls_resolves_relative_to_doc_dir_and_confines() {
         let dir = temp_dir("rwsub");
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("top.md"), "t").unwrap();
@@ -624,21 +798,120 @@ mod tests {
 
         // From sub/child.md, "../top.md" resolves to top.md (in-root) -> rewritten.
         let body = r#"<a href="../top.md">up</a> <a href="../../etc/passwd.md">escape</a>"#;
-        let out = rewrite_md_links(body, &dir, "sub/child.md");
+        let out = rewrite_doc_urls(body, &dir, "sub/child.md");
         assert!(out.contains(r#"href="/view?path=top.md""#), "in-root parent link rewritten: {out}");
         // The escape attempt is left untouched (within() rejected it).
         assert!(out.contains(r#"href="../../etc/passwd.md""#), "escape left as-is: {out}");
+
+        // An asset src that escapes the root is likewise left untouched.
+        let asset = rewrite_doc_urls(r#"<img src="../../etc/passwd">"#, &dir, "sub/child.md");
+        assert!(asset.contains(r#"src="../../etc/passwd""#), "asset escape left as-is: {asset}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn rewrite_md_links_preserves_fragment_suffix() {
+    fn rewrite_doc_urls_preserves_fragment_suffix() {
         let dir = temp_dir("rwfrag");
         std::fs::write(dir.join("a.md"), "a").unwrap();
         std::fs::write(dir.join("b.md"), "b").unwrap();
-        let out = rewrite_md_links(r#"<a href="b.md#section">x</a>"#, &dir, "a.md");
+        let out = rewrite_doc_urls(r#"<a href="b.md#section">x</a>"#, &dir, "a.md");
         assert!(out.contains(r#"href="/view?path=b.md#section""#), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn content_type_for_infers_by_extension() {
+        assert_eq!(content_type_for(Path::new("pic.png")), "image/png");
+        assert_eq!(content_type_for(Path::new("a.JPG")), "image/jpeg");
+        assert_eq!(content_type_for(Path::new("a.jpeg")), "image/jpeg");
+        assert_eq!(content_type_for(Path::new("logo.svg")), "image/svg+xml");
+        assert_eq!(content_type_for(Path::new("anim.gif")), "image/gif");
+        assert_eq!(content_type_for(Path::new("x.webp")), "image/webp");
+        assert_eq!(content_type_for(Path::new("style.css")), "text/css; charset=utf-8");
+        // Unknown / no extension -> safe default.
+        assert_eq!(content_type_for(Path::new("blob.xyz")), "application/octet-stream");
+        assert_eq!(content_type_for(Path::new("noext")), "application/octet-stream");
+    }
+
+    #[test]
+    fn has_uri_scheme_detects_schemes_not_relative_paths() {
+        assert!(has_uri_scheme("https://x/y"));
+        assert!(has_uri_scheme("data:image/png;base64,AAAA"));
+        assert!(has_uri_scheme("mailto:a@b"));
+        assert!(!has_uri_scheme("pic.png"));
+        assert!(!has_uri_scheme("sub/pic.png"));
+        assert!(!has_uri_scheme("../up/pic.png"));
+        assert!(!has_uri_scheme(""));
+    }
+
+    #[tokio::test]
+    async fn serve_asset_serves_in_root_file_with_content_type() {
+        let dir = temp_dir("asset-ok");
+        // A tiny PNG-like payload; only the bytes + content-type matter here.
+        let bytes: &[u8] = b"\x89PNG\r\n\x1a\nfake-image-bytes";
+        std::fs::write(dir.join("pic.png"), bytes).unwrap();
+        let state = AppState::new(dir.clone());
+
+        let resp = serve_asset(&state, "pic.png");
+        assert_eq!(resp.status(), warp::http::StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "image/png",
+            "png served with image/png"
+        );
+        let body = warp::hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        assert_eq!(&body[..], bytes, "served bytes match the file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_asset_rejects_traversal_and_missing() {
+        let dir = temp_dir("asset-bad");
+        let state = AppState::new(dir.clone());
+
+        // `../` traversal escape -> 400 (confinement failure).
+        let trav = serve_asset(&state, "../etc/passwd");
+        assert_eq!(trav.status(), warp::http::StatusCode::BAD_REQUEST);
+
+        // Absolute path elsewhere -> 400.
+        let abs = serve_asset(&state, "/etc/passwd");
+        assert_eq!(abs.status(), warp::http::StatusCode::BAD_REQUEST);
+
+        // In-root but nonexistent -> 404.
+        let missing = serve_asset(&state, "nope.png");
+        assert_eq!(missing.status(), warp::http::StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_asset_refuses_over_size_cap() {
+        let dir = temp_dir("asset-big");
+        // One byte over the default read cap.
+        let big = vec![b'x'; (DEFAULT_MAX_FILE_SIZE + 1) as usize];
+        std::fs::write(dir.join("big.bin"), &big).unwrap();
+        let state = AppState::new(dir.clone());
+
+        let resp = serve_asset(&state, "big.bin");
+        assert_eq!(
+            resp.status(),
+            warp::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "oversize asset refused before read"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn img_rewrite_through_render_produces_asset_url() {
+        // The img-rewrite called out in the verification plan, exercised over a
+        // real render: `![x](pic.png)` -> `<img src="/asset?path=pic.png">`.
+        let dir = temp_dir("imgrender");
+        std::fs::write(dir.join("pic.png"), b"PNG").unwrap();
+        let body = rewrite_doc_urls(&render_markdown("![x](pic.png)"), &dir, "doc.md");
+        assert!(body.contains(r#"src="/asset?path=pic.png""#), "{body}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
