@@ -2,6 +2,14 @@
 
 A dead simple Markdown preview command-line tool. Converts a `.md` file to GitHub-flavored HTML, serves it on a local port, and opens it in your browser — then exits.
 
+Features:
+
+- **GitHub-flavored Markdown** — tables, strikethrough, task lists, footnotes
+- **TeX math** — inline `$...$` and display `$$...$$`, rendered with KaTeX
+- **Syntax highlighting** — class-based, with bundled GitHub Light/Dark themes
+- **Copy-code buttons** on every code block
+- **Auto light/dark** — page, code, and math follow your system `prefers-color-scheme`
+
 ## Usage
 
 ```bash
@@ -60,16 +68,20 @@ If the browser fails to open for any reason, the URL is printed to stdout so you
 ## How it works
 
 1. Reads the Markdown file from the argument
-2. Converts it to HTML using `pulldown-cmark` with GFM extensions (tables, strikethrough, task lists, footnotes)
-3. Wraps the output in a GitHub dark-mode styled template (via `github-markdown-css`)
-4. Starts an HTTP server on an ephemeral port
-5. Opens the URL in your default browser
-6. Serves the page, then exits
+2. Converts it to HTML using `pulldown-cmark` with GFM extensions (tables, strikethrough, task lists, footnotes) plus math (`$...$`, `$$...$$`)
+3. Highlights code blocks server-side with `syntect`, emitting class-based markup styled by bundled GitHub Light/Dark themes
+4. Wraps the output in a `github-markdown-css` template that auto-switches light/dark via `prefers-color-scheme`; math is rendered in the browser by KaTeX
+5. Starts an HTTP server on an ephemeral port
+6. Opens the URL in your default browser
+7. Serves the page, then exits
+
+> Markdown styling (`github-markdown-css`) and math (KaTeX) load from a CDN, so rendering those needs an internet connection. Syntax-highlight themes are bundled into the binary and work offline.
 
 ## Dependencies
 
 | Crate | Purpose |
 |---|---|
-| `pulldown-cmark` | Fast GFM-compatible Markdown parser |
+| `pulldown-cmark` | Fast GFM-compatible Markdown parser (with math extension) |
+| `syntect` | Syntax highlighting (class-based HTML + theme CSS) |
 | `tiny_http` | Minimal HTTP server |
 | `webbrowser` | Cross-platform browser launcher |
