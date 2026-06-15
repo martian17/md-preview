@@ -14,6 +14,14 @@ use syntect::html::{css_for_theme_with_class_style, ClassStyle, ClassedHTMLGener
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+// Real-time collaborative editing (see ~/.claude/plans/inherited-rolling-finch.md).
+// The renderer above stays pure and reusable; these modules add the document
+// model behind a stable contract (`doc::DocSession`).
+pub mod doc;
+pub mod diff;
+pub mod file_peer;
+pub mod session;
+
 /// Class prefix for syntect's highlight classes. Shared by the HTML generator
 /// and the generated CSS so the markup and stylesheet stay in sync.
 const HL_PREFIX: &str = "hl-";
