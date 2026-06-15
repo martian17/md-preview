@@ -85,3 +85,7 @@ If the browser fails to open for any reason, the URL is printed to stdout so you
 | `syntect` | Syntax highlighting (class-based HTML + theme CSS) |
 | `tiny_http` | Minimal HTTP server |
 | `webbrowser` | Cross-platform browser launcher |
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). Copyright 2026 Yutaro Yoshii.
