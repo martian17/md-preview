@@ -185,8 +185,8 @@ fn routes(
     let view = warp::path("view")
         .and(warp::path::end())
         .and(warp::get())
-        .and(warp::query::<PathQuery>())
-        .map(move |q: PathQuery| view_page(&view_state, &q.path));
+        .and(warp::query::<ViewQuery>())
+        .map(move |q: ViewQuery| view_page(&view_state, &q.path, q.view.as_deref()));
 
     // GET /asset?path=<rel> -> raw bytes of a confined in-root file, read-only,
     // with a Content-Type inferred from the extension (images, css, …).
@@ -196,6 +196,32 @@ fn routes(
         .and(warp::get())
         .and(warp::query::<PathQuery>())
         .map(move |q: PathQuery| serve_asset(&asset_state, &q.path));
+
+    // GET /raw?path=<rel> -> the confined file's raw Markdown source as
+    // text/plain, so the in-browser editor can load it. Confined exactly like
+    // /view (traversal/symlink escape → 400, size cap → 413, missing → 404).
+    let raw_state = state.clone();
+    let raw = warp::path("raw")
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<PathQuery>())
+        .map(move |q: PathQuery| serve_raw(&raw_state, &q.path));
+
+    // POST /save?path=<rel> (body = new Markdown) -> write it to the confined
+    // file via the FilePeer write path. The watch loop ingests our write
+    // (content-compare guard), re-renders, and broadcasts → preview updates.
+    // A WRITE endpoint: confined + size-limited strictly (escape → 400,
+    // oversize → 413). Body capped at the read size limit before writing.
+    let save_state = state.clone();
+    let save = warp::path("save")
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::query::<PathQuery>())
+        .and(warp::body::content_length_limit(DEFAULT_MAX_FILE_SIZE))
+        .and(warp::body::bytes())
+        .map(move |q: PathQuery, body: warp::hyper::body::Bytes| {
+            save_doc(&save_state, &q.path, &body)
+        });
 
     // GET /ws?path=<rel> -> WebSocket; forwards each new body fragment.
     let ws_state = state.clone();
@@ -208,13 +234,23 @@ fn routes(
             ws.on_upgrade(move |socket| client_ws(socket, st, q.path))
         });
 
-    health.or(view).or(asset).or(ws)
+    health.or(view).or(asset).or(raw).or(save).or(ws)
 }
 
-/// The `?path=<rel>` query both `/view` and `/ws` accept.
+/// The `?path=<rel>` query `/ws`, `/asset`, `/raw`, and `/save` accept.
 #[derive(serde::Deserialize)]
 struct PathQuery {
     path: String,
+}
+
+/// The `/view` query: `?path=<rel>` plus an optional `?view=preview|split|editor`
+/// that picks the initial layout (the in-page toolbar can switch it afterwards,
+/// persisting the choice in `localStorage`). An unknown/absent `view` falls back
+/// to the persisted choice, then to `preview` — handled client-side.
+#[derive(serde::Deserialize)]
+struct ViewQuery {
+    path: String,
+    view: Option<String>,
 }
 
 /// Render the full live-preview page for `rel`, confined under the app root.
@@ -224,7 +260,7 @@ struct PathQuery {
 /// entry is lazily created/reused; the page body comes from the entry's cached
 /// latest render (kept current by its watch loop), so `/view` reflects live
 /// state without touching the single-threaded session.
-fn view_page(state: &AppState, rel: &str) -> warp::reply::Response {
+fn view_page(state: &AppState, rel: &str, view: Option<&str>) -> warp::reply::Response {
     use warp::http::StatusCode;
     use warp::reply::Reply;
 
@@ -237,11 +273,29 @@ fn view_page(state: &AppState, rel: &str) -> warp::reply::Response {
     };
 
     // The cached body fragment already has cross-file links rewritten by the
-    // watch loop, resolved relative to this document. Wrap it in #doc and inject
-    // the WS client pointed at this path.
+    // watch loop, resolved relative to this document. Wrap it in #doc, inject the
+    // WS client (live preview) + the three-view toolbar/editor (CSS in <head>,
+    // markup + editor JS before </body>). The body stays inside #doc.
+    let doc_rel = rel_for(&state.root, &canon, rel);
     let body = entry.latest_body.lock().unwrap().clone();
-    let page = render_page_with(&wrap_doc(&body), &ws_client_head(&rel_for(&state.root, &canon, rel)), "");
+    let initial_view = normalize_view(view);
+    let page = render_page_with(
+        &wrap_doc(&body),
+        &format!("{}{}", ws_client_head(&doc_rel), views_head()),
+        &views_body(&doc_rel, initial_view),
+    );
     warp::reply::html(page).into_response()
+}
+
+/// The three supported layouts. `preview` is the default editor-less live view;
+/// `split` is editor + preview side by side; `editor` is a full-page textarea.
+const VIEW_MODES: [&str; 3] = ["preview", "split", "editor"];
+
+/// Normalise a `?view=` value to one of [`VIEW_MODES`], or `None` if unset/
+/// unrecognised (the client then falls back to `localStorage`, then `preview`).
+fn normalize_view(view: Option<&str>) -> Option<&'static str> {
+    let v = view?;
+    VIEW_MODES.iter().copied().find(|&m| m == v)
 }
 
 /// Serve the raw bytes of a confined in-root file for `/asset?path=<rel>`.
@@ -289,6 +343,107 @@ fn serve_asset(state: &AppState, rel: &str) -> warp::reply::Response {
     };
 
     warp::reply::with_header(bytes, "content-type", content_type_for(&canon)).into_response()
+}
+
+/// Serve the confined file's raw Markdown source for `GET /raw?path=<rel>`.
+///
+/// This is the source the in-browser editor loads into its textarea. Confined
+/// and size-limited exactly like [`serve_asset`]/`view`: `rel` is resolved
+/// through [`FilePeer::within`] (traversal/symlink escape → **400**, with no
+/// leak of whether a path exists), the existing [`DEFAULT_MAX_FILE_SIZE`] read
+/// cap is enforced (oversize → **413**), a missing file is **404**, and a
+/// directory is **404**. The bytes are returned verbatim as
+/// `text/plain; charset=utf-8`. Read-only; never follows a link outside the
+/// root and never writes.
+fn serve_raw(state: &AppState, rel: &str) -> warp::reply::Response {
+    use warp::http::StatusCode;
+    use warp::reply::Reply;
+
+    let status = |code| warp::reply::with_status("", code).into_response();
+
+    // Confine first (mirrors /view and /asset): a traversal/symlink escape is a
+    // 400 with no path-existence leak.
+    let canon = match FilePeer::within(&state.root, rel, YrsSession::from_text("")) {
+        Ok(peer) => peer.path().to_path_buf(),
+        Err(_) => return status(StatusCode::BAD_REQUEST),
+    };
+
+    // Size cap before reading (Security #4): stat so a huge file cannot OOM us.
+    match std::fs::metadata(&canon) {
+        Ok(meta) if meta.is_dir() => return status(StatusCode::NOT_FOUND),
+        Ok(meta) if meta.len() > DEFAULT_MAX_FILE_SIZE => {
+            return status(StatusCode::PAYLOAD_TOO_LARGE)
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return status(StatusCode::NOT_FOUND)
+        }
+        Err(_) => return status(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+
+    let bytes = match std::fs::read(&canon) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return status(StatusCode::NOT_FOUND)
+        }
+        Err(_) => return status(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+
+    warp::reply::with_header(bytes, "content-type", "text/plain; charset=utf-8").into_response()
+}
+
+/// Write a new Markdown body to the confined file for `POST /save?path=<rel>`.
+///
+/// **This is the one WRITE endpoint, so confinement is strict.** `rel` is
+/// resolved through [`FilePeer::within`] (traversal/symlink escape, absolute
+/// path elsewhere → **400**, with no path-existence leak); the body is rejected
+/// if it exceeds [`DEFAULT_MAX_FILE_SIZE`] (→ **413**; warp also rejects an
+/// over-cap request earlier via `content_length_limit`). On success the bytes
+/// are written through the same [`FilePeer`]/`write_to_disk` path used
+/// elsewhere — the file is only ever written *inside* the confinement root.
+///
+/// We do **not** drive the registry's single-threaded session here: instead we
+/// let the file be the source of truth. After the write the per-path watch loop
+/// observes the change, ingests it (its content-compare feedback guard means our
+/// write is treated as an ordinary external edit), re-renders, and broadcasts
+/// the new body over `/ws` → every preview pane updates. Writing the bytes that
+/// the editor sent (rather than round-tripping through this request's session)
+/// keeps `/save` stateless and avoids touching the `!Send` session from the
+/// async world.
+///
+/// **First cut is last-write-wins via the file.** Concurrent editors (or an
+/// external edit) can overwrite each other; the editing client's textarea may go
+/// stale until reloaded. Acceptable for v1 (see the CHANGELOG / editor JS note).
+fn save_doc(state: &AppState, rel: &str, body: &[u8]) -> warp::reply::Response {
+    use warp::http::StatusCode;
+    use warp::reply::Reply;
+
+    let status = |code| warp::reply::with_status("", code).into_response();
+
+    // Defence in depth: warp's content_length_limit already rejects an over-cap
+    // request, but a chunked/length-less body could slip past it — re-check the
+    // materialised body before writing.
+    if body.len() as u64 > DEFAULT_MAX_FILE_SIZE {
+        return status(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    // The new contents must be valid UTF-8 (the document model is text).
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => t.to_owned(),
+        Err(_) => return status(StatusCode::BAD_REQUEST),
+    };
+
+    // Confine: resolve the full path under the root through the same check
+    // /view uses, then write via the FilePeer write path so the bytes can only
+    // ever land inside the root. A bad path is a 400 (no path-existence leak).
+    let peer = match FilePeer::within(&state.root, rel, YrsSession::from_text(&text)) {
+        Ok(p) => p,
+        Err(_) => return status(StatusCode::BAD_REQUEST),
+    };
+    match peer.write_to_disk() {
+        Ok(()) => status(StatusCode::NO_CONTENT),
+        Err(_) => status(StatusCode::INTERNAL_SERVER_ERROR),
+    }
 }
 
 /// Infer a `Content-Type` from a file's extension (ASCII-case-insensitive).
@@ -522,6 +677,160 @@ fn ws_client_head(rel: &str) -> String {
                 ws.onclose = function () {{ setTimeout(connect, 1000); }};
             }}
             connect();
+        }})();
+        </script>"#
+    )
+}
+
+/// The `<head>` CSS for the three-view layout. Pure CSS, no per-request data:
+/// the active layout is selected by a `data-view` attribute on `<body>` (set by
+/// [`views_body`]'s script), so switching views is a class/attribute flip with
+/// no re-render. In `preview` mode the editor pane is hidden and the page looks
+/// exactly like the original editor-less live preview. `split` shows the editor
+/// (left) and the preview (right); `editor` is a full-page textarea.
+fn views_head() -> &'static str {
+    r#"
+        <style>
+        /* Three-view layout. The body is the preview surface (.markdown-body);
+           we lay it out as a flex row holding the editor pane + the preview
+           (#doc), with a fixed toolbar on top. `data-view` on <body> selects
+           which panes are visible. */
+        body.mdv { max-width: none; margin: 0; padding: 0; display: flex; flex-direction: column; min-height: 100vh; box-sizing: border-box; }
+        .mdv-toolbar {
+            position: sticky; top: 0; z-index: 10;
+            display: flex; gap: 6px; align-items: center;
+            padding: 6px 10px; border-bottom: 1px solid rgba(175,184,193,.3);
+            background: #f6f8fa; font: 13px/1 system-ui, sans-serif;
+        }
+        .mdv-toolbar button {
+            padding: 4px 10px; border: 1px solid rgba(175,184,193,.4);
+            border-radius: 6px; background: #fff; color: #24292f; cursor: pointer;
+        }
+        .mdv-toolbar button.active { background: #0969da; color: #fff; border-color: #0969da; }
+        .mdv-panes { flex: 1 1 auto; display: flex; min-height: 0; }
+        .mdv-editor {
+            box-sizing: border-box; width: 50%; border: none; outline: none; resize: none;
+            padding: 16px; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+            background: #fff; color: #24292f;
+            border-right: 1px solid rgba(175,184,193,.3);
+        }
+        /* #doc holds the rendered preview; it scrolls independently and is
+           centred like the standalone page via its own max-width. */
+        .mdv-panes #doc { flex: 1 1 auto; overflow: auto; padding: 0 45px; box-sizing: border-box; }
+        .mdv-panes #doc > * { max-width: 980px; margin-left: auto; margin-right: auto; }
+        @media (max-width: 767px) { .mdv-panes #doc { padding: 0 15px; } }
+
+        /* preview (default): editor hidden, preview full width. */
+        body[data-view="preview"] .mdv-editor { display: none; }
+        body[data-view="preview"] .mdv-panes #doc { width: 100%; }
+        /* split: editor + preview side by side. */
+        body[data-view="split"] .mdv-editor { display: block; }
+        /* editor: full-page textarea, preview hidden. */
+        body[data-view="editor"] .mdv-editor { display: block; width: 100%; border-right: none; }
+        body[data-view="editor"] .mdv-panes #doc { display: none; }
+
+        @media (prefers-color-scheme: dark) {
+            .mdv-toolbar { background: #161b22; border-color: rgba(99,110,123,.4); }
+            .mdv-toolbar button { background: #21262d; color: #c9d1d9; border-color: rgba(99,110,123,.4); }
+            .mdv-toolbar button.active { background: #1f6feb; color: #fff; border-color: #1f6feb; }
+            .mdv-editor { background: #0d1117; color: #c9d1d9; border-color: rgba(99,110,123,.4); }
+        }
+        </style>"#
+}
+
+/// The before-`</body>` markup + JS for the three-view toolbar and editor.
+///
+/// Vanilla JS, no deps. On load it: picks the initial view (`?view=` →
+/// `localStorage` → `preview`), wires the three toolbar buttons (each persists
+/// the choice in `localStorage`), fetches `/raw?path=` into the textarea, and on
+/// input **debounces ~400ms** then `POST`s the textarea to `/save?path=`. The
+/// preview pane (#doc) keeps updating via the existing `/ws` push — saving the
+/// file makes the watch loop re-render and broadcast, so the editor never pushes
+/// HTML itself.
+///
+/// **v1 caveat (last-write-wins):** the textarea is loaded once and is not
+/// re-synced from `/ws`; an external edit (or another tab) can leave it stale
+/// until reload. Acceptable for this non-collaborative first cut (ADR-0002
+/// describes the future ephemeral-CRDT editing model — not built here).
+fn views_body(rel: &str, initial_view: Option<&str>) -> String {
+    let path_json = json_string(rel);
+    // The server-side initial view (from ?view=), or JS `null` to let the client
+    // fall back to localStorage/preview. Always one of VIEW_MODES, so a bare
+    // identifier-safe string literal is injected via json_string.
+    let initial_json = match initial_view {
+        Some(v) => json_string(v),
+        None => "null".to_string(),
+    };
+    format!(
+        r#"
+        <div class="mdv-panes">
+            <textarea class="mdv-editor" spellcheck="false" aria-label="Markdown source"></textarea>
+        </div>
+        <script>
+        (function () {{
+            const path = {path_json};
+            const initialView = {initial_json};
+            const MODES = ["preview", "split", "editor"];
+            const KEY = "md-preview:view";
+            const body = document.body;
+
+            // The page renders #doc inside the body; move it into the panes row
+            // so the editor sits beside it.
+            const panes = document.querySelector('.mdv-panes');
+            const editor = panes.querySelector('.mdv-editor');
+            const doc = document.getElementById('doc');
+            if (doc) panes.appendChild(doc);
+
+            // Build the toolbar.
+            const bar = document.createElement('div');
+            bar.className = 'mdv-toolbar';
+            const buttons = {{}};
+            for (const m of MODES) {{
+                const b = document.createElement('button');
+                b.type = 'button';
+                b.textContent = m.charAt(0).toUpperCase() + m.slice(1);
+                b.addEventListener('click', function () {{ setView(m, true); }});
+                bar.appendChild(b);
+                buttons[m] = b;
+            }}
+            body.classList.add('mdv');
+            body.insertBefore(bar, body.firstChild);
+
+            function setView(mode, persist) {{
+                if (!MODES.includes(mode)) mode = 'preview';
+                body.setAttribute('data-view', mode);
+                for (const m of MODES) buttons[m].classList.toggle('active', m === mode);
+                if (persist) {{ try {{ localStorage.setItem(KEY, mode); }} catch (e) {{}} }}
+            }}
+
+            // Initial view: ?view= (server-validated) -> localStorage -> preview.
+            let stored = null;
+            try {{ stored = localStorage.getItem(KEY); }} catch (e) {{}}
+            setView(initialView || stored || 'preview', false);
+
+            // Load the raw source into the editor.
+            const rawUrl = "/raw?path=" + encodeURIComponent(path);
+            fetch(rawUrl).then(function (r) {{
+                if (r.ok) return r.text();
+                throw new Error('raw load failed: ' + r.status);
+            }}).then(function (text) {{
+                editor.value = text;
+            }}).catch(function (err) {{ console.error(err); }});
+
+            // Debounced save: POST the textarea to /save; the preview updates via
+            // the existing /ws push once the watch loop ingests the write.
+            let timer = null;
+            const saveUrl = "/save?path=" + encodeURIComponent(path);
+            editor.addEventListener('input', function () {{
+                if (timer) clearTimeout(timer);
+                timer = setTimeout(function () {{
+                    fetch(saveUrl, {{
+                        method: 'POST',
+                        headers: {{ 'Content-Type': 'text/plain; charset=utf-8' }},
+                        body: editor.value,
+                    }}).catch(function (err) {{ console.error('save failed:', err); }});
+                }}, 400);
+            }});
         }})();
         </script>"#
     )
@@ -946,6 +1255,218 @@ mod tests {
         );
         // And the cached latest_body reflects the latest render.
         assert!(entry.latest_body.lock().unwrap().contains("Two"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn serve_raw_returns_source_text() {
+        let dir = temp_dir("raw-ok");
+        std::fs::write(dir.join("doc.md"), "# Hello\n\nsource *text*").unwrap();
+        let state = AppState::new(dir.clone());
+
+        let resp = serve_raw(&state, "doc.md");
+        assert_eq!(resp.status(), warp::http::StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        let body = warp::hyper::body::to_bytes(resp.into_body()).await.unwrap();
+        assert_eq!(&body[..], b"# Hello\n\nsource *text*", "raw source returned verbatim");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_raw_rejects_traversal_absolute_and_missing() {
+        let dir = temp_dir("raw-bad");
+        let state = AppState::new(dir.clone());
+
+        // `../` traversal escape -> 400 (confinement failure, no existence leak).
+        assert_eq!(
+            serve_raw(&state, "../etc/passwd").status(),
+            warp::http::StatusCode::BAD_REQUEST
+        );
+        // Absolute path elsewhere -> 400.
+        assert_eq!(
+            serve_raw(&state, "/etc/passwd").status(),
+            warp::http::StatusCode::BAD_REQUEST
+        );
+        // In-root but nonexistent -> 404.
+        assert_eq!(
+            serve_raw(&state, "nope.md").status(),
+            warp::http::StatusCode::NOT_FOUND
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_raw_refuses_over_size_cap() {
+        let dir = temp_dir("raw-big");
+        let big = vec![b'x'; (DEFAULT_MAX_FILE_SIZE + 1) as usize];
+        std::fs::write(dir.join("big.md"), &big).unwrap();
+        let state = AppState::new(dir.clone());
+        assert_eq!(
+            serve_raw(&state, "big.md").status(),
+            warp::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_doc_writes_confined_file() {
+        let dir = temp_dir("save-ok");
+        std::fs::write(dir.join("doc.md"), "old").unwrap();
+        let state = AppState::new(dir.clone());
+
+        let resp = save_doc(&state, "doc.md", b"# New content");
+        assert_eq!(resp.status(), warp::http::StatusCode::NO_CONTENT);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("doc.md")).unwrap(),
+            "# New content",
+            "save must write the body to the confined file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_doc_creates_new_in_root_file() {
+        let dir = temp_dir("save-new");
+        let state = AppState::new(dir.clone());
+        // A not-yet-existing in-root file is allowed (within() accepts it).
+        let resp = save_doc(&state, "fresh.md", b"hi");
+        assert_eq!(resp.status(), warp::http::StatusCode::NO_CONTENT);
+        assert_eq!(std::fs::read_to_string(dir.join("fresh.md")).unwrap(), "hi");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_doc_rejects_traversal_and_absolute_and_never_writes_outside() {
+        let dir = temp_dir("save-bad");
+        let state = AppState::new(dir.clone());
+
+        // `../` traversal escape -> 400, and nothing is written outside root.
+        assert_eq!(
+            save_doc(&state, "../escape.md", b"pwned").status(),
+            warp::http::StatusCode::BAD_REQUEST
+        );
+        assert!(
+            !dir.parent().unwrap().join("escape.md").exists(),
+            "a rejected save must not create a file outside the root"
+        );
+        // Absolute path elsewhere -> 400.
+        assert_eq!(
+            save_doc(&state, "/tmp/md-preview-should-not-exist.md", b"pwned").status(),
+            warp::http::StatusCode::BAD_REQUEST
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_doc_refuses_over_size_cap_and_invalid_utf8() {
+        let dir = temp_dir("save-big");
+        std::fs::write(dir.join("doc.md"), "keep").unwrap();
+        let state = AppState::new(dir.clone());
+
+        // One byte over the cap -> 413, and the existing file is untouched.
+        let big = vec![b'x'; (DEFAULT_MAX_FILE_SIZE + 1) as usize];
+        assert_eq!(
+            save_doc(&state, "doc.md", &big).status(),
+            warp::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("doc.md")).unwrap(), "keep");
+
+        // Invalid UTF-8 body -> 400 (the document model is text).
+        assert_eq!(
+            save_doc(&state, "doc.md", &[0xff, 0xfe, 0x00]).status(),
+            warp::http::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(std::fs::read_to_string(dir.join("doc.md")).unwrap(), "keep");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn normalize_view_accepts_known_modes_only() {
+        assert_eq!(normalize_view(Some("preview")), Some("preview"));
+        assert_eq!(normalize_view(Some("split")), Some("split"));
+        assert_eq!(normalize_view(Some("editor")), Some("editor"));
+        assert_eq!(normalize_view(Some("bogus")), None);
+        assert_eq!(normalize_view(None), None);
+    }
+
+    #[tokio::test]
+    async fn view_page_contains_three_modes_toolbar_and_view_param() {
+        let dir = temp_dir("view-three");
+        std::fs::write(dir.join("doc.md"), "# Hi").unwrap();
+        let state = AppState::new(dir.clone());
+
+        // No ?view= -> client falls back (server injects `null`), still has all
+        // three modes + toolbar + editor wiring.
+        let resp = view_page(&state, "doc.md", None);
+        assert_eq!(resp.status(), warp::http::StatusCode::OK);
+        let html = String::from_utf8(
+            warp::hyper::body::to_bytes(resp.into_body())
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        // Three view modes selectable (CSS selectors key off data-view).
+        for mode in VIEW_MODES {
+            assert!(
+                html.contains(&format!("data-view=\"{mode}\"")),
+                "CSS references the {mode} view"
+            );
+        }
+        // And the JS knows all three modes by name.
+        assert!(
+            html.contains(r#"["preview", "split", "editor"]"#),
+            "JS lists the three modes"
+        );
+        // Toolbar + editor present, and the editor wires /raw and /save.
+        assert!(html.contains("mdv-toolbar"), "toolbar present");
+        assert!(html.contains("mdv-editor"), "editor pane present");
+        assert!(html.contains("/raw?path="), "editor loads /raw");
+        assert!(html.contains("/save?path="), "editor saves to /save");
+        // The body is still wrapped in #doc (preview pane).
+        assert!(html.contains("id=\"doc\""), "body stays in #doc");
+        // No ?view= -> server injects JS null as the initial view.
+        assert!(
+            html.contains("const initialView = null;"),
+            "absent ?view -> null initial view (client picks localStorage/preview)"
+        );
+
+        // ?view=split -> server injects the validated mode.
+        let resp2 = view_page(&state, "doc.md", Some("split"));
+        let html2 = String::from_utf8(
+            warp::hyper::body::to_bytes(resp2.into_body())
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            html2.contains("const initialView = \"split\";"),
+            "?view=split honoured server-side"
+        );
+
+        // ?view=bogus -> normalised away to null (client fallback).
+        let resp3 = view_page(&state, "doc.md", Some("bogus"));
+        let html3 = String::from_utf8(
+            warp::hyper::body::to_bytes(resp3.into_body())
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            html3.contains("const initialView = null;"),
+            "unknown ?view -> null (ignored)"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
