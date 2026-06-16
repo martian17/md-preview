@@ -14,6 +14,20 @@ use syntect::html::{css_for_theme_with_class_style, ClassStyle, ClassedHTMLGener
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+// Real-time collaborative editing (see ~/.claude/plans/inherited-rolling-finch.md).
+// The renderer above stays pure and reusable; these modules add the document
+// model behind a stable contract (`doc::DocSession`).
+pub mod doc;
+pub mod diff;
+pub mod file_peer;
+pub mod session;
+
+// The persistent daemon (warp + tokio live preview). Feature-gated so the lib
+// stays usable on its own — `--no-default-features` builds the pure renderer and
+// document core with ZERO web/server dependencies.
+#[cfg(feature = "daemon")]
+pub mod server;
+
 /// Class prefix for syntect's highlight classes. Shared by the HTML generator
 /// and the generated CSS so the markup and stylesheet stay in sync.
 const HL_PREFIX: &str = "hl-";
@@ -185,8 +199,24 @@ pub fn render_markdown(markdown_input: &str) -> String {
 /// [`render_markdown`] body plus the `<head>` styles (github-markdown-css,
 /// KaTeX CSS, auto light/dark highlight CSS) and the scripts that drive KaTeX
 /// and the copy-code buttons.
+///
+/// This is a thin wrapper over [`render_page_with`] with empty extras; its
+/// output is byte-identical to assembling the document by hand.
 pub fn render_page(markdown_input: &str) -> String {
-    let content = render_markdown(markdown_input);
+    render_page_with(&render_markdown(markdown_input), "", "")
+}
+
+/// Assemble the full standalone HTML document around an already-rendered
+/// `body` fragment, injecting `extra_head` just before `</head>` and
+/// `extra_body` just before `</body>`.
+///
+/// This is the **pure** seam the daemon uses to add its live-reload WebSocket
+/// client (and wrap the body in `<div id="doc">…</div>`) without duplicating
+/// the bundled assets/styles, while keeping the renderer free of any web/server
+/// dependency. With empty extras the output is byte-identical to the original
+/// standalone page, so [`render_page`] and the existing snapshot tests are
+/// unaffected.
+pub fn render_page_with(body: &str, extra_head: &str, extra_body: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
         <html>
@@ -231,10 +261,10 @@ pub fn render_page(markdown_input: &str) -> String {
                 }}
                 /* GitHub Light/Dark code highlighting, auto-switching. */
 {syntax_css}
-            </style>
+            </style>{extra_head}
         </head>
         <body class="markdown-body">
-            {content}
+            {body}
         <script type="module">
 import katex from 'https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.mjs';
 
@@ -277,11 +307,13 @@ document.addEventListener('click', async (e) => {{
         console.error('Copy failed:', err);
     }}
 }});
-        </script>
+        </script>{extra_body}
         </body>
         </html>"#,
         syntax_css = syntax_css(),
-        content = content
+        body = body,
+        extra_head = extra_head,
+        extra_body = extra_body
     )
 }
 
@@ -382,6 +414,38 @@ mod tests {
         // The highlight CSS is injected.
         assert!(page.contains("prefers-color-scheme: dark"));
         // And the rendered body is embedded.
+        assert!(page.contains("<h1>Hi</h1>"));
+    }
+
+    #[test]
+    fn render_page_with_empty_extras_is_byte_identical_to_render_page() {
+        // The pure seam must not perturb the standalone page when no extras are
+        // injected — this is what keeps the existing snapshot/asset tests and any
+        // byte-for-byte consumers stable.
+        for md in ["", "# Hi", "Inline $a^2$ and\n\n```rust\nfn x() {}\n```\n"] {
+            let body = render_markdown(md);
+            assert_eq!(
+                render_page_with(&body, "", ""),
+                render_page(md),
+                "render_page_with(.., \"\", \"\") must equal render_page for {md:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_page_with_injects_extras_in_the_right_places() {
+        let body = render_markdown("# Hi");
+        let page = render_page_with(&body, "<!--HEADMARK-->", "<!--BODYMARK-->");
+        // extra_head lands inside <head> (before the closing tag).
+        let head_pos = page.find("<!--HEADMARK-->").expect("head extra present");
+        let head_close = page.find("</head>").expect("</head> present");
+        assert!(head_pos < head_close, "extra_head must be inside <head>");
+        // extra_body lands just before </body>.
+        let body_pos = page.find("<!--BODYMARK-->").expect("body extra present");
+        let body_close = page.find("</body>").expect("</body> present");
+        assert!(body_pos < body_close, "extra_body must be before </body>");
+        assert!(head_close < body_pos, "head extra precedes body extra");
+        // The original body fragment is still embedded.
         assert!(page.contains("<h1>Hi</h1>"));
     }
 }
