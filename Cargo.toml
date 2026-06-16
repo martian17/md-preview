@@ -4,8 +4,24 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 
+[features]
+# The daemon (warp + tokio live-preview server) is on by default for the `md`
+# binary, but the renderer + document core build with ZERO web deps when it is
+# disabled (`cargo build --no-default-features`), keeping the lib lean & reusable.
+default = ["daemon"]
+daemon = ["dep:tokio", "dep:warp", "dep:futures-util", "dep:webbrowser", "dep:serde"]
+
 [dependencies]
 pulldown-cmark = "0.13.3"  # Fast and GFM compatible
-tiny_http = "0.12.0"      # Simple, low-overhead server
-webbrowser = "1.2.1"      # Opens the default browser cross-platform
 syntect = "5.3.0"
+yrs = "0.27.2"
+similar = "3.1.1"
+notify = "8.2.0"
+
+# Daemon-only (optional): the async server stack. Picked per ADR-0003 so
+# `yrs-warp` (y-sync + awareness) drops in for Phase 3.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs"], optional = true }
+warp = { version = "0.3", optional = true }
+futures-util = { version = "0.3", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }  # query deserialization for warp
+webbrowser = { version = "1.2.1", optional = true }  # Opens the default browser cross-platform

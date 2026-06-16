@@ -1,45 +1,145 @@
-use md_preview::render_page;
-use std::env;
-use std::fs;
-use tiny_http::{Header, Response, Server};
+//! The `md-preview` binary.
+//!
+//! With the default `daemon` feature this starts the persistent live-preview
+//! server ([`md_preview::server`]) and opens the browser at `/view`. Without the
+//! feature it falls back to a minimal one-shot render to stdout, so the crate
+//! still builds and is useful with zero web dependencies.
 
+#[cfg(feature = "daemon")]
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: md-preview <file.md>");
-        return;
-    }
-    let filename = &args[1];
-    let markdown_input = fs::read_to_string(filename).expect("Failed to read file");
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+    use std::process::ExitCode;
 
-    let full_html = render_page(&markdown_input);
+    // Tiny hand-rolled arg parsing — no clap dependency for three flags.
+    //   md-preview <file.md> [--port N] [--no-open]
+    // Headless operation: pass `--no-open`, or set `BROWSER` (honoured below as
+    // the opener command, so `BROWSER=/bin/true` opens nothing), or set
+    // `MD_PREVIEW_NO_OPEN`.
+    let mut file: Option<PathBuf> = None;
+    let mut port: u16 = default_port();
+    let mut no_open = std::env::var_os("MD_PREVIEW_NO_OPEN").is_some();
 
-    let server = Server::http("127.0.0.1:0").unwrap();
-    let port = server.server_addr().to_ip().unwrap().port();
-    let url = format!("http://127.0.0.1:{}", port);
-
-    println!("Preview ready: {}", url);
-
-    // Try to open browser; on WSL the webbrowser crate uses explorer.exe automatically.
-    // Don't panic on failure — user can open the URL manually.
-    if let Err(e) = webbrowser::open(&url) {
-        eprintln!("Could not open browser automatically: {}", e);
-        eprintln!("Open this URL in your browser: {}", url);
-    }
-
-    // Serve requests until the root page has been delivered. Browsers send side
-    // requests (e.g. /favicon.ico) before the main page; answer those with 204
-    // No Content and keep waiting for the root request.
-    for request in server.incoming_requests() {
-        let path = request.url();
-        if path == "/" || path.starts_with("/?") {
-            let response = Response::from_string(full_html.clone()).with_header(
-                Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap(),
-            );
-            let _ = request.respond(response);
-            println!("Preview served. Shutting down.");
-            break;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--no-open" => no_open = true,
+            "--port" => {
+                match args.next().and_then(|p| p.parse::<u16>().ok()) {
+                    Some(p) => port = p,
+                    None => {
+                        eprintln!("--port requires a number");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "-h" | "--help" => {
+                eprintln!("Usage: md-preview <file.md> [--port N] [--no-open]");
+                return;
+            }
+            other if file.is_none() && !other.starts_with('-') => {
+                file = Some(PathBuf::from(other));
+            }
+            other => {
+                eprintln!("Unexpected argument: {other}");
+                std::process::exit(2);
+            }
         }
-        let _ = request.respond(Response::empty(204));
+    }
+
+    let file = match file {
+        Some(f) => f,
+        None => {
+            eprintln!("Usage: md-preview <file.md> [--port N] [--no-open]");
+            std::process::exit(2);
+        }
+    };
+
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+
+    // The thin-client URL points at /view for the served file's name; the daemon
+    // resolves it under the file's parent directory (the confinement root).
+    let file_name = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let url = format!("http://{addr}/view?path={file_name}");
+
+    // A multi-threaded runtime: the blocking watch loop runs on its own OS
+    // thread, but the WS forwarding + HTTP serving want async workers.
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Failed to start runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let code = rt.block_on(async move {
+        // Bring the server up; serve() validates + confines the file and spawns
+        // the watch thread before it starts accepting connections.
+        let server = md_preview::server::serve(&file, addr);
+
+        if no_open {
+            println!("Preview ready (headless): {url}");
+        } else if let Some(browser) = std::env::var_os("BROWSER") {
+            // Honour an explicit opener command (lets CI use BROWSER=/bin/true).
+            println!("Preview ready: {url}");
+            if let Err(e) = std::process::Command::new(&browser).arg(&url).spawn() {
+                eprintln!("Could not run $BROWSER ({browser:?}): {e}");
+                eprintln!("Open this URL in your browser: {url}");
+            }
+        } else {
+            println!("Preview ready: {url}");
+            if let Err(e) = webbrowser::open(&url) {
+                eprintln!("Could not open browser automatically: {e}");
+                eprintln!("Open this URL in your browser: {url}");
+            }
+        }
+
+        match server.await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("Server error: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    });
+
+    std::process::exit(match code {
+        c if c == ExitCode::SUCCESS => 0,
+        _ => 1,
+    });
+}
+
+/// Default port for the daemon, overridable via `--port` or the `MD_PREVIEW_PORT`
+/// env var. Fixed (not ephemeral) so the thin client can find a running daemon.
+#[cfg(feature = "daemon")]
+fn default_port() -> u16 {
+    std::env::var("MD_PREVIEW_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7878)
+}
+
+/// Fallback build with no web dependencies: render the file to stdout. Keeps the
+/// crate buildable and useful under `--no-default-features`.
+#[cfg(not(feature = "daemon"))]
+fn main() {
+    use std::path::PathBuf;
+
+    let file = std::env::args().nth(1).map(PathBuf::from);
+    let Some(file) = file else {
+        eprintln!("Usage: md-preview <file.md>");
+        eprintln!("(built without the `daemon` feature: renders to stdout)");
+        std::process::exit(2);
+    };
+
+    match std::fs::read_to_string(&file) {
+        Ok(md) => print!("{}", md_preview::render_page(&md)),
+        Err(e) => {
+            eprintln!("Failed to read {}: {e}", file.display());
+            std::process::exit(1);
+        }
     }
 }
