@@ -14,7 +14,7 @@ use syntect::html::{css_for_theme_with_class_style, ClassStyle, ClassedHTMLGener
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
-// Real-time collaborative editing (see ~/.claude/plans/inherited-rolling-finch.md).
+// Real-time collaborative editing (see ADR-0001 "CRDT over OT" and ADR-0003).
 // The renderer above stays pure and reusable; these modules add the document
 // model behind a stable contract (`doc::DocSession`).
 pub mod doc;
