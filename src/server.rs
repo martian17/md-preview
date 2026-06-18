@@ -63,7 +63,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use warp::ws::{Message, WebSocket};
 use warp::Filter;
 
@@ -72,6 +72,14 @@ use crate::file_peer::{FilePeer, DEFAULT_MAX_FILE_SIZE};
 use crate::render_markdown;
 use crate::render_page_with;
 use crate::session::YrsSession;
+
+// The Phase-3 collaborative-editing WebSocket lives in its own module, declared
+// FROM here (not `lib.rs`): `server.rs` owns the registry/`Entry`/watch thread it
+// plugs into, so the wiring stays local to the daemon. The module is itself
+// daemon-only (this whole file is `pub mod server` behind the `daemon` feature).
+#[path = "collab.rs"]
+pub mod collab;
+use collab::{CollabMsg, COLLAB_BROADCAST_CAP, MAX_UPDATE_BYTES};
 
 /// How often each blocking watch loop polls its [`FilePeer`] for coalesced file
 /// events. The underlying `notify` watcher is event-driven; this interval only
@@ -86,6 +94,13 @@ const WATCH_POLL: Duration = Duration::from_millis(150);
 /// matters.
 const BROADCAST_CAP: usize = 16;
 
+/// How long the watch thread waits after the last browser-origin edit before
+/// flushing the document to disk (Phase 3 write-back). Debouncing coalesces a
+/// burst of keystrokes into one write; the file-peer's content-compare guard
+/// then swallows the resulting fs event, so write-back never feeds back as an
+/// external edit. Kept short so the on-disk file tracks the live doc closely.
+const WRITE_BACK_DEBOUNCE: Duration = Duration::from_millis(500);
+
 /// One live document in the registry: everything a `/view`/`/ws` for a single
 /// confined path needs, with **no** `YrsSession` in it (the session lives only
 /// on this entry's watch thread). All fields here are `Send + Sync`.
@@ -98,6 +113,15 @@ struct Entry {
     /// Broadcast of the freshly-rendered body fragment on every change. Each
     /// `/ws` client for this path drops it straight into `#doc.innerHTML`.
     tx: broadcast::Sender<String>,
+    /// `/collab` async tasks → this path's watch thread (Phase 3). Carries
+    /// **Send bytes only** ([`CollabMsg`]); the `!Send` session stays on the
+    /// watch thread. Cloned per connection so editors of the same path feed one
+    /// serialization point. The thread holds the matching receiver.
+    collab_in: mpsc::Sender<CollabMsg>,
+    /// Watch thread → `/collab` async tasks (Phase 3). Carries encoded outbound
+    /// y-protocols frames (peer updates + relayed awareness). Each editor
+    /// subscribes; drop-oldest lag semantics like [`Entry::tx`].
+    collab_out: broadcast::Sender<Vec<u8>>,
 }
 
 /// The lazily-populated `canonical path -> Entry` registry.
@@ -146,17 +170,29 @@ impl AppState {
         }
 
         // Slow path: create the entry + its watch thread, then insert. We build
-        // the channel/cache here (cheap, Send) and hand them to the thread; the
+        // the channels/cache here (cheap, Send) and hand them to the thread; the
         // !Send session is born inside the thread.
         let (tx, _rx) = broadcast::channel::<String>(BROADCAST_CAP);
         let latest_body = Arc::new(Mutex::new(String::new()));
+        // Phase-3 collab channels: async tasks → thread (`collab_in`) and thread
+        // → async tasks (`collab_out`). The receiver for `collab_in` moves into
+        // the watch thread (it is `Send`); the thread owns the broadcast sender.
+        let (collab_in, collab_rx) = mpsc::channel::<CollabMsg>(COLLAB_BROADCAST_CAP);
+        let (collab_out, _) = broadcast::channel::<Vec<u8>>(COLLAB_BROADCAST_CAP);
         spawn_watch(
             self.root.clone(),
             canon.clone(),
             tx.clone(),
             latest_body.clone(),
+            collab_rx,
+            collab_out.clone(),
         )?;
-        let entry = Arc::new(Entry { latest_body, tx });
+        let entry = Arc::new(Entry {
+            latest_body,
+            tx,
+            collab_in,
+            collab_out,
+        });
 
         // Re-check under the lock in case a concurrent request created it first;
         // if so, reuse theirs (and let our just-spawned thread idle harmlessly —
@@ -234,7 +270,27 @@ fn routes(
             ws.on_upgrade(move |socket| client_ws(socket, st, q.path))
         });
 
-    health.or(view).or(asset).or(raw).or(save).or(ws)
+    // GET /collab?path=<rel> -> binary WebSocket speaking the y-websocket wire
+    // format (Phase 3). Confined exactly like /ws; on a confinement failure the
+    // upgraded socket is simply closed. The async task is a pure byte pump — the
+    // !Send session stays on the path's watch thread (see `collab.rs`).
+    let collab_state = state.clone();
+    let collab_ws_route = warp::path("collab")
+        .and(warp::path::end())
+        .and(warp::query::<PathQuery>())
+        .and(warp::ws())
+        .map(move |q: PathQuery, ws: warp::ws::Ws| {
+            let st = collab_state.clone();
+            ws.on_upgrade(move |socket| collab_upgrade(socket, st, q.path))
+        });
+
+    health
+        .or(view)
+        .or(asset)
+        .or(raw)
+        .or(save)
+        .or(ws)
+        .or(collab_ws_route)
 }
 
 /// The `?path=<rel>` query `/ws`, `/asset`, `/raw`, and `/save` accept.
@@ -904,6 +960,57 @@ async fn client_ws(ws: WebSocket, state: Arc<AppState>, rel: String) {
     }
 }
 
+/// Per-connection `/collab` upgrade wrapper: resolve `rel` to its shared
+/// registry entry (creating it on first touch — editors and viewers of the same
+/// file share ONE session), then hand the socket and the entry's collab channels
+/// to [`collab::collab_ws`]. A confinement failure (traversal/symlink escape)
+/// simply closes the upgraded socket, the 400-equivalent here.
+///
+/// The session is never reached from this async path: `collab_ws` only pumps
+/// `Send` bytes over `collab_in`/`collab_out` to/from the path's watch thread.
+async fn collab_upgrade(ws: WebSocket, state: Arc<AppState>, rel: String) {
+    let (canon, entry) = match state.entry_for(&rel) {
+        Ok(pair) => pair,
+        Err(_) => return, // confinement failure → close the socket
+    };
+    collab::collab_ws(
+        ws,
+        entry.collab_in.clone(),
+        entry.collab_out.clone(),
+        canon,
+    )
+    .await;
+}
+
+/// Rebuild a confined, watching [`FilePeer`] seeded from `last_good` text, used
+/// by the **#5 guard** when an integrate panic poisons the in-flight session.
+///
+/// `target` is an already-validated canonical in-root path, so `within` and
+/// `watch` are expected to succeed; if either *does* fail (e.g. the file was
+/// concurrently removed), we fall back to a non-watching peer seeded from the
+/// same text so the watch thread keeps serving the last-known-good document
+/// rather than crashing. Either way the returned peer's text equals `last_good`.
+fn rebuild_peer(root: &Path, target: &Path, last_good: &str) -> FilePeer<YrsSession> {
+    match FilePeer::within(root, target, YrsSession::from_text(last_good)) {
+        Ok(mut peer) => {
+            // Re-establish the directory watch; ignore a watch-setup error (the
+            // peer is still usable via collab even without fs events).
+            let _ = peer.watch();
+            peer
+        }
+        // Confinement/IO failure on a previously-valid path: keep a usable,
+        // non-watching peer at last-good text. `new` only needs the parent dir
+        // to canonicalize (which it did at first spawn), so this is expected to
+        // succeed; on the vanishingly rare failure we still keep last-good text.
+        Err(_) => {
+            let mut peer = FilePeer::new(target, YrsSession::from_text(last_good))
+                .expect("rebuild fallback peer: parent dir was canonical at spawn");
+            let _ = peer.watch();
+            peer
+        }
+    }
+}
+
 /// Spawn the dedicated watch thread that owns the [`FilePeer`]/[`YrsSession`]
 /// for one confined `target` path and broadcasts a re-rendered body fragment on
 /// every change.
@@ -921,11 +1028,25 @@ async fn client_ws(ws: WebSocket, state: Arc<AppState>, rel: String) {
 /// rewritten relative to this document (via [`rewrite_doc_urls`]) before it is
 /// cached/broadcast, so every consumer (initial `/view`, initial `/ws` frame,
 /// live updates) is consistent.
+///
+/// ## Phase 3: the single serialization point for ALL doc mutations
+/// This thread now also drains `collab_rx` (browser editors → here) alongside its
+/// filesystem polling. Because the `!Send` session is mutated *only* here, in
+/// arrival order, there is exactly one writer — the "two writers" problem is gone
+/// and fs edits / browser edits commute by CRDT semantics (ADR-0001). For each
+/// applied browser update the thread, in order: enforces the **#5 guard**,
+/// re-renders + broadcasts HTML on `tx` (so one-way `/ws` viewers are *not*
+/// regressed), broadcasts the update on `collab_out` (to the other editors), and
+/// marks the doc dirty for the debounced write-back. A filesystem-origin edit is
+/// likewise broadcast on `collab_out` (computed via `update_since` against the
+/// pre-change state vector) so browser editors converge with on-disk edits.
 fn spawn_watch(
     root: PathBuf,
     target: PathBuf,
     tx: broadcast::Sender<String>,
     latest_body: Arc<Mutex<String>>,
+    mut collab_rx: mpsc::Receiver<CollabMsg>,
+    collab_out: broadcast::Sender<Vec<u8>>,
 ) -> std::io::Result<()> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
 
@@ -960,19 +1081,144 @@ fn spawn_watch(
             *latest_body.lock().unwrap() = render(&peer.session().text());
             let _ = ready_tx.send(Ok(()));
 
+            // Re-render the cache + broadcast the new body to one-way `/ws`
+            // preview viewers. Used by BOTH the fs path and the collab path so a
+            // browser-origin edit keeps the preview live (viewer-not-regressed).
+            let publish_html = |peer: &FilePeer<YrsSession>| {
+                let body = render(&peer.session().text());
+                *latest_body.lock().unwrap() = body.clone();
+                // A send error only means there are no live subscribers; the
+                // latest body is still cached for the next /ws.
+                let _ = tx.send(body);
+            };
+
+            // Debounced write-back bookkeeping: when a browser edit lands we mark
+            // the doc dirty; once `WRITE_BACK_DEBOUNCE` elapses with no further
+            // edit we flush to disk. The file-peer's stateless content-compare
+            // guard (`sync_from_disk`) swallows the fs event our own write emits,
+            // so this never feeds back as an external edit (no write storm).
+            let mut dirty_since: Option<std::time::Instant> = None;
+
             loop {
-                // Coalesce any pending fs events into a single sync + render.
-                match peer.try_drain() {
-                    Ok(true) => {
-                        let body = render(&peer.session().text());
-                        *latest_body.lock().unwrap() = body.clone();
-                        // A send error only means there are no live subscribers;
-                        // the latest body is still cached for the next /ws.
-                        let _ = tx.send(body);
+                // --- Filesystem-origin edits ----------------------------------
+                // IMPORTANT ordering: while a browser edit is pending write-back
+                // (`dirty_since.is_some()`), the on-disk file is known-stale —
+                // the session is ahead of it. Ingesting the file then would diff
+                // the stale contents against the newer session and REVERT the
+                // un-written browser edit (a lost update). So we ingest fs events
+                // only when the session and file are in sync (not dirty); once the
+                // debounced write-back below flushes, file == session and fs
+                // watching resumes normally. This keeps the single serialization
+                // point coherent without racing our own pending write.
+                if dirty_since.is_none() {
+                    // Snapshot the pre-change SV so we can compute exactly the
+                    // update an external edit introduced and forward it to editors.
+                    let pre_sv = peer.session().state_vector();
+                    match peer.try_drain() {
+                        Ok(true) => {
+                            publish_html(&peer);
+                            // Forward the on-disk change to browser editors so they
+                            // converge with the file (CRDT apply is idempotent).
+                            let update = peer.session().update_since(&pre_sv);
+                            if !update.is_empty() {
+                                let _ = collab_out.send(collab::encode_sync_update(update));
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(_) => { /* transient I/O; next tick re-reads from disk */ }
                     }
-                    Ok(false) => {}
-                    Err(_) => { /* transient I/O; next tick re-reads from disk */ }
                 }
+
+                // --- Browser-origin collab messages ---------------------------
+                // Drain everything currently queued (coalesce a burst) so the
+                // session advances in arrival order at one serialization point.
+                let mut applied_any = false;
+                while let Ok(msg) = collab_rx.try_recv() {
+                    match msg {
+                        CollabMsg::SnapshotRequest(reply) => {
+                            // Answer with the server's own SyncStep1 (its SV).
+                            let frame =
+                                collab::encode_sync_step1(peer.session().state_vector());
+                            let _ = reply.send(frame);
+                        }
+                        CollabMsg::SyncStep1(sv, reply) => {
+                            // #5 step 1 (bandwidth amplification): refuse an
+                            // oversized state vector rather than echo the full
+                            // doc. A tiny/empty SV is normal (a fresh client).
+                            let frame = if sv.len() > MAX_UPDATE_BYTES {
+                                Vec::new()
+                            } else {
+                                collab::encode_sync_step2(peer.session().update_since(&sv))
+                            };
+                            let _ = reply.send(frame);
+                        }
+                        CollabMsg::AwarenessFrame(frame) => {
+                            // Ephemeral peer state: relay to the other editors,
+                            // never touch the doc.
+                            let _ = collab_out.send(frame);
+                        }
+                        CollabMsg::ClientUpdate(update) => {
+                            // THE apply funnel (#5). This inlines the same guard
+                            // as `collab::apply_client_update` (which is unit-tested
+                            // in isolation in `collab.rs`); it is inlined here only
+                            // because the merge and rebuild steps both need `&mut
+                            // peer`, which two `FnMut` closures cannot co-borrow.
+                            // Keep the two in lockstep. Snapshot the last-known-good
+                            // text + pre-state-vector BEFORE applying, so a caught
+                            // integrate panic can rebuild, and a success can be
+                            // re-broadcast as a minimal update.
+                            let last_good = peer.session().text();
+                            let pre_sv = peer.session().state_vector();
+
+                            // Step 1: pre-decode size cap (the network edge also
+                            // caps, but the funnel is self-contained).
+                            if update.len() > MAX_UPDATE_BYTES {
+                                continue;
+                            }
+                            // Steps 2+3: decode-guarded merge under catch_unwind.
+                            let changed = match std::panic::catch_unwind(
+                                std::panic::AssertUnwindSafe(|| peer.session_mut().merge(&update)),
+                            ) {
+                                Ok(changed) => changed,
+                                Err(_) => {
+                                    // #5 step 3: integrate panicked. Rebuild the
+                                    // session from last-known-good text and carry
+                                    // on; the !Send single-owner session means no
+                                    // shared mutex was poisoned. Re-establish the
+                                    // watch on the rebuilt peer.
+                                    peer = rebuild_peer(&root, &target, &last_good);
+                                    false
+                                }
+                            };
+
+                            if changed {
+                                applied_any = true;
+                                // Keep one-way /ws preview viewers current.
+                                publish_html(&peer);
+                                // Fan the new ops out to the other editors as a
+                                // minimal update (idempotent to echo to all).
+                                let fanout = peer.session().update_since(&pre_sv);
+                                if !fanout.is_empty() {
+                                    let _ = collab_out.send(collab::encode_sync_update(fanout));
+                                }
+                            }
+                        }
+                    }
+                }
+                if applied_any {
+                    dirty_since.get_or_insert_with(std::time::Instant::now);
+                }
+
+                // --- Debounced write-back -------------------------------------
+                if let Some(since) = dirty_since
+                    && since.elapsed() >= WRITE_BACK_DEBOUNCE
+                {
+                    // Best-effort write; the content-compare guard means our own
+                    // resulting fs event is a no-op (no feedback loop).
+                    let _ = peer.write_to_disk();
+                    dirty_since = None;
+                }
+
                 std::thread::sleep(WATCH_POLL);
             }
         })?;
