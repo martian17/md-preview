@@ -43,3 +43,28 @@ fn render_page_wraps_the_body_in_a_full_document() {
     assert!(page.contains("katex.mjs"));
     assert!(page.contains("github-markdown.min.css"));
 }
+
+#[test]
+fn mermaid_fence_renders_as_a_diagram_block_others_stay_highlighted() {
+    let md = "\
+```mermaid
+graph TD; A-->B;
+```
+
+```rust
+fn main() {}
+```
+";
+    let html = render_markdown(md);
+    // The mermaid fence is a diagram target: no highlighting, no copy button.
+    assert!(html.contains(r#"<pre class="mermaid">"#));
+    assert!(html.contains("graph TD; A--&gt;B;"));
+    // The normal rust fence is still a highlighted, copyable block (regression).
+    assert!(html.contains(r#"<pre class="hl-code">"#));
+    assert_eq!(html.matches(r#"class="copy-btn""#).count(), 1);
+
+    // The full page imports and initializes Mermaid.js from the jsdelivr CDN.
+    let page = render_page(md);
+    assert!(page.contains("mermaid@11/dist/mermaid.esm.min.mjs"));
+    assert!(page.contains("mermaid.initialize"));
+}
