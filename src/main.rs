@@ -57,8 +57,9 @@ fn main() {
 
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
 
-    // The thin-client URL points at /view for the served file's name; the daemon
-    // resolves it under the file's parent directory (the confinement root).
+    // Build the preview URL: /view with the file's name as the path query
+    // parameter.  The server resolves it under the file's parent directory
+    // (the confinement root).
     let file_name = file
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -99,6 +100,14 @@ fn main() {
 
         match server.await {
             Ok(()) => ExitCode::SUCCESS,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                eprintln!(
+                    "md-preview is already using port {port} — \
+                     open http://127.0.0.1:{port}/view?path=... \
+                     or pass --port N to run a second instance"
+                );
+                ExitCode::FAILURE
+            }
             Err(e) => {
                 eprintln!("Server error: {e}");
                 ExitCode::FAILURE
@@ -113,7 +122,8 @@ fn main() {
 }
 
 /// Default port for the daemon, overridable via `--port` or the `MD_PREVIEW_PORT`
-/// env var. Fixed (not ephemeral) so the thin client can find a running daemon.
+/// env var. Each invocation starts its own server on this port; if the port is
+/// already in use the process exits with a clear message and a non-zero status.
 #[cfg(feature = "daemon")]
 fn default_port() -> u16 {
     std::env::var("MD_PREVIEW_PORT")
