@@ -807,6 +807,7 @@ dependencies = [
  "similar",
  "syntect",
  "tokio",
+ "tokio-tungstenite",
  "warp",
  "webbrowser",
  "yrs",

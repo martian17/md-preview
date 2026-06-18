@@ -14,7 +14,7 @@ daemon = ["dep:tokio", "dep:warp", "dep:futures-util", "dep:webbrowser", "dep:se
 [dependencies]
 pulldown-cmark = "0.13.3"  # Fast and GFM compatible
 syntect = "5.3.0"
-yrs = "0.27.2"
+yrs = { version = "0.27.2", features = ["sync"] }  # `sync` enables y-protocols framing types (Message/SyncMessage) for /collab (ADR-0004)
 similar = "3.1.1"
 notify = "8.2.0"
 
@@ -25,3 +25,9 @@ warp = { version = "0.3", optional = true }
 futures-util = { version = "0.3", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }  # query deserialization for warp
 webbrowser = { version = "1.2.1", optional = true }  # Opens the default browser cross-platform
+
+[dev-dependencies]
+# A minimal WebSocket *client* for the `/collab` integration tests — the daemon
+# (warp) is the server. Pinned to the same version warp already pulls in, so it
+# resolves from cache with no new transitive deps. Used only by tests/collab.rs.
+tokio-tungstenite = "0.21"
