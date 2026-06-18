@@ -224,6 +224,16 @@ fn routes(
         .and(warp::query::<ViewQuery>())
         .map(move |q: ViewQuery| view_page(&view_state, &q.path, q.view.as_deref()));
 
+    // GET /edit?path=<rel> -> full multi-user collaborative editor page (confined
+    // exactly like /view). The page's client connects back to /collab?path=<rel>
+    // to sync via the y-websocket protocol (see render_editor_page + collab.rs).
+    let edit_state = state.clone();
+    let edit = warp::path("edit")
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::<PathQuery>())
+        .map(move |q: PathQuery| edit_page(&edit_state, &q.path));
+
     // GET /asset?path=<rel> -> raw bytes of a confined in-root file, read-only,
     // with a Content-Type inferred from the extension (images, css, …).
     let asset_state = state.clone();
@@ -286,6 +296,7 @@ fn routes(
 
     health
         .or(view)
+        .or(edit)
         .or(asset)
         .or(raw)
         .or(save)
@@ -341,6 +352,27 @@ fn view_page(state: &AppState, rel: &str, view: Option<&str>) -> warp::reply::Re
         &views_body(&doc_rel, initial_view),
     );
     warp::reply::html(page).into_response()
+}
+
+/// Render the full collaborative editor page for `rel`, confined under the app
+/// root exactly like [`view_page`]. We only need the canonical relative path for
+/// the page (the WS client derives `/collab?path=<rel>` from it); the per-path
+/// `Entry`/session is created lazily by the `/collab` upgrade, so we don't touch
+/// it here. A confinement failure (traversal/symlink escape) is a 400 with no
+/// existence leak, matching `view_page`.
+fn edit_page(state: &AppState, rel: &str) -> warp::reply::Response {
+    use warp::http::StatusCode;
+    use warp::reply::Reply;
+
+    let (canon, _entry) = match state.entry_for(rel) {
+        Ok(pair) => pair,
+        Err(_) => {
+            return warp::reply::with_status("invalid path", StatusCode::BAD_REQUEST)
+                .into_response();
+        }
+    };
+    let doc_rel = rel_for(&state.root, &canon, rel);
+    warp::reply::html(crate::render_editor_page(&doc_rel)).into_response()
 }
 
 /// The three supported layouts. `preview` is the default editor-less live view;
