@@ -354,6 +354,319 @@ document.addEventListener('click', async (e) => {{
     )
 }
 
+/// Serialize `s` as a JSON string literal (quotes included), safe to embed in a
+/// `<script>`. Escapes the characters that would break out of the literal or
+/// the script context (notably `<`/`>`/`&`, so a `path` like `a</script>b`
+/// can't close the tag).
+///
+/// This mirrors the daemon's own `json_string` (in `server.rs`), but lives here
+/// so the pure render layer stays free of any web/server dependency and still
+/// compiles under `--no-default-features`.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '<' => out.push_str("\\u003c"), // never let a literal </script> close the tag
+            '>' => out.push_str("\\u003e"),
+            '&' => out.push_str("\\u0026"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Render the standalone HTML page for the **collaborative** Markdown editor
+/// (Phase 3, ADR-0002). Pure render layer: like [`render_page_with`] it only
+/// emits HTML+JS strings — zero web/server deps — so it builds under
+/// `--no-default-features`. The daemon (a separate agent) wires the route that
+/// calls this; we provide only the page.
+///
+/// ## Contract with the server agent (two load-bearing facts)
+/// - **Shared `Y.Text` name: `"content"`.** The browser binds `ydoc.getText("content")`
+///   to CodeMirror; the server must use the same name on its peer doc.
+/// - **WebSocket URL: `ws[s]://<host>/collab?path=<encodeURIComponent(rel)>`.**
+///   `wss` when the page is served over https, else `ws`.
+///
+/// ## Provider: custom, not y-websocket's `WebsocketProvider`
+/// y-websocket@2's `WebsocketProvider(serverUrl, roomname, doc)` always composes
+/// its URL as `serverUrl + '/' + roomname + '?...'` (with its own query params),
+/// so it *cannot* produce our `/collab?path=<rel>` shape (no `/<room>` segment,
+/// our own `path` query key). Per the spec's fallback we therefore ship a small
+/// custom provider implementing the same wire protocol — a `varint(messageType)`
+/// followed by the payload, where type 0 = sync (`y-protocols/sync`) and type 1
+/// = awareness (`y-protocols/awareness`) — against the ephemeral doc. We still import
+/// `y-websocket@2` so the version is pinned/available, but drive the socket
+/// ourselves. `yCollab` consumes `provider.awareness` exactly as it would the
+/// stock provider's.
+///
+/// The ephemeral doc (created here, bound to CodeMirror, flushed and discarded
+/// on exit) is the editor's local doc — never a long-lived peer (ADR-0002).
+pub fn render_editor_page(rel_path: &str) -> String {
+    // The path is injected as a JSON-escaped literal and re-encoded with
+    // encodeURIComponent in the browser, so no raw path text lands in the
+    // script context (defends against a `path` like `a</script><b>.md`).
+    let path_json = json_string(rel_path);
+    // Visible label in the toolbar — HTML-escaped for text-node safety.
+    let display_path = escape_html(rel_path);
+
+    format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{display_path} — collaborative editor</title>
+    <!-- Pinned ESM via importmap (esm.sh), matching the KaTeX/mermaid CDN house
+         style. Stable Yjs-v13 line: yjs@13.6 + y-codemirror.next@0.3 (NOT the
+         Yjs-v14 `@y/codemirror`). CodeMirror 6 core + markdown lang. y-websocket@2
+         supplies the wire-protocol deps; we drive the socket via a custom provider. -->
+    <script type="importmap">
+    {{
+      "imports": {{
+        "yjs": "https://esm.sh/yjs@13.6",
+        "y-protocols/sync": "https://esm.sh/y-protocols@1/sync",
+        "y-protocols/awareness": "https://esm.sh/y-protocols@1/awareness",
+        "y-codemirror.next": "https://esm.sh/y-codemirror.next@0.3",
+        "y-websocket": "https://esm.sh/y-websocket@2",
+        "lib0/encoding": "https://esm.sh/lib0@0.2/encoding",
+        "lib0/decoding": "https://esm.sh/lib0@0.2/decoding",
+        "@codemirror/state": "https://esm.sh/@codemirror/state@6",
+        "@codemirror/view": "https://esm.sh/@codemirror/view@6",
+        "@codemirror/commands": "https://esm.sh/@codemirror/commands@6",
+        "@codemirror/lang-markdown": "https://esm.sh/@codemirror/lang-markdown@6"
+      }}
+    }}
+    </script>
+    <style>
+        :root {{ color-scheme: light dark; }}
+        body {{
+            margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+                Helvetica, Arial, sans-serif;
+            background-color: #ffffff; color: #1f2328;
+        }}
+        @media (prefers-color-scheme: dark) {{
+            body {{ background-color: #0d1117; color: #e6edf3; }}
+        }}
+        #toolbar {{
+            display: flex; align-items: center; gap: 12px;
+            padding: 8px 16px; border-bottom: 1px solid rgba(128,128,128,.3);
+            font-size: 14px;
+        }}
+        #toolbar .path {{ font-weight: 600; }}
+        #toolbar .spacer {{ flex: 1; }}
+        #toolbar label {{ color: #656d76; }}
+        @media (prefers-color-scheme: dark) {{ #toolbar label {{ color: #7d8590; }} }}
+        #username {{
+            font: inherit; padding: 2px 6px; border-radius: 6px;
+            border: 1px solid rgba(128,128,128,.4); background: transparent; color: inherit;
+        }}
+        #status {{ font-size: 12px; color: #656d76; }}
+        #editor {{ max-width: 980px; margin: 0 auto; padding: 16px; }}
+        .cm-editor {{ border: 1px solid rgba(128,128,128,.3); border-radius: 6px; }}
+        .cm-editor.cm-focused {{ outline: none; }}
+    </style>
+</head>
+<body>
+    <div id="toolbar">
+        <span class="path">{display_path}</span>
+        <span class="spacer"></span>
+        <label for="username">name</label>
+        <input id="username" type="text" maxlength="40" autocomplete="off">
+        <span id="status">connecting…</span>
+    </div>
+    <div id="editor"></div>
+
+    <script type="module">
+import * as Y from 'yjs';
+import * as syncProtocol from 'y-protocols/sync';
+import * as awarenessProtocol from 'y-protocols/awareness';
+import * as encoding from 'lib0/encoding';
+import * as decoding from 'lib0/decoding';
+import {{ yCollab }} from 'y-codemirror.next';
+import {{ EditorState }} from '@codemirror/state';
+import {{ EditorView, keymap }} from '@codemirror/view';
+import {{ defaultKeymap, history, historyKeymap }} from '@codemirror/commands';
+import {{ markdown }} from '@codemirror/lang-markdown';
+
+// (1) Server-injected path, JSON-escaped so it can't break out of <script>.
+const path = {path_json};
+const displayPath = path;
+
+// CONTRACT (server agent must match): the shared Y.Text is named "content".
+const Y_TEXT_NAME = 'content';
+
+// (2) Ephemeral Y.Doc (ADR-0002): created on edit, bound to CodeMirror below,
+// flushed and discarded on exit — never the long-lived peer.
+const ydoc = new Y.Doc();
+const awareness = new awarenessProtocol.Awareness(ydoc);
+
+// y-websocket wire message types.
+const MSG_SYNC = 0;
+const MSG_AWARENESS = 1;
+
+// Custom provider (~kept small): y-websocket@2's WebsocketProvider can only
+// build `serverUrl + '/' + room + '?...'`, which can't express our `/collab?path=<rel>`
+// endpoint, so we speak its protocol directly. Connects to EXACTLY
+// `ws[s]://<host>/collab?path=<encodeURIComponent(path)>`.
+class CollabProvider {{
+    constructor(doc, awareness) {{
+        this.doc = doc;
+        this.awareness = awareness;
+        this.ws = null;
+        this.synced = false;
+        this.shouldConnect = true;
+        this._onStatus = () => {{}};
+        doc.on('update', (update, origin) => {{
+            if (origin === this) return; // don't echo applied remote updates
+            const enc = encoding.createEncoder();
+            encoding.writeVarUint(enc, MSG_SYNC);
+            syncProtocol.writeUpdate(enc, update);
+            this._send(enc);
+        }});
+        awareness.on('update', ({{ added, updated, removed }}) => {{
+            const changed = added.concat(updated, removed);
+            const enc = encoding.createEncoder();
+            encoding.writeVarUint(enc, MSG_AWARENESS);
+            encoding.writeVarUint8Array(
+                enc, awarenessProtocol.encodeAwarenessUpdate(awareness, changed));
+            this._send(enc);
+        }});
+        this.connect();
+    }}
+    get connected() {{ return this.ws && this.ws.readyState === WebSocket.OPEN; }}
+    connect() {{
+        const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+        const url = scheme + '://' + location.host
+            + '/collab?path=' + encodeURIComponent(path);
+        const ws = new WebSocket(url);
+        ws.binaryType = 'arraybuffer';
+        this.ws = ws;
+        ws.onopen = () => {{
+            this._onStatus('connected');
+            // Step 1 of sync: send our state vector so the server can reply with
+            // the missing updates.
+            const enc = encoding.createEncoder();
+            encoding.writeVarUint(enc, MSG_SYNC);
+            syncProtocol.writeSyncStep1(enc, this.doc);
+            this._send(enc);
+            // Announce our local awareness state.
+            if (this.awareness.getLocalState() !== null) {{
+                const aenc = encoding.createEncoder();
+                encoding.writeVarUint(aenc, MSG_AWARENESS);
+                encoding.writeVarUint8Array(aenc, awarenessProtocol.encodeAwarenessUpdate(
+                    this.awareness, [this.doc.clientID]));
+                this._send(aenc);
+            }}
+        }};
+        ws.onmessage = (event) => this._onMessage(new Uint8Array(event.data));
+        ws.onclose = () => {{
+            this._onStatus('disconnected');
+            // Drop our awareness entry locally; reconnect after a short backoff.
+            awarenessProtocol.removeAwarenessStates(
+                this.awareness, [...this.awareness.getStates().keys()]
+                    .filter((id) => id !== this.doc.clientID), this);
+            if (this.shouldConnect) setTimeout(() => this.connect(), 1000);
+        }};
+        ws.onerror = () => {{ try {{ ws.close(); }} catch (e) {{}} }};
+    }}
+    _onMessage(buf) {{
+        const dec = decoding.createDecoder(buf);
+        const enc = encoding.createEncoder();
+        const type = decoding.readVarUint(dec);
+        if (type === MSG_SYNC) {{
+            encoding.writeVarUint(enc, MSG_SYNC);
+            // readSyncMessage applies the update (origin = this, so we don't
+            // echo it back) and may write a reply (e.g. syncStep2) into enc.
+            const syncType = syncProtocol.readSyncMessage(dec, enc, this.doc, this);
+            if (syncType === syncProtocol.messageYjsSyncStep2 && !this.synced) {{
+                this.synced = true;
+            }}
+            if (encoding.length(enc) > 1) this._send(enc);
+        }} else if (type === MSG_AWARENESS) {{
+            awarenessProtocol.applyAwarenessUpdate(
+                this.awareness, decoding.readVarUint8Array(dec), this);
+        }}
+    }}
+    _send(enc) {{
+        if (this.connected) this.ws.send(encoding.toUint8Array(enc));
+    }}
+    onStatus(fn) {{ this._onStatus = fn; }}
+    destroy() {{
+        this.shouldConnect = false;
+        awarenessProtocol.removeAwarenessStates(
+            this.awareness, [this.doc.clientID], 'window unload');
+        if (this.ws) {{ try {{ this.ws.close(); }} catch (e) {{}} }}
+    }}
+}}
+
+const provider = new CollabProvider(ydoc, awareness);
+const statusEl = document.getElementById('status');
+provider.onStatus((s) => {{ statusEl.textContent = s; }});
+
+// (4) Awareness identity (D7): random color + editable display name, persisted
+// in localStorage. yCollab renders remote cursors/labels from these fields.
+function randomColor() {{
+    const h = Math.floor(Math.random() * 360);
+    return 'hsl(' + h + ', 70%, 50%)';
+}}
+let userColor = localStorage.getItem('collab-color');
+if (!userColor) {{ userColor = randomColor(); localStorage.setItem('collab-color', userColor); }}
+let userName = localStorage.getItem('collab-name')
+    || ('anon-' + Math.floor(Math.random() * 1000));
+const nameInput = document.getElementById('username');
+nameInput.value = userName;
+function applyIdentity() {{
+    awareness.setLocalStateField('user', {{ name: userName, color: userColor, colorLight: userColor }});
+}}
+applyIdentity();
+nameInput.addEventListener('input', () => {{
+    userName = nameInput.value;
+    localStorage.setItem('collab-name', userName);
+    applyIdentity();
+}});
+
+// (3) Bind the shared Y.Text "content" to CodeMirror via yCollab + markdown.
+const ytext = ydoc.getText(Y_TEXT_NAME);
+const state = EditorState.create({{
+    doc: ytext.toString(),
+    extensions: [
+        history(),
+        keymap.of([...defaultKeymap, ...historyKeymap]),
+        markdown(),
+        yCollab(ytext, awareness),
+        EditorView.lineWrapping,
+    ],
+}});
+const view = new EditorView({{ state, parent: document.getElementById('editor') }});
+view.focus();
+
+// (5) Flush-on-exit (ADR-0002 gotcha): best-effort flush pending updates before
+// teardown. Yjs applies edits synchronously and our doc-update handler sends
+// each update immediately, so by `beforeunload` there's normally nothing queued;
+// but if the socket isn't connected we can't flush — warn rather than silently
+// drop the user's unsynced edits.
+window.addEventListener('beforeunload', () => {{
+    if (!provider.connected) {{
+        console.warn('[collab] socket not connected on exit — unsynced edits may be lost');
+    }}
+    provider.destroy();
+}});
+    </script>
+</body>
+</html>"#,
+        display_path = display_path,
+        path_json = path_json,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,5 +816,60 @@ mod tests {
         assert!(head_close < body_pos, "head extra precedes body extra");
         // The original body fragment is still embedded.
         assert!(page.contains("<h1>Hi</h1>"));
+    }
+
+    #[test]
+    fn render_editor_page_targets_collab_endpoint_for_the_path() {
+        let page = render_editor_page("notes.md");
+        assert!(page.starts_with("<!DOCTYPE html>"));
+        // Connects to our /collab endpoint (path is appended via encodeURIComponent).
+        assert!(page.contains("/collab?path="));
+        // The path appears (injected literal + visible toolbar label).
+        assert!(page.contains("notes.md"));
+    }
+
+    #[test]
+    fn render_editor_page_pins_versions_and_binds_ycollab() {
+        let page = render_editor_page("notes.md");
+        // Importmap with the pinned, exact versions (esm.sh house style).
+        assert!(page.contains(r#"<script type="importmap">"#));
+        assert!(page.contains("yjs@13.6"));
+        assert!(page.contains("y-codemirror.next@0.3"));
+        assert!(page.contains("y-websocket@2"));
+        assert!(page.contains("@codemirror/state@6"));
+        assert!(page.contains("@codemirror/view@6"));
+        assert!(page.contains("@codemirror/commands@6"));
+        assert!(page.contains("@codemirror/lang-markdown@6"));
+        // The CodeMirror <-> Yjs binding.
+        assert!(page.contains("yCollab(ytext, awareness)"));
+    }
+
+    #[test]
+    fn render_editor_page_names_the_shared_text_content() {
+        // The shared type name is the contract with the server agent.
+        let page = render_editor_page("notes.md");
+        assert!(page.contains("'content'"));
+        assert!(page.contains(r#"getText(Y_TEXT_NAME)"#));
+    }
+
+    #[test]
+    fn render_editor_page_escapes_path_so_it_cannot_break_the_script() {
+        // A path crafted to close the <script> tag must be neutralized: the
+        // literal </script> from user input is JSON-unicode-escaped, mirroring
+        // the json_string escaping test in server.rs.
+        let page = render_editor_page("a</script><b>.md");
+        // The injected JS literal carries the escaped form, never a raw </script>.
+        assert!(page.contains("a\\u003c/script\\u003e\\u003cb\\u003e.md"));
+        // And no raw breakout sequence from the user input survives in the page.
+        assert!(!page.contains("a</script>"));
+    }
+
+    #[test]
+    fn json_string_escapes_script_breakers() {
+        // Mirrors server.rs's json_string contract so the two stay in lockstep.
+        let out = json_string("a</script>b");
+        assert!(out.contains("\\u003c/script\\u003e"));
+        assert_eq!(json_string("plain"), "\"plain\"");
+        assert_eq!(json_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
     }
 }
