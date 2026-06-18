@@ -1000,7 +1000,32 @@ pub async fn serve(file: &Path, addr: SocketAddr) -> std::io::Result<()> {
         .to_path_buf();
 
     let state = AppState::new(root);
-    warp::serve(routes(state)).run(addr).await;
+    // Use try_bind_ephemeral so a port-in-use (or any other bind) error is
+    // returned as an io::Result rather than causing a panic.  The bound address
+    // is fixed (addr was already chosen by the caller), so we ignore the
+    // returned SocketAddr.
+    let (_bound_addr, fut) = warp::serve(routes(state))
+        .try_bind_ephemeral(addr)
+        .map_err(|e| {
+            // Walk the error source chain to recover the io::Error kind
+            // (e.g. AddrInUse) so callers can match on ErrorKind.
+            // The chain is: warp::Error -> hyper::Error -> std::io::Error.
+            let kind = {
+                let mut src: Option<&dyn std::error::Error> =
+                    std::error::Error::source(&e);
+                let mut found = std::io::ErrorKind::Other;
+                while let Some(s) = src {
+                    if let Some(io) = s.downcast_ref::<std::io::Error>() {
+                        found = io.kind();
+                        break;
+                    }
+                    src = s.source();
+                }
+                found
+            };
+            std::io::Error::new(kind, e)
+        })?;
+    fut.await;
     Ok(())
 }
 
@@ -1491,6 +1516,56 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(eb.latest_body.lock().unwrap().contains("B"));
         assert!(!Arc::ptr_eq(&ea, &eb), "a.md and b.md are distinct entries");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Binding the same address twice must return an AddrInUse error, not panic.
+    ///
+    /// Uses a real TCP bind to port 0 so the OS assigns an ephemeral port, then
+    /// tries to bind it again.  Port 0 is always available and the double-bind
+    /// always collides, so this test is non-flaky.
+    #[tokio::test]
+    async fn double_bind_returns_addr_in_use_not_panic() {
+        let dir = temp_dir("dbl");
+        std::fs::write(dir.join("x.md"), "# X").unwrap();
+
+        // First bind: ask the OS for an ephemeral port.
+        let state1 = AppState::new(dir.clone());
+        let loopback: std::net::SocketAddr = ([127, 0, 0, 1], 0).into();
+        let (bound_addr, _fut1) = warp::serve(routes(state1))
+            .try_bind_ephemeral(loopback)
+            .expect("first bind must succeed");
+
+        // Second bind on the now-occupied port must fail, not panic.
+        let state2 = AppState::new(dir.clone());
+        let result = warp::serve(routes(state2))
+            .try_bind_ephemeral(bound_addr)
+            .map_err(|e| {
+                // Same walking logic as serve() — walk the source chain to find
+                // the underlying io::Error kind.
+                let kind = {
+                    let mut src: Option<&dyn std::error::Error> =
+                        std::error::Error::source(&e);
+                    let mut found = std::io::ErrorKind::Other;
+                    while let Some(s) = src {
+                        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+                            found = io.kind();
+                            break;
+                        }
+                        src = s.source();
+                    }
+                    found
+                };
+                std::io::Error::new(kind, e)
+            });
+
+        let err = result.err().expect("second bind must fail");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AddrInUse,
+            "error kind must be AddrInUse"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
