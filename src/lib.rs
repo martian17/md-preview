@@ -85,6 +85,14 @@ fn syntax_css() -> String {
     )
 }
 
+/// Render a `mermaid` fenced block as the `<pre class="mermaid">` element the
+/// Mermaid.js client picks up. The graph source is HTML-escaped (Mermaid reads
+/// `textContent`, which decodes it back, so this is lossless and safe); the
+/// block gets neither syntax highlighting nor a copy-button wrapper.
+fn render_mermaid_block(code: &str) -> String {
+    format!("<pre class=\"mermaid\">{}</pre>", escape_html(code))
+}
+
 /// Minimal HTML escaping for text placed inside the <math-renderer> element.
 /// The frontend reads `this.textContent`, which decodes these back to raw TeX
 /// before handing it to KaTeX, so escaping here is lossless.
@@ -178,7 +186,13 @@ pub fn render_markdown(markdown_input: &str) -> String {
             }
             Event::End(TagEnd::CodeBlock) => {
                 let (lang, code) = code_block.take().expect("CodeBlock End without Start");
-                Some(Event::Html(render_code_block(&ps, &lang, &code).into()))
+                // A ```mermaid fence is a live diagram, not highlighted code.
+                let html = if lang == "mermaid" {
+                    render_mermaid_block(&code)
+                } else {
+                    render_code_block(&ps, &lang, &code)
+                };
+                Some(Event::Html(html.into()))
             }
             // While inside a code block, route text into the buffer instead of
             // the document. (A ```math fence is just a code block here — only
@@ -267,6 +281,29 @@ pub fn render_page_with(body: &str, extra_head: &str, extra_body: &str) -> Strin
             {body}
         <script type="module">
 import katex from 'https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.mjs';
+import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+
+// Mermaid diagrams: <pre class="mermaid"> blocks. Theme follows the system
+// light/dark like the rest of the page. startOnLoad renders the initial blocks;
+// the daemon swaps `#doc.innerHTML` on every live update (no custom element to
+// auto-fire), so a MutationObserver re-runs mermaid against any new <pre> nodes
+// — the same "re-init against the swapped nodes" idea KaTeX gets for free.
+const mermaidDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+mermaid.initialize({{ startOnLoad: true, theme: mermaidDark ? 'dark' : 'default' }});
+{{
+    let scheduled = false;
+    const rerun = () => {{
+        scheduled = false;
+        const blocks = document.querySelectorAll('pre.mermaid:not([data-processed])');
+        if (blocks.length) mermaid.run({{ nodes: blocks }});
+    }};
+    const doc = document.getElementById('doc');
+    if (doc) new MutationObserver(() => {{
+        if (scheduled) return;
+        scheduled = true;
+        queueMicrotask(rerun);
+    }}).observe(doc, {{ childList: true }});
+}}
 
 class MathRenderer extends HTMLElement {{
     connectedCallback() {{
@@ -381,6 +418,25 @@ mod tests {
         assert!(html.contains(r#"<pre class="hl-code">"#));
         assert!(html.contains(r#"class="copy-btn""#));
         assert!(html.contains("let x = 42;"));
+    }
+
+    #[test]
+    fn mermaid_fence_becomes_a_mermaid_block_not_highlighted_code() {
+        let html = render_markdown("```mermaid\ngraph TD; A-->B;\n```");
+        // Rendered as the Mermaid.js target element, with no highlighting and no
+        // copy-button wrapper.
+        assert!(html.contains(r#"<pre class="mermaid">"#));
+        assert!(!html.contains("hl-code"));
+        assert!(!html.contains("copy-btn"));
+        // The graph source survives inside the element.
+        assert!(html.contains("graph TD; A--&gt;B;"));
+    }
+
+    #[test]
+    fn mermaid_block_escapes_its_source() {
+        let html = render_mermaid_block("a --> b & <c>");
+        assert!(html.contains("a --&gt; b &amp; &lt;c&gt;"));
+        assert!(!html.contains("<c>"));
     }
 
     #[test]
