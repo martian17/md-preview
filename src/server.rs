@@ -67,7 +67,9 @@ use tokio::sync::{broadcast, mpsc};
 use warp::ws::{Message, WebSocket};
 use warp::Filter;
 
+use crate::asset_origin;
 use crate::auth::{self, Clock, NonceStore, SessionStore};
+use crate::bundle;
 use crate::confine::{self, ConfineError, ConfinedFile};
 use crate::doc::DocSession;
 use crate::file_peer::{FilePeer, DEFAULT_MAX_FILE_SIZE};
@@ -181,10 +183,19 @@ struct AppState {
     /// future periodic nonce/session sweep. Not read on the hot path yet.
     #[allow(dead_code)]
     clock: Arc<Clock>,
-    /// Placeholder for a future capability / static-asset origin (a LATER wave).
-    /// Always `None` here — the static-origin split is not built in W3.
-    #[allow(dead_code)]
-    static_base: Option<PathBuf>,
+    /// Short-TTL, per-doc capability tokens for the **secondary static origin**'s
+    /// asset server (design §3 / ADR-0007). The trusted shell mints a token here
+    /// for each confined asset path; the static origin's `/cap/<token>` route
+    /// resolves + re-confines it. Behind a `Mutex` like the nonce/session stores
+    /// (mutates on `mint`/`resolve`, swept lazily); never held across an `.await`.
+    /// The `<img>`/`<video>` rewrite that calls [`asset_origin::cap_url`] is wired
+    /// in W6; this step stands up the store + route.
+    pub caps: Arc<Mutex<asset_origin::CapStore>>,
+    /// The secondary static origin's base URL (`http://127.0.0.1:<static_port>`),
+    /// learned once that port is bound (see [`serve_with_control`]). `None`
+    /// before the static origin is up (and in the test constructor). Stored for
+    /// the future shell / content API / asset-URL rewrite (W6).
+    pub static_base: Arc<Mutex<Option<String>>>,
     /// `canonical path -> Entry`, lazily filled on first access and reused after.
     registry: Registry,
 }
@@ -208,7 +219,8 @@ impl AppState {
             roots: Arc::new(Mutex::new(roots)),
             auth: Arc::new(AuthState::new(&clock_factory, secure_cookies)),
             clock: Arc::new(clock_factory()),
-            static_base: None,
+            caps: Arc::new(Mutex::new(asset_origin::CapStore::new())),
+            static_base: Arc::new(Mutex::new(None)),
             registry: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -263,6 +275,27 @@ impl AppState {
     /// `&[&Root]` + a `Roots` for the denylist). Mutex dropped before return.
     fn roots_snapshot(&self) -> Roots {
         self.roots.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Build an [`asset_origin::Confiner`] sharing this state's authoritative
+    /// roots registry (plus the primary-root fallback), so the static origin's
+    /// `/cap/<token>` route re-confines through the **same** funnel direct
+    /// `?path=` requests use — a capability is never a weaker path than a typed
+    /// one. See [`AppState::confine_read`].
+    fn confiner(&self) -> asset_origin::Confiner {
+        // `root` is the single-file/primary fallback; for a multi-root daemon this
+        // may be None (the Confiner falls back to the registry union).
+        let primary_root = None;
+        asset_origin::Confiner::new(self.roots.clone(), primary_root)
+    }
+
+    /// Record the secondary static origin's base URL once that port is bound, for
+    /// the future shell / asset-URL rewrite (W6). Best-effort: a poisoned lock
+    /// is ignored (the daemon keeps serving; only minting full URLs is affected).
+    fn set_static_base(&self, base: String) {
+        if let Ok(mut slot) = self.static_base.lock() {
+            *slot = Some(base);
+        }
     }
 
     /// Resolve `requested` (absolute) to its canonical path and get (or lazily
@@ -429,10 +462,13 @@ fn network_guard(ctx: &ReqContext) -> Option<warp::reply::Response> {
 
 /// Build the warp route filter for the given [`AppState`]. Split out from
 /// [`serve`] so it is unit/integration-testable without binding a socket.
+/// Accepts either an owned `AppState` (tests) or a shared `Arc<AppState>` (the
+/// production call sites, which also hand the SAME Arc to the secondary static
+/// origin so both origins share one capability store).
 fn routes(
-    state: AppState,
+    state: impl Into<Arc<AppState>>,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-    let state = Arc::new(state);
+    let state = state.into();
 
     // GET /healthz -> "ok"  (liveness; lets the thin client detect the daemon).
     // Unguarded by design: it serves no file bytes and leaks no path info.
@@ -1700,6 +1736,145 @@ fn spawn_watch(
         .unwrap_or_else(|_| Err(std::io::Error::other("watch thread exited during setup")))
 }
 
+// ===========================================================================
+// Static origin — secondary loopback port (design §3 / ADR-0007)
+// ===========================================================================
+
+/// A warp custom rejection used by [`static_host_guard`] when the `Host` header
+/// is absent or does not match the static-origin loopback authority.
+#[derive(Debug)]
+struct NetworkDenied;
+impl warp::reject::Reject for NetworkDenied {}
+
+/// Recovery handler for the static origin: map any unhandled rejection (including
+/// `NetworkDenied`) to a 403. Unlike the shell origin the static origin has no
+/// body routes beyond bundle/cap, so a 403 is the right fallback.
+async fn handle_static_rejection(
+    err: warp::Rejection,
+) -> Result<impl warp::Reply, std::convert::Infallible> {
+    use warp::http::StatusCode;
+    let code = if err.find::<NetworkDenied>().is_some() {
+        StatusCode::FORBIDDEN
+    } else if err.is_not_found() {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::FORBIDDEN
+    };
+    Ok(warp::reply::with_status("", code))
+}
+
+/// A `Host` allowlist guard for the **secondary static origin**, identical in
+/// spirit to the shell origin's host guard but bound to the *static* port (the
+/// two origins live on different ports). DNS-rebinding defense: admit only
+/// `127.0.0.1:<static>` / `localhost:<static>`.
+fn static_host_guard(
+    static_port: u16,
+) -> impl Filter<Extract = (), Error = warp::Rejection> + Clone {
+    warp::header::optional::<String>("host")
+        .and_then(move |host: Option<String>| async move {
+            let ok = match host.as_deref() {
+                Some(h) => {
+                    auth::host_allowed(h) && h.contains(&format!(":{static_port}"))
+                }
+                None => false,
+            };
+            if ok {
+                Ok(())
+            } else {
+                Err(warp::reject::custom(NetworkDenied))
+            }
+        })
+        .untuple_one()
+}
+
+/// Build the warp filter for the **secondary static origin** (design §3 /
+/// ADR-0007): the SRI-pinned JS/CSS [`bundle::bundle_routes`] **plus** the
+/// capability-gated [`asset_origin::asset_origin_routes`], so the sandboxed
+/// null-origin renderer loads mermaid/KaTeX/CSS and document assets *cross-origin*
+/// (with `Cross-Origin-Resource-Policy: cross-origin` on every response, which
+/// `bundle.rs`/`asset_origin.rs` already set) from an origin that is **not** the
+/// shell origin.
+///
+/// ## Why one secondary origin for both (design interpretation, ADR-0007)
+/// The design calls for "separate local origins" for the bundle and the assets.
+/// To avoid port sprawl we stand up **one** secondary "static" origin (a single
+/// extra loopback TCP port) that serves both. The security model only needs this
+/// origin to be *separate from the shell origin* — cross-origin to the
+/// null-origin renderer (so canvas-taint + `connect-src 'none'` make asset bytes
+/// visible-but-opaque-and-unexfiltratable) and CORP-tagged (so the COEP
+/// shell/iframe can load them). A single secondary origin satisfies all of that;
+/// the shell origin stays the primary port.
+///
+/// Unlike the shell origin this filter carries **no `Origin` guard and no session
+/// cookie**: the bundle is public, and the assets are gated by the unguessable,
+/// short-TTL capability token (re-confined at serve time), not the cookie. The
+/// no-cors subresource loads from the null-origin iframe carry no `Origin`, so an
+/// `Origin` guard would buy nothing here. Only the loopback `Host` allowlist is
+/// applied (DNS-rebinding defense), via [`static_host_guard`].
+fn static_origin_routes<F>(
+    state: Arc<AppState>,
+    static_port: u16,
+    cache: bundle::BundleCache,
+    fetcher: F,
+) -> impl Filter<Extract = impl warp::Reply, Error = std::convert::Infallible> + Clone
+where
+    F: bundle::Fetcher + Clone + 'static,
+{
+    let assets = asset_origin::asset_origin_routes(state.caps.clone(), state.confiner());
+    let bndl = bundle::bundle_routes(cache, fetcher);
+    static_host_guard(static_port)
+        .and(bndl.or(assets))
+        .recover(handle_static_rejection)
+}
+
+/// Bind and spawn the **secondary static origin** (design §3 / ADR-0007) on the
+/// same tokio runtime as the shell server, sharing `state` (`Arc<AppState>`).
+///
+/// The static port defaults to `shell_addr.port() + 1`; if that is busy (or 0)
+/// `try_bind_ephemeral` falls back to an OS-chosen port, and we learn the ACTUAL
+/// bound address. The bundle cache dir is [`bundle::default_cache_dir`] (a temp
+/// fallback if `$HOME`/XDG are unset); the production fetcher is
+/// [`bundle::UreqFetcher`]. The learned base URL (`http://127.0.0.1:<port>`) is
+/// recorded in `state` for the future shell / asset-URL rewrite (W6).
+///
+/// Best-effort and non-fatal: a static-origin bind failure is logged and the
+/// daemon continues serving the shell origin (assets/bundle simply unavailable
+/// cross-origin until restart) rather than aborting startup.
+fn spawn_static_origin(shell_addr: SocketAddr, state: Arc<AppState>) {
+    // Default to shell_port + 1; saturating so port 65535 doesn't wrap. A 0 (or
+    // busy) port is handled by the ephemeral fallback below.
+    let static_port = shell_addr.port().saturating_add(1);
+    let bind_addr = SocketAddr::new(shell_addr.ip(), static_port);
+
+    // Bundle cache dir + production fetcher. A missing cache dir is non-fatal: the
+    // bundle route fetches+verifies on demand and stores lazily.
+    let cache_dir = bundle::default_cache_dir()
+        .unwrap_or_else(|| std::env::temp_dir().join("md-preview").join("bundle"));
+    let cache = bundle::BundleCache::new(cache_dir);
+    let fetcher = bundle::UreqFetcher;
+
+    let routes = static_origin_routes(state.clone(), static_port, cache, fetcher);
+    match warp::serve(routes).try_bind_ephemeral(bind_addr) {
+        Ok((bound, fut)) => {
+            // Learn the ACTUAL bound port (ephemeral fallback may differ) and
+            // record the base URL for the shell / asset-URL rewrite (W6).
+            state.set_static_base(format!("http://127.0.0.1:{}", bound.port()));
+            tokio::spawn(fut);
+        }
+        Err(e) => {
+            eprintln!(
+                "md-preview: could not bind the secondary static origin on {bind_addr}: {}; \
+                 cross-origin bundle/assets unavailable this run",
+                e
+            );
+        }
+    }
+}
+
+// ===========================================================================
+// Public serve entry-points
+// ===========================================================================
+
 /// Build and run the daemon on `addr`. The first `file` is not special — it is
 /// just the first path the thin client points the browser at; its owning root is
 /// registered in the multi-root [`Roots`] registry and any other file under an
@@ -1723,12 +1898,14 @@ pub async fn serve(file: &Path, addr: SocketAddr) -> std::io::Result<()> {
     let _ = roots.register_for(&abs);
     let _ = roots.save();
 
-    let state = AppState::new(roots);
+    // One shared Arc: the shell routes AND the secondary static origin must use
+    // the SAME AppState (so they share one capability store + roots registry).
+    let state = Arc::new(AppState::new(roots));
     // Use try_bind_ephemeral so a port-in-use (or any other bind) error is
     // returned as an io::Result rather than causing a panic.  The bound address
     // is fixed (addr was already chosen by the caller), so we ignore the
     // returned SocketAddr.
-    let (_bound_addr, fut) = warp::serve(routes(state))
+    let (_bound_addr, fut) = warp::serve(routes(state.clone()))
         .try_bind_ephemeral(addr)
         .map_err(|e| {
             // Walk the error source chain to recover the io::Error kind
@@ -1749,6 +1926,9 @@ pub async fn serve(file: &Path, addr: SocketAddr) -> std::io::Result<()> {
             };
             std::io::Error::new(kind, e)
         })?;
+    // Stand up the secondary static origin (bundle + capability assets) on the
+    // same runtime, sharing the AppState (best-effort; see `spawn_static_origin`).
+    spawn_static_origin(addr, state);
     fut.await;
     Ok(())
 }
@@ -1781,7 +1961,9 @@ pub async fn serve_with_control(
     let _ = roots.register_for(&abs);
     let _ = roots.save();
 
-    let state = AppState::new(roots);
+    // One shared Arc across the shell routes, the control accept loop, AND the
+    // secondary static origin (they share one capability store + roots registry).
+    let state = Arc::new(AppState::new(roots));
 
     // Try the preferred port first; fall back to OS-assigned on AddrInUse.
     let preferred: SocketAddr = ([127, 0, 0, 1], 7878).into();
@@ -1805,6 +1987,11 @@ pub async fn serve_with_control(
             };
             std::io::Error::new(kind, e)
         })?;
+
+    // Stand up the secondary static origin (bundle + capability assets) on the
+    // same runtime, sharing the AppState. Keyed off the ACTUAL bound shell port
+    // so its default neighbor port (+1) tracks the real shell port.
+    spawn_static_origin(bound_addr, state.clone());
 
     let state_ctrl = state.clone();
     std::thread::Builder::new()
@@ -2515,5 +2702,207 @@ mod tests {
         let err = result.err().expect("second bind must fail");
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Secondary static origin wiring (design §3 / ADR-0007).
+    //
+    // These exercise `static_origin_routes` — the bundle + capability-asset
+    // filter mounted on the second loopback port — end-to-end via `warp::test`,
+    // sharing one `Arc<AppState>` so a token minted into `state.caps` is the same
+    // store the route resolves against (the real production wiring). Network-free:
+    // a fake fetcher means the bundle path never touches the network.
+    // -----------------------------------------------------------------------
+
+    /// The static origin's test port.
+    const TEST_STATIC_PORT: u16 = 8081;
+
+    fn valid_static_host() -> String {
+        format!("127.0.0.1:{TEST_STATIC_PORT}")
+    }
+
+    /// Network-free bundle fetcher: any fetch fails.
+    #[derive(Clone, Copy)]
+    struct OfflineFetcher;
+    impl bundle::Fetcher for OfflineFetcher {
+        fn get(&self, _url: &str) -> std::io::Result<Vec<u8>> {
+            Err(std::io::Error::other("offline (test fetcher)"))
+        }
+    }
+
+    fn static_routes_over(
+        state: Arc<AppState>,
+        cache_dir: PathBuf,
+    ) -> impl warp::Filter<Extract = impl warp::Reply, Error = std::convert::Infallible> + Clone
+    {
+        let cache = bundle::BundleCache::new(cache_dir);
+        static_origin_routes(state, TEST_STATIC_PORT, cache, OfflineFetcher)
+    }
+
+    #[tokio::test]
+    async fn static_origin_serves_capability_asset_with_corp_and_no_cors() {
+        let dir = temp_dir("static-cap");
+        let bytes: &[u8] = b"\x89PNG\r\n\x1a\nfake";
+        std::fs::write(dir.join("pic.png"), bytes).unwrap();
+        std::fs::set_permissions(
+            dir.join("pic.png"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let state = Arc::new(state_for(&dir));
+        let token = state
+            .caps
+            .lock()
+            .unwrap()
+            .mint(
+                dir.join("pic.png"),
+                asset_origin::CAP_TTL_SECS,
+                asset_origin::now_secs(),
+            )
+            .unwrap();
+        let cache_dir = temp_dir("static-cap-cache");
+        let routes = static_routes_over(state, cache_dir.clone());
+
+        let resp = warp::test::request()
+            .method("GET")
+            .path(&format!("/cap/{token}"))
+            .header("host", valid_static_host())
+            .reply(&routes)
+            .await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+        assert_eq!(
+            resp.headers().get("cross-origin-resource-policy").unwrap(),
+            "cross-origin"
+        );
+        assert!(
+            resp.headers().get("access-control-allow-origin").is_none(),
+            "static-origin assets must be CORS-less"
+        );
+        assert_eq!(resp.body().as_ref(), bytes);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[tokio::test]
+    async fn static_origin_is_host_guarded_but_needs_no_cookie() {
+        let dir = temp_dir("static-host");
+        std::fs::write(dir.join("pic.png"), b"x").unwrap();
+        std::fs::set_permissions(
+            dir.join("pic.png"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let state = Arc::new(state_for(&dir));
+        let token = state
+            .caps
+            .lock()
+            .unwrap()
+            .mint(
+                dir.join("pic.png"),
+                asset_origin::CAP_TTL_SECS,
+                asset_origin::now_secs(),
+            )
+            .unwrap();
+        let cache_dir = temp_dir("static-host-cache");
+        let routes = static_routes_over(state, cache_dir.clone());
+
+        let rebind = warp::test::request()
+            .method("GET")
+            .path(&format!("/cap/{token}"))
+            .header("host", "evil.example.com")
+            .reply(&routes)
+            .await;
+        assert_eq!(rebind.status(), 403, "static origin is Host-guarded");
+
+        let no_host = warp::test::request()
+            .method("GET")
+            .path(&format!("/cap/{token}"))
+            .reply(&routes)
+            .await;
+        assert_eq!(no_host.status(), 403, "missing Host rejected");
+
+        let ok = warp::test::request()
+            .method("GET")
+            .path(&format!("/cap/{token}"))
+            .header("host", valid_static_host())
+            .reply(&routes)
+            .await;
+        assert_eq!(ok.status(), 200, "valid Host + valid cap serves, no cookie");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[tokio::test]
+    async fn static_origin_mounts_the_bundle_route() {
+        let dir = temp_dir("static-bundle");
+        let state = Arc::new(state_for(&dir));
+        let cache_dir = temp_dir("static-bundle-cache");
+        let routes = static_routes_over(state, cache_dir.clone());
+
+        let resp = warp::test::request()
+            .method("GET")
+            .path("/bundle/this-id-does-not-exist.js")
+            .header("host", valid_static_host())
+            .reply(&routes)
+            .await;
+        assert_eq!(resp.status(), 404, "unknown bundle id → 404 from bundle route");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn static_base_round_trips_through_app_state() {
+        let dir = temp_dir("static-base");
+        let state = state_for(&dir);
+        assert_eq!(*state.static_base.lock().unwrap(), None);
+        state.set_static_base("http://127.0.0.1:8081".to_string());
+        assert_eq!(
+            state.static_base.lock().unwrap().as_deref(),
+            Some("http://127.0.0.1:8081")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn non_world_readable_asset_on_stale_token_is_denied() {
+        // Track-A floor hardening: a token for a now-private (0o600) file → 403.
+        let dir = temp_dir("static-floor");
+        std::fs::write(dir.join("secret.png"), b"\x89PNG").unwrap();
+        std::fs::set_permissions(
+            dir.join("secret.png"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let state = Arc::new(state_for(&dir));
+        let token = state
+            .caps
+            .lock()
+            .unwrap()
+            .mint(
+                dir.join("secret.png"),
+                asset_origin::CAP_TTL_SECS,
+                asset_origin::now_secs(),
+            )
+            .unwrap();
+        let cache_dir = temp_dir("static-floor-cache");
+        let routes = static_routes_over(state, cache_dir.clone());
+
+        let resp = warp::test::request()
+            .method("GET")
+            .path(&format!("/cap/{token}"))
+            .header("host", valid_static_host())
+            .reply(&routes)
+            .await;
+        assert_eq!(
+            resp.status(),
+            403,
+            "non-world-readable asset on a stale token must be denied (Track-A floor)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 }
