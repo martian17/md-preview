@@ -10,17 +10,29 @@ fn main() {
     use std::path::PathBuf;
     use std::process::ExitCode;
 
-    // Tiny hand-rolled arg parsing — no clap dependency for two flags.
+    // Tiny hand-rolled arg parsing — no clap dependency for four flags.
     //   md-preview <file.md> [--no-open]
+    //   md-preview --warm-cache
+    //   md-preview --daemon   (used by the systemd user unit)
     // Headless: pass `--no-open`, set `BROWSER=/bin/true`, or `MD_PREVIEW_NO_OPEN`.
     let mut file: Option<PathBuf> = None;
     let mut no_open = std::env::var_os("MD_PREVIEW_NO_OPEN").is_some();
+    let mut warm_cache = false;
+    let mut daemon_flag = false;
 
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--no-open" => no_open = true,
+            "--warm-cache" => warm_cache = true,
+            // --daemon: start the server without opening a document; used by the
+            // systemd user unit so the daemon is always-up even before `md <file>`
+            // is first run.  The election still applies — if another instance is
+            // already running this becomes a no-op client and exits cleanly.
+            "--daemon" => daemon_flag = true,
             "-h" | "--help" => {
                 eprintln!("Usage: md-preview <file.md> [--no-open]");
+                eprintln!("       md-preview --warm-cache");
+                eprintln!("       md-preview --daemon");
                 return;
             }
             other if file.is_none() && !other.starts_with('-') => {
@@ -29,6 +41,74 @@ fn main() {
             other => {
                 eprintln!("Unexpected argument: {other}");
                 std::process::exit(2);
+            }
+        }
+    }
+
+    // --warm-cache: pre-fetch + verify + store every pinned bundle asset, then exit.
+    // Requires the `daemon` feature (bundle cache is daemon-only).
+    if warm_cache {
+        let cache_dir = match md_preview::bundle::default_cache_dir() {
+            Some(d) => d,
+            None => {
+                eprintln!("--warm-cache: cannot determine cache dir (neither XDG_CACHE_HOME nor HOME is set)");
+                std::process::exit(1);
+            }
+        };
+        let cache = md_preview::bundle::BundleCache::new(&cache_dir);
+        let fetcher = md_preview::bundle::UreqFetcher;
+        eprintln!("Warming bundle cache at {} …", cache_dir.display());
+        let summary = md_preview::bundle::warm_all(&cache, &fetcher);
+        for id in &summary.fetched {
+            eprintln!("  fetched:  {id}");
+        }
+        for id in &summary.already_cached {
+            eprintln!("  cached:   {id}");
+        }
+        for (id, err) in &summary.failed {
+            eprintln!("  FAILED:   {id}: {err}");
+        }
+        if summary.all_ok() {
+            eprintln!("All {} bundle assets verified and cached.", summary.fetched.len() + summary.already_cached.len());
+            return;
+        } else {
+            eprintln!("{} asset(s) failed; daemon may degrade on those assets while offline.", summary.failed.len());
+            std::process::exit(1);
+        }
+    }
+
+    // --daemon without a file: start (or join) the always-on daemon, no document.
+    if daemon_flag && file.is_none() {
+        match md_preview::control::bind_or_detect() {
+            Ok(md_preview::control::Election::Client(_handle)) => {
+                // Another daemon instance is already running — nothing to do.
+                return;
+            }
+            Ok(md_preview::control::Election::Daemon(ctrl_listener)) => {
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!("Failed to start runtime: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                let code = rt.block_on(async move {
+                    match md_preview::server::serve_daemon_only(ctrl_listener).await {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(e) => {
+                            eprintln!("Server error: {e}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                });
+                std::process::exit(match code {
+                    c if c == ExitCode::SUCCESS => 0,
+                    _ => 1,
+                });
+            }
+            Err(e) => {
+                eprintln!("Control socket error: {e}");
+                std::process::exit(1);
             }
         }
     }

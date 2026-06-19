@@ -1928,6 +1928,79 @@ pub async fn serve_with_control(
     Ok(())
 }
 
+/// Start the server **without an initial document**: the daemon binds the
+/// control socket and waits for `Open` requests from thin-client invocations
+/// (`md <file>`). Used by `--daemon` / the systemd user unit, where the service
+/// must be always-up even before any file is first opened.
+///
+/// Behaviour is identical to [`serve_with_control`] except no initial root is
+/// registered — the roots registry starts from the persisted state on disk (if
+/// any) so previously open tabs continue to work across restarts.
+pub async fn serve_daemon_only(
+    ctrl: std::os::unix::net::UnixListener,
+) -> std::io::Result<()> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let mut roots = Roots::new(home);
+    if let Ok(loaded) = roots.load() {
+        roots = loaded;
+    }
+
+    let state = Arc::new(AppState::new(roots));
+
+    let preferred: SocketAddr = ([127, 0, 0, 1], 7878).into();
+    let ephemeral: SocketAddr = ([127, 0, 0, 1], 0).into();
+
+    let (bound_addr, fut) = warp::serve(routes(state.clone()))
+        .try_bind_ephemeral(preferred)
+        .or_else(|_| warp::serve(routes(state.clone())).try_bind_ephemeral(ephemeral))
+        .map_err(|e| {
+            let kind = {
+                let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
+                let mut found = std::io::ErrorKind::Other;
+                while let Some(s) = src {
+                    if let Some(io) = s.downcast_ref::<std::io::Error>() {
+                        found = io.kind();
+                        break;
+                    }
+                    src = s.source();
+                }
+                found
+            };
+            std::io::Error::new(kind, e)
+        })?;
+
+    spawn_static_origin(bound_addr, state.clone());
+
+    let state_ctrl = state.clone();
+    std::thread::Builder::new()
+        .name("md-preview-control".into())
+        .spawn(move || {
+            for conn in ctrl.incoming() {
+                match conn {
+                    Ok(stream) => {
+                        let state_conn = state_ctrl.clone();
+                        let http_addr = bound_addr;
+                        std::thread::Builder::new()
+                            .name("md-preview-control-conn".into())
+                            .spawn(move || {
+                                let _ = crate::control::serve_connection(stream, |req| {
+                                    handle_control_request(&state_conn, req, http_addr)
+                                });
+                            })
+                            .ok();
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .map_err(std::io::Error::other)?;
+
+    fut.await;
+    Ok(())
+}
+
 /// Handle one control-plane request on the daemon side.
 ///
 /// `Open{path,root}` → register the root, mint a bootstrap nonce, return

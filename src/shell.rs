@@ -230,12 +230,39 @@ pub fn render_shell_page(static_origin: &str, nonce: &str) -> String {
   }}
 
   // Live updates over a same-origin WebSocket (connect-src 'self').
+  // Auto-reconnects on close/error with capped exponential backoff + jitter so
+  // a tab whose daemon restarted self-heals without a manual page reload.
+  // CSP: connect-src 'self' already permits this same-origin WS — unchanged.
   function subscribe(path, onUpdate) {{
-    const scheme = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(scheme + "://" + location.host
-      + "/ws?path=" + encodeURIComponent(path));
-    ws.addEventListener("message", (ev) => onUpdate(ev.data));
-    return ws;
+    const WS_BASE_MS   = 500;   // first reconnect delay
+    const WS_MAX_MS    = 10000; // cap (~10 s)
+    let delay = WS_BASE_MS;
+    let ws;
+    let stopped = false;
+
+    function connect() {{
+      if (stopped) return;
+      const scheme = location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(scheme + "://" + location.host
+        + "/ws?path=" + encodeURIComponent(path));
+      ws.addEventListener("message", (ev) => onUpdate(ev.data));
+      ws.addEventListener("open", () => {{ delay = WS_BASE_MS; }}); // reset on success
+      ws.addEventListener("close", () => {{ if (!stopped) scheduleReconnect(); }});
+      ws.addEventListener("error", () => {{ /* close fires after error; handled there */ }});
+    }}
+
+    function scheduleReconnect() {{
+      // Jitter: ±20 % of current delay to spread reconnect storms.
+      const jitter = (Math.random() * 0.4 - 0.2) * delay;
+      const wait = Math.min(delay + jitter, WS_MAX_MS);
+      delay = Math.min(delay * 2, WS_MAX_MS);
+      setTimeout(connect, wait);
+    }}
+
+    connect();
+
+    // Return a handle the caller can use to stop reconnecting (e.g. on navigate).
+    return {{ close() {{ stopped = true; ws && ws.close(); }} }};
   }}
 
   window.addEventListener("message", (ev) => {{
@@ -466,6 +493,45 @@ mod tests {
         assert!(page.contains("5000"));
         // Source-based bus check, not origin.
         assert!(page.contains("ev.source === frame.contentWindow"));
+    }
+
+    // Wave 7: WS auto-reconnect / backoff assertions.
+    #[test]
+    fn ws_reconnect_code_is_present_in_shell_page() {
+        let page = render_shell_page(STATIC, "nonceR");
+        // The reconnect plumbing must be present in the inline script.
+        assert!(
+            page.contains("scheduleReconnect"),
+            "shell page must contain WS reconnect logic"
+        );
+        assert!(
+            page.contains("WS_BASE_MS"),
+            "shell page must define base reconnect delay"
+        );
+        assert!(
+            page.contains("WS_MAX_MS"),
+            "shell page must define max reconnect delay cap"
+        );
+        // Jitter must be applied (Math.random()).
+        assert!(
+            page.contains("Math.random()"),
+            "shell page must apply jitter to the reconnect delay"
+        );
+        // The reconnect loop must hook on 'close' (and error fires before close).
+        assert!(
+            page.contains(r#""close""#),
+            "shell page must attach close listener for reconnect"
+        );
+    }
+
+    #[test]
+    fn ws_reconnect_does_not_loosen_csp() {
+        // CSP is built independently of the inline JS, so just check it still
+        // carries connect-src 'self' and nothing wider.
+        let csp = shell_csp(STATIC, "n");
+        assert!(csp.contains("connect-src 'self'"), "CSP must still be connect-src 'self'");
+        assert!(!csp.contains("connect-src *"), "CSP must not be wildened");
+        assert!(!csp.contains("connect-src 'unsafe'"), "CSP must not be wildened");
     }
 
     #[test]
