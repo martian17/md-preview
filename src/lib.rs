@@ -28,9 +28,10 @@ pub mod session;
 #[cfg(feature = "daemon")]
 pub mod server;
 
-// Track-3 "always-on, multi-root, isolated preview daemon" modules. Scaffolded
-// in rebuild Wave 0 as compilable stubs; each is implemented in a later wave
-// (see hq/products/md-preview/REBUILD-PLAN.md). All daemon-gated.
+// Always-on, multi-root, isolated preview daemon modules (Track-3 rebuild,
+// shipped `eb02537`–`ece1ef0`). See HANDOFF.md §3–§4 for the architectural
+// decisions; ADR-0005 (registry), ADR-0006 (auth/trust), ADR-0007 (render-
+// isolation). All daemon-gated.
 #[cfg(feature = "daemon")]
 pub mod roots;
 #[cfg(feature = "daemon")]

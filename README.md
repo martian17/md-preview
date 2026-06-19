@@ -21,16 +21,19 @@ md-preview yourfile.md
 md yourfile.md
 ```
 
-This opens your browser at the live preview and keeps serving until you stop it with Ctrl-C.
+This contacts the always-on daemon (spawning it if needed), registers the file's project root, and opens the browser at the preview URL.
 
 ### Flags and environment
 
 ```bash
-md-preview <file.md> [--port N] [--no-open]
+md-preview <file.md> [--no-open]
+md-preview --warm-cache
+md-preview --daemon
 ```
 
-- `--port N` — port to serve on (default `7878`; also settable via `MD_PREVIEW_PORT`). The port is fixed, not ephemeral.
-- `--no-open` — start the server but don't open a browser (also `MD_PREVIEW_NO_OPEN=1`). The URL is printed to stdout.
+- `--no-open` — register the file and print the URL without opening a browser (also `MD_PREVIEW_NO_OPEN=1`).
+- `--warm-cache` — pre-fetch and verify all pinned bundle assets into the local cache, then exit. Run once after install if you want offline-first operation from the first preview.
+- `--daemon` — start the daemon in server mode (no document); used by the systemd user unit. If a daemon is already running this exits cleanly.
 - `BROWSER` — if set, used as the opener command instead of the system default (e.g. `BROWSER=/bin/true` opens nothing). Useful in CI/headless runs.
 
 ## Installation
@@ -82,15 +85,15 @@ If the browser fails to open for any reason, the URL is printed to stdout so you
 
 ## How it works
 
-1. Takes the Markdown file from the argument; its parent directory becomes the confinement root, so any `.md` (and local assets) under that directory can be previewed
-2. Starts a persistent HTTP server (`warp` + `tokio`) on a fixed port (`7878` by default), and opens your browser at `/view?path=<file>`
-3. Converts Markdown to HTML using `pulldown-cmark` with GFM extensions (tables, strikethrough, task lists, footnotes) plus math (`$...$`, `$$...$$`)
-4. Highlights code blocks server-side with `syntect`, emitting class-based markup styled by bundled GitHub Light/Dark themes
-5. Wraps the output in a `github-markdown-css` template that auto-switches light/dark via `prefers-color-scheme`; math is rendered in the browser by KaTeX
-6. Watches the file with `notify`; on every change — an external editor *or* the built-in editor's save — it re-renders and pushes the new HTML to the page over a WebSocket, so the preview updates live without a reload
-7. Keeps running until you stop it (Ctrl-C)
+1. `md <file>` is a thin client: it talks to the always-on daemon over a Unix socket (`$XDG_RUNTIME_DIR/md-preview/`), registers the file's project root, and opens the browser at the preview URL. If no daemon is running it spawns one detached first.
+2. The daemon (`warp` + `tokio`) runs as a systemd user service (`Restart=always`) — one long-lived process per login, not one per file. It holds a **multi-root registry**: on `md <file>`, the project root (detected by walking ancestors for `.git`/`Cargo.toml`/etc., stopping before `$HOME`) is registered; all files under it can then be previewed. Roots persist across reboots with a 30-day sliding TTL.
+3. All filesystem access goes through a single **confinement funnel** (`confine.rs`): canonicalize → check against the union of registered roots → deny sensitive paths (`~/.ssh`, `$HOME`, `/etc`, …) → open with `O_NOFOLLOW` and hold the fd for the read. No TOCTOU re-resolution.
+4. The preview page is a **trusted SPA shell** (intact localhost origin, session-cookie-gated) that loads the rendered content into a **sandboxed null-origin `<iframe>`** (`sandbox="allow-scripts"`, `connect-src 'none'`). Document images/assets are served from a second loopback port as short-TTL capability URLs, cross-origin to the iframe (canvas-tainted, unexfiltratable).
+5. Converts Markdown to HTML using `pulldown-cmark` with GFM extensions (tables, strikethrough, task lists, footnotes) plus math (`$...$`, `$$...$$`).
+6. Highlights code blocks server-side with `syntect`, emitting class-based markup styled by bundled GitHub Light/Dark themes.
+7. Watches the file with `notify`; on every change — an external editor *or* the built-in editor's save — it re-renders and pushes the new HTML to the page over a WebSocket, so the preview updates live without a reload.
 
-> Markdown styling (`github-markdown-css`) and math (KaTeX) load from a CDN, so rendering those needs an internet connection. Syntax-highlight themes are bundled into the binary and work offline.
+> Built with the default `daemon` feature, the daemon fetches `github-markdown-css`, KaTeX, and Mermaid from pinned CDN URLs on first use and caches them locally (verifying SHA-384); subsequent starts and offline use serve from that cache (`~/.cache/md-preview/`). Built **without** the daemon feature (`--no-default-features`), the standalone HTML output references the CDN URLs directly and requires an internet connection to render styles and math. Syntax-highlight themes are always bundled into the binary and work offline.
 
 Built **without** the default `daemon` feature (`cargo build --no-default-features`), the binary drops every web dependency and instead renders the file to stdout once — a zero-dependency fallback that keeps the renderer reusable as a library.
 
@@ -112,9 +115,15 @@ Daemon only (the default `daemon` feature; absent under `--no-default-features`)
 |---|---|
 | `tokio` | Async runtime |
 | `warp` | HTTP + WebSocket server |
-| `futures-util` | Stream helpers for the WebSocket forwarding |
-| `serde` | Query-string deserialization for routes |
+| `futures-util` | Stream helpers for WebSocket forwarding |
+| `serde` / `serde_json` | Query-string deserialization + control-plane protocol |
 | `webbrowser` | Cross-platform browser launcher |
+| `getrandom` | Entropy for nonce/session/capability tokens |
+| `libc` | `SO_PEERCRED`, `O_NOFOLLOW`, `fstat` (confinement funnel) |
+| `ureq` | Bundle cache HTTP fetcher |
+| `sha2` | SHA-384 SRI verification for the bundle cache |
+| `subtle` | Constant-time comparison for secrets |
+| `base64` | URL-safe + standard encoding for tokens |
 
 ## License
 
