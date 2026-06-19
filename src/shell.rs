@@ -169,7 +169,6 @@ pub fn renderer_csp(static_origin: &str, asset_origin: &str, nonce: &str) -> Str
 pub fn render_shell_page(static_origin: &str, nonce: &str) -> String {
     let s = escape_attr(static_origin);
     let n = escape_attr(nonce);
-    let sandbox = IFRAME_SANDBOX;
     let watchdog = RENDER_WATCHDOG_MS;
     format!(
         r#"<!DOCTYPE html>
@@ -181,46 +180,57 @@ pub fn render_shell_page(static_origin: &str, nonce: &str) -> String {
 <link rel="stylesheet" href="{s}/shell.css" nonce="{n}">
 </head>
 <body>
-<!-- The untrusted renderer: sandbox is allow-scripts ONLY (deliberately not
-     granting the same-origin flag => null/opaque origin, no cookie/token). Its
-     srcdoc is set per document. -->
-<iframe id="render-frame" sandbox="{sandbox}" referrerpolicy="no-referrer"
-        title="rendered document"></iframe>
+<!-- The untrusted renderer iframe is created/destroyed per navigation by the
+     bootstrap (a fresh srcdoc + fresh nonce each time). It always carries
+     sandbox="allow-scripts" ONLY (deliberately not granting the same-origin flag
+     => null/opaque origin, no cookie/token). -->
+<div id="render-host"></div>
 <script nonce="{n}">
-// Trusted shell bus + content fetch + WS subscribe (design §3). The parent is the
-// sole authority on paths: it fetches/authorizes content and re-confines every
-// navigation target; the iframe only reports intent.
+// Trusted shell bus + content fetch + WS subscribe + navigate/save (design §3).
+// The parent is the SOLE authority on paths: it does every authenticated fetch
+// (carrying the cookie same-origin, which is what makes SameSite=Strict work
+// post-/claim), re-confines every navigation target server-side, and the iframe
+// only ever REPORTS intent — it never resolves a path or touches the network.
 (() => {{
   "use strict";
   const RENDER_WATCHDOG_MS = {watchdog};
-  const frame = document.getElementById("render-frame");
-  let watchdog = null;
+  const IFRAME_SANDBOX = "{sandbox}";
+  const host = document.getElementById("render-host");
 
-  // Validate by source (the frame's contentWindow), NEVER event.origin: an opaque
-  // sandbox origin is always the string "null", so origin checks are meaningless.
-  function fromRenderer(ev) {{ return ev.source === frame.contentWindow; }}
+  // Per-mount state. Each navigation destroys the iframe and rebuilds all of it,
+  // so the channel/port/watchdog never leak across documents (no XSS bleed).
+  let frame = null;       // the live <iframe>
+  let channel = null;     // the MessageChannel to the live iframe
+  let watchdog = null;    // teardown timer for the un-acked iframe
+  let wsHandle = null;    // live /ws subscription handle
+  let currentPath = null; // the document the shell is currently tracking
 
   function armWatchdog() {{
     clearTimeout(watchdog);
-    // The iframe is disposable: if it doesn't ack "rendered" in time, tear it
-    // down (bounds DoS from a malicious document).
-    watchdog = setTimeout(() => teardownFrame(), RENDER_WATCHDOG_MS);
+    // The iframe is disposable: if it doesn't ack {{rendered}} in time, tear it
+    // down and rebuild it (bounds DoS from a malicious document, e.g. an
+    // infinite Mermaid graph).
+    watchdog = setTimeout(() => {{ if (currentPath) mount(currentPath); }},
+      RENDER_WATCHDOG_MS);
   }}
 
+  // Destroy the live iframe + its channel + watchdog. Disposable by design.
   function teardownFrame() {{
     clearTimeout(watchdog);
-    frame.removeAttribute("srcdoc");
+    if (channel) {{ try {{ channel.port1.close(); }} catch (e) {{}} channel = null; }}
+    if (frame && frame.parentNode) frame.parentNode.removeChild(frame);
+    frame = null;
   }}
 
-  // parent -> iframe: hand the body HTML over for rendering.
+  // parent -> iframe: hand the body HTML over the dedicated MessageChannel port.
   function postRender(html) {{
+    if (!channel) return;
     armWatchdog();
-    frame.contentWindow.postMessage({{ type: "render", html }}, "*");
+    channel.port1.postMessage({{ type: "render", html }});
   }}
 
-  // The shell does ALL authenticated fetches (it holds the cookie). Wave 6 wires
-  // the concrete content endpoint; here we keep the same-origin fetch shape that
-  // shell_csp's `connect-src 'self'` permits.
+  // The shell does ALL authenticated fetches (it holds the cookie). Same-origin
+  // so the cookie is carried (SameSite=Strict). connect-src 'self' permits this.
   async function loadDocument(path) {{
     const res = await fetch("./content?path=" + encodeURIComponent(path), {{
       credentials: "same-origin",
@@ -229,10 +239,69 @@ pub fn render_shell_page(static_origin: &str, nonce: &str) -> String {
     return res.text();
   }}
 
+  // Fetch a FRESH /srcdoc (fresh nonce, fresh renderer CSP) for each mount, so
+  // every navigation gets a brand-new null-origin sandbox with no shared state.
+  async function fetchSrcdoc() {{
+    const res = await fetch("./srcdoc", {{ credentials: "same-origin" }});
+    if (!res.ok) throw new Error("srcdoc fetch failed: " + res.status);
+    return res.text();
+  }}
+
+  // Build a fresh sandboxed iframe for `path`: destroy any prior frame, mint a
+  // MessageChannel, mount a fresh /srcdoc, hand the iframe its private port on
+  // load, then fetch + relay the rendered body and (re)subscribe to live updates.
+  async function mount(path) {{
+    currentPath = path;
+    teardownFrame();
+    if (wsHandle) {{ wsHandle.close(); wsHandle = null; }}
+
+    let srcdoc;
+    try {{ srcdoc = await fetchSrcdoc(); }} catch (e) {{ console.error("[shell]", e); return; }}
+    // The mount may have been superseded while awaiting (rapid navigation).
+    if (currentPath !== path) return;
+
+    channel = new MessageChannel();
+    frame = document.createElement("iframe");
+    frame.setAttribute("sandbox", IFRAME_SANDBOX);
+    frame.setAttribute("referrerpolicy", "no-referrer");
+    frame.setAttribute("title", "rendered document");
+    frame.id = "render-frame";
+
+    // Inbound from the iframe arrives ONLY over the channel port we created and
+    // handed it — never event.origin (an opaque sandbox origin is the string
+    // "null", so an origin check is meaningless). The port IS the auth: only the
+    // iframe we minted it for holds the other end.
+    channel.port1.onmessage = (ev) => handleRendererMessage(ev.data);
+    channel.port1.start && channel.port1.start();
+
+    frame.addEventListener("load", () => {{
+      // Hand the iframe its private port (transfer port2). The srcdoc keeps it
+      // and replies only over it. armWatchdog before the first body relay.
+      if (!frame || !channel) return;
+      frame.contentWindow.postMessage({{ type: "__port" }}, "*", [channel.port2]);
+    }});
+
+    host.appendChild(frame);
+    frame.srcdoc = srcdoc;
+
+    // Fetch the rendered body and relay it once we have a frame + port. We post
+    // on the next tick after load via the bus; the iframe buffers until ready by
+    // virtue of the channel (queued port messages are delivered after start()).
+    let html;
+    try {{ html = await loadDocument(path); }} catch (e) {{ console.error("[shell]", e); return; }}
+    if (currentPath !== path || !channel) return;
+    postRender(html);
+
+    // Live updates over a same-origin WS (connect-src 'self'); relayed verbatim
+    // into the iframe as a fresh {{render}} on each new body fragment.
+    wsHandle = subscribe(path, (body) => {{
+      if (currentPath === path) postRender(body);
+    }});
+  }}
+
   // Live updates over a same-origin WebSocket (connect-src 'self').
   // Auto-reconnects on close/error with capped exponential backoff + jitter so
   // a tab whose daemon restarted self-heals without a manual page reload.
-  // CSP: connect-src 'self' already permits this same-origin WS — unchanged.
   function subscribe(path, onUpdate) {{
     const WS_BASE_MS   = 500;   // first reconnect delay
     const WS_MAX_MS    = 10000; // cap (~10 s)
@@ -265,39 +334,103 @@ pub fn render_shell_page(static_origin: &str, nonce: &str) -> String {
     return {{ close() {{ stopped = true; ws && ws.close(); }} }};
   }}
 
-  window.addEventListener("message", (ev) => {{
-    if (!fromRenderer(ev)) return;            // source check, not origin
-    const msg = ev.data;
+  // The PARENT is the sole path authority. The iframe reports a clicked link's
+  // target as a STRING; the shell asks the server to re-confine it (server-side
+  // authority — the iframe never gets path authority), then destroys + recreates
+  // the iframe with a fresh /srcdoc for the new doc. Escapes -> the /outside path.
+  async function navigate(target) {{
+    if (typeof target !== "string" || !target) return;
+    // Absolute in-root paths are tracked as the canonical `path=`; the server
+    // re-confine is authoritative. We relay the click target the renderer saw;
+    // the server resolves + confines it relative to the current document's root.
+    let res;
+    try {{
+      res = await fetch("./navigate?path=" + encodeURIComponent(resolveTarget(target)), {{
+        credentials: "same-origin",
+      }});
+    }} catch (e) {{ console.error("[shell]", e); return; }}
+    if (res.status === 204) {{
+      // In-root: re-point the shell URL and mount a fresh iframe for the doc.
+      const next = resolveTarget(target);
+      setPathInUrl(next);
+      mount(next);
+    }} else {{
+      // Escape / sensitive / missing -> the /outside sentinel (server refused).
+      location.href = "/outside";
+    }}
+  }}
+
+  // Resolve a renderer-reported link target against the CURRENT document path so
+  // the server receives an absolute candidate to re-confine. Already-absolute
+  // targets pass through; relative ones are joined to the current doc's dir.
+  // (The server is still the sole authority — this is just to form the query.)
+  function resolveTarget(target) {{
+    if (target.startsWith("/")) return target;
+    const dir = currentPath ? currentPath.replace(/\/[^/]*$/, "") : "";
+    return dir + "/" + target;
+  }}
+
+  function setPathInUrl(path) {{
+    const u = new URL(location.href);
+    u.searchParams.set("path", path);
+    history.replaceState(null, "", u.toString());
+  }}
+
+  // The iframe asked to save the current document. The parent relays the content
+  // to the authenticated same-origin /save endpoint (carrying the cookie). Edits
+  // are SCOPED to the currently tracked path — the iframe cannot name another.
+  async function saveCurrent(content) {{
+    if (!currentPath || typeof content !== "string") return;
+    try {{
+      await fetch("./save?path=" + encodeURIComponent(currentPath), {{
+        method: "POST",
+        credentials: "same-origin",
+        headers: {{ "content-type": "text/plain; charset=utf-8" }},
+        body: content,
+      }});
+    }} catch (e) {{ console.error("[shell]", e); }}
+  }}
+
+  // Validated inbound from the iframe (delivered ONLY over the channel port).
+  function handleRendererMessage(msg) {{
     if (!msg || typeof msg.type !== "string") return;
     switch (msg.type) {{
       case "rendered":
         clearTimeout(watchdog);               // ack: cancel the teardown timer
         break;
       case "save":
-        // Parent writes only the current tracked document (scoped edits).
-        saveCurrent(msg.content);
+        saveCurrent(msg.content);             // scoped to the tracked doc
         break;
       case "navigate":
-        // Parent re-resolves + confines msg.target, destroys this frame, and
-        // mounts a fresh srcdoc iframe (Wave 6 owns the confinement).
-        navigate(msg.target);
+        navigate(msg.target);                 // server re-confine + remount
         break;
       case "error":
         console.error("[renderer]", msg.message);
         break;
     }}
-  }});
+  }}
 
-  // Wave-6 wiring stubs (kept inert so the shell is self-contained & no-panic):
-  function saveCurrent(_content) {{ /* parent POSTs to the save endpoint */ }}
-  function navigate(_target) {{ teardownFrame(); /* re-confine + remount */ }}
+  // The shell drives itself on load from the ?path= in its OWN (trusted) URL.
+  function start() {{
+    const path = new URLSearchParams(location.search).get("path");
+    if (path) mount(path);
+  }}
 
-  // Exposed for the Wave-6 bootstrap to drive once a document/path is known.
-  window.__mdPreviewShell = {{ loadDocument, subscribe, postRender, teardownFrame }};
+  // Exposed for tests / manual driving; the page also self-starts on load.
+  window.__mdPreviewShell = {{
+    loadDocument, subscribe, postRender, teardownFrame, mount, navigate, saveCurrent, start,
+  }};
+
+  if (document.readyState === "loading") {{
+    document.addEventListener("DOMContentLoaded", start);
+  }} else {{
+    start();
+  }}
 }})();
 </script>
 </body>
-</html>"#
+</html>"#,
+        sandbox = IFRAME_SANDBOX,
     )
 }
 
@@ -308,11 +441,14 @@ pub fn render_shell_page(static_origin: &str, nonce: &str) -> String {
 /// the matching CSP is embedded as a `<meta http-equiv>` so the policy travels with
 /// the srcdoc (a srcdoc document has no response headers of its own).
 ///
-/// The bootstrap is intentionally tiny: it waits for `{type:"render", html}` from
-/// the parent, injects the body, and posts `{type:"rendered"}` (or
-/// `{type:"error", message}`). Save / navigate intents are reported up to the
-/// parent — the renderer never resolves a path or touches the network
-/// (`connect-src 'none'`).
+/// The bootstrap is intentionally tiny: it first receives its **private
+/// `MessageChannel` port** from the parent (a one-shot `{type:"__port"}` window
+/// message carrying the transferred port — the *only* `window`-level message it
+/// trusts, and only when it arrives from `parent` with a port attached). From then
+/// on all traffic flows over that port: it waits for `{type:"render", html}`,
+/// injects the body, and posts `{type:"rendered"}` (or `{type:"error", message}`)
+/// back **over the port**. Save / navigate intents are reported up the port — the
+/// renderer never resolves a path or touches the network (`connect-src 'none'`).
 pub fn render_srcdoc(static_origin: &str, asset_origin: &str) -> String {
     let nonce = gen_nonce();
     let csp = escape_attr(&renderer_csp(static_origin, asset_origin, &nonce));
@@ -334,12 +470,15 @@ pub fn render_srcdoc(static_origin: &str, asset_origin: &str) -> String {
 // paths itself (the parent is the sole path authority).
 (() => {{
   "use strict";
-  // Reply only to the embedder (parent). Do NOT trust event.origin ("null").
-  function toParent(msg) {{ parent.postMessage(msg, "*"); }}
+  // The dedicated MessageChannel port to the parent. Until it arrives there is no
+  // bus at all (and never any network). Reply ONLY over this port — never
+  // event.origin ("null" for an opaque sandbox) and never a broadcast postMessage.
+  let port = null;
 
-  window.addEventListener("message", (ev) => {{
-    if (ev.source !== parent) return;
-    const msg = ev.data;
+  function toParent(msg) {{ if (port) port.postMessage(msg); }}
+
+  // Render a body fragment handed down over the port and ack it.
+  function render(msg) {{
     if (!msg || msg.type !== "render" || typeof msg.html !== "string") return;
     try {{
       document.getElementById("doc").innerHTML = msg.html;
@@ -347,10 +486,25 @@ pub fn render_srcdoc(static_origin: &str, asset_origin: &str) -> String {
     }} catch (e) {{
       toParent({{ type: "error", message: String(e && e.message || e) }});
     }}
+  }}
+
+  // ONE-SHOT port handshake. The only window-level message we honour is the
+  // parent handing us our private port; we bind the bus to it and stop listening
+  // at the window level. We require ev.source === parent AND a transferred port
+  // (the parent is the embedder; an opaque origin can't be checked, so the
+  // source + the unforgeable transferred port ARE the authentication).
+  window.addEventListener("message", function onPort(ev) {{
+    if (ev.source !== parent) return;
+    const msg = ev.data;
+    if (!msg || msg.type !== "__port" || !ev.ports || !ev.ports[0]) return;
+    window.removeEventListener("message", onPort);
+    port = ev.ports[0];
+    port.onmessage = (e) => render(e.data);
+    if (port.start) port.start();
   }});
 
-  // Link clicks are reported up; the parent re-confines the target and remounts a
-  // fresh iframe. The renderer never navigates itself.
+  // Link clicks are reported up the port; the parent re-confines the target and
+  // remounts a fresh iframe. The renderer never navigates itself.
   document.addEventListener("click", (ev) => {{
     const a = ev.target.closest && ev.target.closest("a[href]");
     if (!a) return;
@@ -499,8 +653,84 @@ mod tests {
         assert!(page.contains(r#"<script nonce="nonceX">"#));
         // Watchdog budget injected.
         assert!(page.contains("5000"));
-        // Source-based bus check, not origin.
-        assert!(page.contains("ev.source === frame.contentWindow"));
+        // The bus is a dedicated MessageChannel port (validated by port identity,
+        // NOT by event.origin — an opaque sandbox origin is the string "null").
+        assert!(page.contains("new MessageChannel()"));
+        assert!(page.contains("channel.port1.onmessage"));
+        // The private port (port2) is transferred to the iframe on load.
+        assert!(page.contains("[channel.port2]"));
+        // The shell must never GATE inbound iframe messages on the origin (it is
+        // the string "null" for an opaque sandbox). The bus validation is the port
+        // identity above; assert no origin-comparison anti-pattern is present.
+        assert!(
+            !page.contains(".origin ===") && !page.contains(".origin =="),
+            "shell must validate by port, never by comparing origin"
+        );
+    }
+
+    #[test]
+    fn shell_bootstrap_wires_content_navigate_save_and_ws() {
+        let page = render_shell_page(STATIC, "n");
+        // Bootstrap: reads ?path= from its OWN (trusted) URL and mounts.
+        assert!(page.contains(r#"new URLSearchParams(location.search).get("path")"#));
+        // Authenticated same-origin content fetch (cookie carried -> SameSite=Strict).
+        assert!(page.contains(r#"fetch("./content?path="#));
+        assert!(page.contains(r#"credentials: "same-origin""#));
+        // A FRESH /srcdoc is fetched per mount (fresh nonce per navigation).
+        assert!(page.contains(r#"fetch("./srcdoc""#));
+        // navigate() is server-authoritative: it hits /navigate, never resolves
+        // the path in the iframe.
+        assert!(page.contains(r#"fetch("./navigate?path="#));
+        // 204 from /navigate => in-root: remount; otherwise the /outside sentinel.
+        assert!(page.contains("204"));
+        assert!(page.contains("/outside"));
+        // saveCurrent() relays to the same-origin /save endpoint, scoped to the
+        // CURRENTLY tracked path (the iframe can never name another doc).
+        assert!(page.contains(r#"fetch("./save?path="#));
+        assert!(page.contains(r#"method: "POST""#));
+        assert!(page.contains("currentPath"));
+        // Live updates subscribe over the same-origin WS and relay as {render}.
+        assert!(page.contains("/ws?path="));
+    }
+
+    #[test]
+    fn shell_handles_full_renderer_message_schema() {
+        let page = render_shell_page(STATIC, "n");
+        // The inbound dispatcher handles every iframe->parent message type.
+        for ty in [r#"case "rendered""#, r#"case "save""#, r#"case "navigate""#, r#"case "error""#] {
+            assert!(page.contains(ty), "shell must handle {ty}");
+        }
+        // The rendered ack cancels the watchdog teardown timer.
+        assert!(page.contains("clearTimeout(watchdog)"));
+    }
+
+    #[test]
+    fn shell_watchdog_tears_down_unacked_iframe() {
+        let page = render_shell_page(STATIC, "n");
+        // An un-acked iframe is rebuilt after RENDER_WATCHDOG_MS.
+        assert!(page.contains("armWatchdog"));
+        assert!(page.contains("setTimeout"));
+        assert!(page.contains("teardownFrame"));
+        // The watchdog re-mounts the current path (disposable iframe).
+        assert!(page.contains("if (currentPath) mount(currentPath)"));
+    }
+
+    #[test]
+    fn srcdoc_binds_bus_to_transferred_port_not_window() {
+        let doc = render_srcdoc(STATIC, ASSET);
+        // The renderer trusts ONLY the one-shot port handshake from the parent and
+        // then talks over the transferred port — never a broadcast postMessage.
+        assert!(doc.contains(r#"msg.type !== "__port""#));
+        assert!(doc.contains("ev.ports[0]"));
+        assert!(doc.contains("ev.source !== parent"));
+        assert!(doc.contains("port.postMessage"));
+        // It must NOT reply via an unscoped parent.postMessage broadcast.
+        assert!(
+            !doc.contains("parent.postMessage"),
+            "renderer must reply only over its dedicated port"
+        );
+        // After binding the port it stops listening at the window level (one-shot).
+        assert!(doc.contains("removeEventListener"));
     }
 
     // Wave 7: WS auto-reconnect / backoff assertions.
