@@ -66,7 +66,8 @@ impl BundleAsset {
 }
 
 /// Pinned KaTeX version, shared by the JS, CSS and every font row.
-const KATEX_VERSION: &str = "0.16.11";
+/// 0.16.47 picks up the CVE-2025-23207 `\htmlData` XSS fix (affects < 0.16.21).
+const KATEX_VERSION: &str = "0.16.47";
 
 /// Compile-time helper for a KaTeX woff2 font row (content-type is fixed). The
 /// dist base is a literal here because `concat!` only accepts literals.
@@ -75,7 +76,7 @@ macro_rules! font {
         BundleAsset {
             id: concat!("fonts/", $id),
             version: KATEX_VERSION,
-            url: concat!("https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/fonts/", $id),
+            url: concat!("https://cdn.jsdelivr.net/npm/katex@0.16.47/dist/fonts/", $id),
             sha384: $sha,
             content_type: "font/woff2",
         }
@@ -93,17 +94,17 @@ pub static MANIFEST: &[BundleAsset] = &[
     // it is the renderer-critical single-file asset we can pin now.)
     BundleAsset {
         id: "mermaid.min.js",
-        version: "11.6.0",
-        url: "https://cdn.jsdelivr.net/npm/mermaid@11.6.0/dist/mermaid.min.js",
-        sha384: "zkWMJO4sgpPUzyuOgDx8HB/K55glbAwajEpk1Go2NWRuPkPA/wIhoEJTuSkmOYrV",
+        version: "11.15.0",
+        url: "https://cdn.jsdelivr.net/npm/mermaid@11.15.0/dist/mermaid.min.js",
+        sha384: "yQ4mmBBT+vhTAwjFH0toJXNYJ6O4usWnt6EPIdWwrRvx2V/n5lXuDZQwQFeSFydF",
         content_type: "text/javascript; charset=utf-8",
     },
     // KaTeX JS (`katex.min.js`) — self-contained, single file.
     BundleAsset {
         id: "katex.min.js",
         version: KATEX_VERSION,
-        url: "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js",
-        sha384: "7zkQWkzuo3B5mTepMUcHkMB5jZaolc2xDwL6VFqjFALcbeS9Ggm/Yr2r3Dy4lfFg",
+        url: "https://cdn.jsdelivr.net/npm/katex@0.16.47/dist/katex.min.js",
+        sha384: "CwjPRVHTvLiMBFjEoij+QZViMV5rhTOIp7CJzl24JEqpRDA1sJFHVXXLURktbYYp",
         content_type: "text/javascript; charset=utf-8",
     },
     // KaTeX CSS (`katex.min.css`) — references `url(fonts/KaTeX_*.woff2)`
@@ -112,16 +113,16 @@ pub static MANIFEST: &[BundleAsset] = &[
     BundleAsset {
         id: "katex.min.css",
         version: KATEX_VERSION,
-        url: "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css",
-        sha384: "nB0miv6/jRmo5UMMR1wu3Gz6NLsoTkbqJghGIsx//Rlm+ZU03BU6SQNC66uf4l5+",
+        url: "https://cdn.jsdelivr.net/npm/katex@0.16.47/dist/katex.min.css",
+        sha384: "nH0MfJ44wi1dd7w6jinlyBgljjS8EJAh2JBoRad8a3VDw2K69vfaaqm4WnR+gXtA",
         content_type: "text/css; charset=utf-8",
     },
     // github-markdown-css — the document base stylesheet.
     BundleAsset {
         id: "github-markdown.css",
-        version: "5.8.1",
-        url: "https://cdn.jsdelivr.net/npm/github-markdown-css@5.8.1/github-markdown.css",
-        sha384: "fykOnyQrzwZG6n5lS8ztU9pMfq4/l7OGFRYvFfTfkaulaTazR46JUlMnH5yl/EQq",
+        version: "5.9.0",
+        url: "https://cdn.jsdelivr.net/npm/github-markdown-css@5.9.0/github-markdown.css",
+        sha384: "X2shx+NJpjDz2Pj4RRV7UUJWOF5zvFlJ8H8hzDTDEK8HIYY31T157AgGG6Kjq4w0",
         content_type: "text/css; charset=utf-8",
     },
     // KaTeX glyph fonts (20 × woff2), each pinned individually — option (a).
