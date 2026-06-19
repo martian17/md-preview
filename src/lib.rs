@@ -28,6 +28,26 @@ pub mod session;
 #[cfg(feature = "daemon")]
 pub mod server;
 
+// Track-3 "always-on, multi-root, isolated preview daemon" modules. Scaffolded
+// in rebuild Wave 0 as compilable stubs; each is implemented in a later wave
+// (see hq/products/md-preview/REBUILD-PLAN.md). All daemon-gated.
+#[cfg(feature = "daemon")]
+pub mod roots;
+#[cfg(feature = "daemon")]
+pub mod auth;
+#[cfg(feature = "daemon")]
+pub mod control;
+#[cfg(feature = "daemon")]
+pub mod shell;
+#[cfg(feature = "daemon")]
+pub mod validate;
+#[cfg(feature = "daemon")]
+pub mod bundle;
+#[cfg(feature = "daemon")]
+pub mod asset_origin;
+#[cfg(feature = "daemon")]
+pub mod confine;
+
 /// Class prefix for syntect's highlight classes. Shared by the HTML generator
 /// and the generated CSS so the markup and stylesheet stay in sync.
 const HL_PREFIX: &str = "hl-";
