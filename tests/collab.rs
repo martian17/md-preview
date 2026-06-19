@@ -73,14 +73,31 @@ async fn spawn_daemon(file: PathBuf, addr: SocketAddr) {
     }
 }
 
-/// Connect a binary WebSocket client to `/collab?path=<rel>` on `addr`.
+/// Percent-encode an absolute path for use as a `path=` query value (mirrors the
+/// server's encoder). A document is identified by its canonical absolute path.
+fn encode_path(p: &std::path::Path) -> String {
+    let mut out = String::new();
+    for b in p.to_string_lossy().bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Connect a binary WebSocket client to `/collab?path=<abs>` on `addr`. `file` is
+/// the canonical absolute document path. tungstenite sets `Host: <addr>`
+/// (loopback) automatically, satisfying the daemon's host guard.
 async fn connect_collab(
     addr: SocketAddr,
-    rel: &str,
+    file: &std::path::Path,
 ) -> tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
 > {
-    let url = format!("ws://{addr}/collab?path={rel}");
+    let url = format!("ws://{addr}/collab?path={}", encode_path(file));
     let (ws, _resp) = tokio_tungstenite::connect_async(url)
         .await
         .expect("collab websocket should connect");
@@ -115,7 +132,7 @@ async fn collab_handshake_seeds_a_fresh_client() {
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     spawn_daemon(file.clone(), addr).await;
 
-    let mut ws = connect_collab(addr, "doc.md").await;
+    let mut ws = connect_collab(addr, &file).await;
 
     // 1. Server's SyncStep1 arrives first (we don't need to act on it here).
     let _server_step1 = next_binary(&mut ws).await;
@@ -163,7 +180,7 @@ async fn collab_edit_writes_back_without_feedback_loop() {
 
     // Build a local session converged with the server, then make an edit and
     // send it as an Update frame.
-    let mut ws = connect_collab(addr, "doc.md").await;
+    let mut ws = connect_collab(addr, &file).await;
     let _server_step1 = next_binary(&mut ws).await;
 
     // Sync up: send our SyncStep1, absorb the SyncStep2.
@@ -230,7 +247,7 @@ async fn collab_edit_still_pushes_html_to_ws_viewer() {
     spawn_daemon(file.clone(), addr).await;
 
     // A one-way preview viewer on /ws (text frames of rendered HTML).
-    let ws_url = format!("ws://{addr}/ws?path=doc.md");
+    let ws_url = format!("ws://{addr}/ws?path={}", encode_path(&file));
     let (mut viewer, _) = tokio_tungstenite::connect_async(ws_url)
         .await
         .expect("/ws viewer connects");
@@ -242,7 +259,7 @@ async fn collab_edit_still_pushes_html_to_ws_viewer() {
         .expect("ok");
 
     // A collab editor converges, then inserts unique marker text.
-    let mut editor = connect_collab(addr, "doc.md").await;
+    let mut editor = connect_collab(addr, &file).await;
     let _server_step1 = next_binary(&mut editor).await;
     let mut local = YrsSession::from_text("");
     let step1 = collab::encode_sync_step1(local.state_vector());

@@ -57,14 +57,14 @@ fn main() {
 
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
 
-    // Build the preview URL: /view with the file's name as the path query
-    // parameter.  The server resolves it under the file's parent directory
-    // (the confinement root).
-    let file_name = file
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let url = format!("http://{addr}/view?path={file_name}");
+    // Build the preview URL: /view with the file's CANONICAL ABSOLUTE path as the
+    // (URL-encoded) `path` query parameter. A document is identified by its
+    // canonical absolute path; the daemon confines it against the active roots.
+    let abs = std::fs::canonicalize(&file).unwrap_or_else(|_| file.clone());
+    let url = format!(
+        "http://{addr}/view?path={}",
+        encode_path_query(&abs.to_string_lossy())
+    );
 
     // A multi-threaded runtime: the blocking watch loop runs on its own OS
     // thread, but the WS forwarding + HTTP serving want async workers.
@@ -119,6 +119,23 @@ fn main() {
         c if c == ExitCode::SUCCESS => 0,
         _ => 1,
     });
+}
+
+/// Minimal percent-encoding for the `path=` query value (an absolute path):
+/// keep the unreserved set plus `/`/`.`/`-`/`_`, percent-encode the rest. Mirrors
+/// the server-side encoder; avoids a URL-encoding crate for one call site.
+#[cfg(feature = "daemon")]
+fn encode_path_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Default port for the daemon, overridable via `--port` or the `MD_PREVIEW_PORT`
