@@ -1634,6 +1634,17 @@ fn spawn_watch(
                             if update.len() > MAX_UPDATE_BYTES {
                                 continue;
                             }
+                            // Step 1b — THE yrs-UB GUARD (audit HIGH): walk the
+                            // untrusted v1 update bytes with the bounds-checked,
+                            // CHECKED-UTF-8 validator and DROP an unsafe update
+                            // BEFORE any yrs decode. `Update::decode_v1` (reached
+                            // by `merge`) reads embedded strings with
+                            // `from_utf8_unchecked` — invalid UTF-8 there is UB /
+                            // a non-unwinding abort that `catch_unwind` cannot
+                            // contain. Rejecting here is the only safe defense.
+                            if !crate::validate::is_update_bytes_safe(&update) {
+                                continue;
+                            }
                             // Steps 2+3: decode-guarded merge under catch_unwind.
                             let changed = match std::panic::catch_unwind(
                                 std::panic::AssertUnwindSafe(|| peer.session_mut().merge(&update)),
@@ -2308,6 +2319,27 @@ mod tests {
             "a.md links to b.md by abs path: {a_body}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- yrs UB guard wiring (W3.3) ----------------------------------------
+
+    #[test]
+    fn unsafe_yrs_update_is_rejected_by_validator() {
+        // A real, valid update is accepted; a bit-flipped / garbage update is
+        // rejected by the pre-decode validator WITHOUT a panic or abort. This is
+        // the guard the collab receive path calls before any yrs decode.
+        use crate::doc::{DocSession as _, TextEdit};
+        let mut s = YrsSession::from_text("");
+        s.apply(&[TextEdit::insert(0, "hello collab")]);
+        let valid = s.update_since(&YrsSession::from_text("").state_vector());
+        assert!(crate::validate::is_update_bytes_safe(&valid), "valid update accepted");
+
+        // Pure garbage is rejected.
+        assert!(!crate::validate::is_update_bytes_safe(&[0xff, 0x00, 0x13, 0x37]));
+        // Truncations never panic and are rejected (no abort).
+        for cut in 1..valid.len() {
+            let _ = crate::validate::is_update_bytes_safe(&valid[..cut]);
+        }
     }
 
     // --- bind error handling (unchanged) -----------------------------------
