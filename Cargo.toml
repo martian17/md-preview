@@ -42,8 +42,10 @@ yrs-weak = ["yrs/weak"]
 yrs-v2-collab = []
 
 [dependencies]
-pulldown-cmark = "0.13.3"  # Fast and GFM compatible
-syntect = "5.3.0"
+# Pure Markdown renderer, split out into its own workspace crate. Re-exported
+# from `lib.rs`; carries no web/async/CRDT deps (pulldown-cmark + syntect live
+# there now), so `--no-default-features` still drops the whole daemon stack.
+md-render = { path = "crates/md-render" }
 yrs = { version = "0.27.2", features = ["sync"] }  # `sync` enables y-protocols framing types (Message/SyncMessage) for /collab (ADR-0004)
 similar = "3.1.1"
 notify = "8.2.0"
