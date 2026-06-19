@@ -233,7 +233,7 @@ pub fn render_shell_page(static_origin: &str, nonce: &str) -> String {
   function subscribe(path, onUpdate) {{
     const scheme = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(scheme + "://" + location.host
-      + "/subscribe?path=" + encodeURIComponent(path));
+      + "/ws?path=" + encodeURIComponent(path));
     ws.addEventListener("message", (ev) => onUpdate(ev.data));
     return ws;
   }}

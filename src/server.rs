@@ -32,29 +32,25 @@
 //!   * an `Arc<Mutex<String>>` holding the latest rendered body so a fresh
 //!     `/view`/`/ws` can reflect the current state without touching the doc.
 //!
-//! ## Cross-file `.md` links and local assets
+//! ## Cross-file `.md` links and local assets (render-isolation; design §3)
 //! The rendered HTML emits ordinary relative URLs — both `<a href="other.md">`
-//! links and `<img src="pic.png">` (and other local) asset references. Rather
-//! than rely on the browser resolving those against `/view?path=…` (which a
-//! query string breaks), the server rewrites them in [`rewrite_doc_urls`]:
-//!   * relative `.md` links become `/view?path=<rel>` (a confined live page), and
-//!   * other relative asset URLs (`src="…"`, plus non-`.md` `href`s) become
-//!     `/asset?path=<rel>` (served read-only by the [`asset`](serve_asset) route).
+//! links and `<img src="pic.png">` (and other local) asset references. The
+//! content path rewrites them in [`rewrite_doc_caps`], the capability-aware
+//! rewrite applied AFTER the floor passes (the mint-time authorization context):
+//!   * relative `.md` links become `/view?path=<abs>` — the trusted shell SPA,
+//!     which (with the parent navigation gate) owns navigation, and
+//!   * relative media (`src="…"`, non-`.md` assets) become a per-doc, short-TTL
+//!     **capability URL** `http://<static>/cap/<token>` on the secondary static
+//!     origin (minted via [`asset_origin::cap_url`]), so the sandboxed
+//!     null-origin renderer can display but never read/exfiltrate the bytes.
 //!
-//! Both share one small attribute-rewrite pass: each candidate URL is resolved
-//! relative to the current document's directory and re-confined through
-//! [`FilePeer::within`]; a URL that escapes the root is left untouched (it simply
-//! won't resolve to a confined target). The rewrite is the only post-processing
-//! of the otherwise-pure render; `render_markdown` stays unchanged.
-//!
-//! ## Sandboxed static assets
-//! [`GET /asset?path=<rel>`](serve_asset) serves local files referenced by the
-//! document (images, stylesheets, …) so they render in the live preview without
-//! a CDN. It mirrors `/view`'s confinement exactly: `<rel>` is resolved via
-//! [`FilePeer::within`] (traversal/symlink escapes are rejected), the existing
-//! [`DEFAULT_MAX_FILE_SIZE`] read cap is enforced, and the bytes are returned
-//! read-only with a `Content-Type` inferred from the file extension. It never
-//! follows a link outside the root and never writes.
+//! A URL that escapes every active root becomes the `/outside` 403 sentinel.
+//! Each candidate is resolved relative to the document's directory and confined
+//! via [`confine::confine_link`]; absolute/external/`data:`/fragment URLs are
+//! left as-is. Both the same-origin `/content` API and the `/ws` watch-loop
+//! broadcast (relayed into the iframe) use this one rewrite; `render_markdown`
+//! stays unchanged. The old shell-origin `/asset?path=` rewrite is retired
+//! (the renderer CSP would block a shell-origin asset URL anyway).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -74,7 +70,6 @@ use crate::confine::{self, ConfineError, ConfinedFile};
 use crate::doc::DocSession;
 use crate::file_peer::{FilePeer, DEFAULT_MAX_FILE_SIZE};
 use crate::render_markdown;
-use crate::render_page_with;
 use crate::roots::Roots;
 use crate::session::YrsSession;
 
@@ -298,6 +293,22 @@ impl AppState {
         }
     }
 
+    /// Snapshot the secondary static origin's base URL, if the static origin has
+    /// been bound yet. The render-isolation shell ([`view_page`]) and the
+    /// per-document srcdoc ([`srcdoc_page`]) need it to point the iframe at the
+    /// cross-origin bundle + capability-asset origin; the asset rewrite
+    /// ([`rewrite_doc_caps`]) needs it to mint `/cap/<token>` URLs. A poisoned
+    /// lock or an unbound static origin yields `None` — callers fail closed (the
+    /// shell still renders but cross-origin assets/bundle are unavailable until
+    /// the static origin is up). Mutex dropped before return; never held across
+    /// an `.await`.
+    fn static_base_snapshot(&self) -> Option<String> {
+        self.static_base
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
     /// Resolve `requested` (absolute) to its canonical path and get (or lazily
     /// create) its registry entry, keyed by the canonical path so different
     /// spellings of the same file share one entry. The owning root (the watch
@@ -360,7 +371,11 @@ impl AppState {
             latest_body.clone(),
             collab_rx,
             collab_out.clone(),
-            self.roots_snapshot(),
+            WatchRenderDeps {
+                roots: self.roots_snapshot(),
+                caps: self.caps.clone(),
+                static_base: self.static_base_snapshot(),
+            },
         )
         .map_err(ConfineError::Io)?;
         let entry = Arc::new(Entry {
@@ -491,16 +506,54 @@ fn routes(
             claim(&claim_state, host.as_deref(), &body)
         });
 
-    // GET /view?path=<abs> -> full live-preview HTML page (confined + floored).
+    // GET /view -> the trusted render-isolation SHELL (the privileged SPA that
+    // holds the cookie, hosts the sandboxed renderer iframe, and does all the
+    // authenticated fetching). COOP/COEP + frame-ancestors 'none' shell CSP. The
+    // `?path=` is consumed client-side by the shell bootstrap (which fetches
+    // `/content?path=` and mounts a fresh `/srcdoc` iframe per document), so the
+    // shell itself serves NO file bytes and is only network-guarded. (W6.1, 3b-iii)
     let view_state = state.clone();
     let view = warp::path("view")
         .and(warp::path::end())
         .and(warp::get())
         .and(with_context(state.clone()))
-        .and(warp::query::<ViewQuery>())
-        .map(move |ctx: ReqContext, q: ViewQuery| {
-            view_page(&view_state, &ctx, &q.path, q.view.as_deref())
-        });
+        .map(move |ctx: ReqContext| view_page(&view_state, &ctx));
+
+    // GET /srcdoc -> the sandboxed null-origin renderer document (a FRESH nonce
+    // per request: a fresh iframe per navigation). renderer CSP (default-src
+    // 'none', connect-src 'none', img/media from the static origin only) travels
+    // in the srcdoc's <meta http-equiv>. Network-guarded; serves no file bytes.
+    let srcdoc_state = state.clone();
+    let srcdoc = warp::path("srcdoc")
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_context(state.clone()))
+        .map(move |ctx: ReqContext| srcdoc_page(&srcdoc_state, &ctx));
+
+    // GET /content?path=<abs> -> the rendered markdown BODY fragment for one doc,
+    // SAME-ORIGIN + authenticated. Goes through `serve_confined` (the floor): a
+    // non-world-readable doc requires the same-origin session cookie. The shell
+    // fetches this and relays {type:"render",html} into the sandboxed iframe.
+    // (W6.1, 3b-iii)
+    let content_state = state.clone();
+    let content = warp::path("content")
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_context(state.clone()))
+        .and(warp::query::<PathQuery>())
+        .map(move |ctx: ReqContext, q: PathQuery| content_fragment(&content_state, &ctx, &q.path));
+
+    // GET /navigate?path=<abs> -> the PARENT's path-authority gate: re-confine a
+    // navigation target the sandboxed iframe reported. 204 (in-root) lets the
+    // parent mount a fresh /srcdoc for it; 403/4xx (escape) is the /outside
+    // sentinel. The iframe NEVER resolves a path itself. (W6.2, 3b-iii)
+    let navigate_state = state.clone();
+    let navigate = warp::path("navigate")
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_context(state.clone()))
+        .and(warp::query::<PathQuery>())
+        .map(move |ctx: ReqContext, q: PathQuery| navigate_gate(&navigate_state, &ctx, &q.path));
 
     // GET /edit?path=<abs> -> full multi-user collaborative editor page. Confined
     // + FLOORED (audit MED-3): a non-world-readable file requires auth even just
@@ -512,15 +565,6 @@ fn routes(
         .and(with_context(state.clone()))
         .and(warp::query::<PathQuery>())
         .map(move |ctx: ReqContext, q: PathQuery| edit_page(&edit_state, &ctx, &q.path));
-
-    // GET /asset?path=<abs> -> raw bytes of a confined in-root file (floored).
-    let asset_state = state.clone();
-    let asset = warp::path("asset")
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_context(state.clone()))
-        .and(warp::query::<PathQuery>())
-        .map(move |ctx: ReqContext, q: PathQuery| serve_asset(&asset_state, &ctx, &q.path));
 
     // GET /raw?path=<abs> -> the confined file's raw Markdown source (floored).
     let raw_state = state.clone();
@@ -576,8 +620,10 @@ fn routes(
     health
         .or(claim)
         .or(view)
+        .or(srcdoc)
+        .or(content)
+        .or(navigate)
         .or(edit)
-        .or(asset)
         .or(raw)
         .or(save)
         .or(ws)
@@ -590,16 +636,6 @@ fn routes(
 #[derive(serde::Deserialize)]
 struct PathQuery {
     path: String,
-}
-
-/// The `/view` query: `?path=<rel>` plus an optional `?view=preview|split|editor`
-/// that picks the initial layout (the in-page toolbar can switch it afterwards,
-/// persisting the choice in `localStorage`). An unknown/absent `view` falls back
-/// to the persisted choice, then to `preview` — handled client-side.
-#[derive(serde::Deserialize)]
-struct ViewQuery {
-    path: String,
-    view: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -670,46 +706,156 @@ impl FloorDeny {
     }
 }
 
-/// Render the full live-preview page for `requested`, confined + FLOORED.
+/// The shell origin's COOP header (cross-origin isolation; design §3 backstops).
+const SHELL_COOP_HEADER: (&str, &str) = ("cross-origin-opener-policy", crate::shell::SHELL_COOP);
+/// The shell origin's COEP header (pairs with COOP for Site Isolation).
+const SHELL_COEP_HEADER: (&str, &str) = ("cross-origin-embedder-policy", crate::shell::SHELL_COEP);
+
+/// Serve the **trusted render-isolation shell** (design §3 "Two contexts";
+/// ADR-0007). This is the privileged SPA that holds the session cookie, hosts
+/// the sandboxed renderer iframe, and does ALL authenticated fetching; it loads
+/// no untrusted content (the bundle comes cross-origin from the static origin).
 ///
-/// First the network guard (host/origin), then the floor chokepoint: a
-/// non-world-readable file requires auth (audit A0). On success the entry is
-/// lazily created/reused; the page body comes from the entry's cached latest
-/// render. Cross-file links are already rewritten to `/view?path=<abs>` /
-/// `/asset?path=<abs>` (and the `/outside` 403 sentinel for escapes) by the
-/// watch loop.
-fn view_page(
-    state: &AppState,
-    ctx: &ReqContext,
-    requested: &str,
-    view: Option<&str>,
-) -> warp::reply::Response {
+/// Headers (the security isolation boundary):
+///   * `Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy:
+///     require-corp` → cross-origin isolation, so the null-origin iframe runs in
+///     its own process (Spectre-class backstop),
+///   * `Content-Security-Policy: <shell_csp>` — which includes
+///     `frame-ancestors 'none'` (the shell may never itself be framed),
+///     `connect-src 'self'` (same-origin content API + WS only), and no CDN.
+///
+/// Only the network guard runs here: the shell serves NO file bytes (the floor
+/// is enforced by `/content`/`/ws`, which the shell fetches same-origin carrying
+/// the cookie — which is what makes `SameSite=Strict` work post-bootstrap). The
+/// `?path=` is consumed entirely client-side by the shell bootstrap.
+fn view_page(state: &AppState, ctx: &ReqContext) -> warp::reply::Response {
+    use warp::reply::Reply;
+
+    if let Some(resp) = network_guard(ctx) {
+        return resp;
+    }
+    // The shell needs the static origin for its own bundle (script/style/font);
+    // if the static origin is not up yet, fall back to a self placeholder so the
+    // CSP is still well-formed and the shell renders (bundle simply 404s).
+    let static_origin = state
+        .static_base_snapshot()
+        .unwrap_or_else(|| "http://127.0.0.1".to_string());
+    let nonce = crate::shell::gen_nonce();
+    let csp = crate::shell::shell_csp(&static_origin, &nonce);
+    let page = crate::shell::render_shell_page(&static_origin, &nonce);
+
+    let mut resp = warp::reply::html(page).into_response();
+    let h = resp.headers_mut();
+    insert_header(h, SHELL_COOP_HEADER.0, SHELL_COOP_HEADER.1);
+    insert_header(h, SHELL_COEP_HEADER.0, SHELL_COEP_HEADER.1);
+    insert_header(h, "content-security-policy", &csp);
+    resp
+}
+
+/// Serve a **fresh sandboxed renderer document** (the iframe `srcdoc`; design §3
+/// "Renderer CSP"). A FRESH nonce is minted per request — a fresh iframe per
+/// navigation — and the renderer CSP (`default-src 'none'`, `connect-src 'none'`,
+/// `img/media` from the static capability origin only) is embedded as the
+/// srcdoc's `<meta http-equiv>` (a srcdoc has no response headers of its own).
+/// The frame is mounted null-origin sandboxed (`sandbox="allow-scripts"`) by the
+/// shell. Network-guarded; serves no file bytes (content arrives over the bus).
+fn srcdoc_page(state: &AppState, ctx: &ReqContext) -> warp::reply::Response {
+    use warp::reply::Reply;
+
+    if let Some(resp) = network_guard(ctx) {
+        return resp;
+    }
+    let static_origin = state
+        .static_base_snapshot()
+        .unwrap_or_else(|| "http://127.0.0.1".to_string());
+    // One secondary origin serves both the bundle and the capability assets
+    // (ADR-0007 interpretation), so the asset origin == the static origin here.
+    let doc = crate::shell::render_srcdoc(&static_origin, &static_origin);
+    warp::reply::html(doc).into_response()
+}
+
+/// Serve the rendered markdown **BODY fragment** for one document, SAME-ORIGIN +
+/// authenticated (design §3 "postMessage bus"). The shell fetches this (carrying
+/// the cookie same-origin) and relays `{type:"render", html}` to the sandboxed
+/// iframe.
+///
+/// This funnels through the SAME floor chokepoint as every other read
+/// ([`serve_confined`]): a non-world-readable doc requires `ctx.authenticated`.
+/// Because the floor passes HERE, this is the **mint-time authorization context**
+/// the /cap design requires — so the in-document `<img>`/`<video>` rewrite mints
+/// capability URLs ([`rewrite_doc_caps`]) only after this gate. The body is
+/// rendered via the lib.rs render core ([`render_markdown`]).
+fn content_fragment(state: &AppState, ctx: &ReqContext, requested: &str) -> warp::reply::Response {
+    use std::io::Read;
+    use warp::http::StatusCode;
     use warp::reply::Reply;
 
     if let Some(resp) = network_guard(ctx) {
         return resp;
     }
     let path = Path::new(requested);
-    // Floor gate FIRST (one chokepoint). We drop the held fd: the watch loop
-    // re-opens through its own confined FilePeer; the floor has already passed.
-    if let Err(deny) = serve_confined(state, ctx, path) {
-        return deny.into_response();
-    }
-
-    let (canon, entry) = match state.entry_for(path) {
-        Ok(pair) => pair,
-        Err(e) => return FloorDeny::Confine(confine_status(&e)).into_response(),
+    // FLOOR chokepoint: confine (held fd) + floor on the fstat'd metadata. This
+    // is the post-floor, mint-time-authorized context for cap_url (W6.2).
+    let mut confined = match serve_confined(state, ctx, path) {
+        Ok(c) => c,
+        Err(deny) => return deny.into_response(),
     };
+    // Read the markdown SOURCE from the HELD fd (no re-open).
+    let mut src = Vec::with_capacity(confined.metadata.len() as usize);
+    if confined.file.read_to_end(&mut src).is_err() {
+        return warp::reply::with_status("", StatusCode::INTERNAL_SERVER_ERROR).into_response();
+    }
+    let Ok(src) = std::str::from_utf8(&src) else {
+        return warp::reply::with_status("", StatusCode::BAD_REQUEST).into_response();
+    };
+    let canon = confined.canonical.clone();
 
-    let doc_id = path_id(&canon);
-    let body = entry.latest_body.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let initial_view = normalize_view(view);
-    let page = render_page_with(
-        &wrap_doc(&body),
-        &format!("{}{}", ws_client_head(&doc_id), views_head()),
-        &views_body(&doc_id, initial_view),
-    );
-    warp::reply::html(page).into_response()
+    // Render the body via the lib.rs render core, then rewrite document media to
+    // capability URLs on the static origin (minted ONLY here, post-floor) and
+    // links to /view (shell) / the /outside sentinel for escapes.
+    let body = render_markdown(src);
+    let roots = state.roots_snapshot();
+    let static_base = state.static_base_snapshot();
+    let body = rewrite_doc_caps(&body, &roots, &canon, &state.caps, static_base.as_deref());
+
+    warp::reply::with_header(body, "content-type", "text/html; charset=utf-8").into_response()
+}
+
+/// The PARENT's sole-path-authority gate (design §3 "Navigation"). The sandboxed
+/// iframe reports a clicked link's `{type:"navigate", target}`; the shell asks
+/// the server to re-confine it here. An in-root target → **204** (the parent then
+/// destroys + recreates the iframe with fresh `/srcdoc` for it); an escape /
+/// sensitive / missing target → **403** (the `/outside` semantics). The iframe
+/// NEVER resolves the path itself. Network-guarded.
+fn navigate_gate(state: &AppState, ctx: &ReqContext, requested: &str) -> warp::reply::Response {
+    use warp::http::StatusCode;
+    use warp::reply::Reply;
+
+    if let Some(resp) = network_guard(ctx) {
+        return resp;
+    }
+    let roots = state.roots_snapshot();
+    let union_owned: Vec<crate::roots::Root> =
+        roots.union().into_iter().cloned().collect();
+    let union: Vec<&crate::roots::Root> = union_owned.iter().collect();
+    match confine::confine_link(Path::new(requested), &union, &roots) {
+        // In-root: the parent may mount a fresh srcdoc for the canonical path.
+        confine::LinkResolution::InRoot(_) => {
+            warp::reply::with_status("", StatusCode::NO_CONTENT).into_response()
+        }
+        // Escape / sensitive / missing → the /outside 403 marker.
+        confine::LinkResolution::Outside => {
+            warp::reply::with_status("forbidden", StatusCode::FORBIDDEN).into_response()
+        }
+    }
+}
+
+/// Insert a response header, ignoring an (impossible for these static values)
+/// parse error rather than panicking on a request path.
+fn insert_header(headers: &mut warp::http::HeaderMap, name: &'static str, value: &str) {
+    if let Ok(v) = warp::http::HeaderValue::from_str(value) {
+        headers.insert(name, v);
+    }
 }
 
 /// Render the full collaborative editor page for `requested`, confined + FLOORED
@@ -816,53 +962,10 @@ fn path_id(canon: &Path) -> String {
     canon.to_string_lossy().replace('\\', "/")
 }
 
-/// The three supported layouts. `preview` is the default editor-less live view;
-/// `split` is editor + preview side by side; `editor` is a full-page textarea.
-const VIEW_MODES: [&str; 3] = ["preview", "split", "editor"];
-
-/// Normalise a `?view=` value to one of [`VIEW_MODES`], or `None` if unset/
-/// unrecognised (the client then falls back to `localStorage`, then `preview`).
-fn normalize_view(view: Option<&str>) -> Option<&'static str> {
-    let v = view?;
-    VIEW_MODES.iter().copied().find(|&m| m == v)
-}
-
-/// Serve the raw bytes of a confined in-root file for `/asset?path=<rel>`.
-///
-/// Read-only, confined exactly like `/view`: `rel` is resolved through
-/// [`FilePeer::within`] (traversal/symlink escapes → 400, with no leak of
-/// whether a path exists), the existing [`DEFAULT_MAX_FILE_SIZE`] read cap is
-/// enforced (oversize → 413), and a missing file is a 404. On success the bytes
-/// are returned with a `Content-Type` inferred from the file extension
-/// ([`content_type_for`]). This never follows a link outside the root and never
-/// writes — it only lets local images/assets referenced by a document render in
-/// the live preview without a CDN.
-fn serve_asset(state: &AppState, ctx: &ReqContext, requested: &str) -> warp::reply::Response {
-    use std::io::Read;
-    use warp::http::StatusCode;
-    use warp::reply::Reply;
-
-    if let Some(resp) = network_guard(ctx) {
-        return resp;
-    }
-    // ONE chokepoint: confine (held fd) + floor on the fstat'd metadata.
-    let mut confined = match serve_confined(state, ctx, Path::new(requested)) {
-        Ok(c) => c,
-        Err(deny) => return deny.into_response(),
-    };
-    // Read from the HELD fd — no re-open, no second stat (audit HIGH-2/3).
-    let mut bytes = Vec::with_capacity(confined.metadata.len() as usize);
-    if confined.file.read_to_end(&mut bytes).is_err() {
-        return warp::reply::with_status("", StatusCode::INTERNAL_SERVER_ERROR).into_response();
-    }
-    let ct = content_type_for(&confined.canonical);
-    warp::reply::with_header(bytes, "content-type", ct).into_response()
-}
-
 /// Serve the confined file's raw Markdown source for `GET /raw?path=<rel>`.
 ///
 /// This is the source the in-browser editor loads into its textarea. Confined
-/// and size-limited exactly like [`serve_asset`]/`view`: `rel` is resolved
+/// and size-limited exactly like `view`: `rel` is resolved
 /// through [`FilePeer::within`] (traversal/symlink escape → **400**, with no
 /// leak of whether a path exists), the existing [`DEFAULT_MAX_FILE_SIZE`] read
 /// cap is enforced (oversize → **413**), a missing file is **404**, and a
@@ -954,81 +1057,11 @@ fn save_doc(
     }
 }
 
-/// Infer a `Content-Type` from a file's extension (ASCII-case-insensitive).
-///
-/// Covers the common asset types a Markdown document references; anything
-/// unrecognised falls back to `application/octet-stream` (a safe default the
-/// browser will download rather than mis-render).
-fn content_type_for(path: &Path) -> &'static str {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "svg" => "image/svg+xml",
-        "ico" => "image/x-icon",
-        "bmp" => "image/bmp",
-        "avif" => "image/avif",
-        "css" => "text/css; charset=utf-8",
-        "js" | "mjs" => "text/javascript; charset=utf-8",
-        "json" => "application/json",
-        "txt" => "text/plain; charset=utf-8",
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "ttf" => "font/ttf",
-        "otf" => "font/otf",
-        "pdf" => "application/pdf",
-        "mp4" => "video/mp4",
-        "webm" => "video/webm",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        _ => "application/octet-stream",
-    }
-}
-
 /// The `/outside` 403 sentinel a document link is rewritten to when its target
 /// escapes every active root (audit: don't emit a live link to an out-of-root
 /// file). The route table has no `/outside` handler, so a click yields a 403/404
 /// — the deliberate "this link leaves the workspace" marker.
 const OUTSIDE_SENTINEL: &str = "/outside";
-
-/// Wrap a rendered body fragment in the `#doc` container the WS client swaps.
-fn wrap_doc(body: &str) -> String {
-    format!("<div id=\"doc\">{body}</div>")
-}
-
-/// Rewrite in-document relative URLs so cross-file links and local assets
-/// resolve to confined daemon routes, using the multi-root confinement funnel:
-///   * a relative `href="…"` to a local `.md` file becomes
-///     `href="/view?path=<abs>"` (a confined live-preview page),
-///   * a relative `src="…"`, or a relative non-`.md` `href="…"`, becomes
-///     `src/href="/asset?path=<abs>"` (the read-only [`serve_asset`] route), and
-///   * a relative URL that **escapes every active root** becomes the
-///     [`OUTSIDE_SENTINEL`] (`/outside`) — the 403 "leaves the workspace" marker
-///     instead of a live link to an out-of-root file.
-///
-/// `body` is a rendered HTML fragment; `doc_canon` is the current document's
-/// CANONICAL ABSOLUTE path. Each candidate URL is resolved **relative to the
-/// document's directory** (absolute) and classified via [`confine::confine_link`]
-/// against `roots.union()`. Absolute/external/`data:`/fragment-only URLs are
-/// left exactly as-is.
-fn rewrite_doc_urls(body: &str, roots: &Roots, doc_canon: &Path) -> String {
-    let doc_dir = doc_canon.parent().map(Path::to_path_buf).unwrap_or_default();
-    let union_owned: Vec<crate::roots::Root> = roots.union().into_iter().cloned().collect();
-    let union: Vec<&crate::roots::Root> = union_owned.iter().collect();
-    // `src` always targets an asset; `href` may target a `.md` view or an asset.
-    let out = rewrite_attr(body, "href=\"", |u| {
-        rewritten_doc_url(u, &doc_dir, &union, roots, false)
-    });
-    rewrite_attr(&out, "src=\"", |u| {
-        rewritten_doc_url(u, &doc_dir, &union, roots, true)
-    })
-}
 
 /// Find every `<attr>="<value>"` occurrence (`attr_open` is e.g. `href="`),
 /// run `f` on the value, and substitute its `Some(_)` replacement (leaving the
@@ -1064,24 +1097,65 @@ fn rewrite_attr(body: &str, attr_open: &str, mut f: impl FnMut(&str) -> Option<S
     out
 }
 
-/// Rewrite a local relative document URL through the multi-root confine funnel.
+/// Rewrite a rendered body fragment for the **render-isolation content path**
+/// (design §3 / ADR-0007): the capability-aware rewrite used by
+/// [`content_fragment`] and the `/ws` watch loop AFTER the floor has passed (the
+/// mint-time authorization context the /cap design requires).
 ///
-/// - A relative URL resolving in-root → `Some("/view?path=<abs>")` (a `.md`
-///   `href`) or `Some("/asset?path=<abs>")` (a `src`, or a non-`.md` `href`),
-///   the canonical absolute path percent-encoded as the `path=` value.
-/// - A relative URL that **escapes every root** → `Some(OUTSIDE_SENTINEL)` (the
-///   `/outside` 403 marker — `confine_link` returns `LinkResolution::Outside`).
-/// - Absolute, external (`scheme:`/protocol-relative), `data:`, and
-///   fragment-only URLs → `None` (left exactly as-is).
-fn rewritten_doc_url(
+///   * relative media (`src="…"`, e.g. `<img>`/`<video>`) resolving in-root →
+///     a **capability URL** `http://<static>/cap/<token>` minted via
+///     [`asset_origin::cap_url`] on the static (capability) origin — so the
+///     sandboxed null-origin renderer (with `img-src/media-src` = the static
+///     origin only, `connect-src 'none'`) can *display* but never *read* the
+///     bytes (canvas-taint + zero egress). The OLD `/asset?path=` rewrite (shell
+///     origin) is deliberately NOT used here: the renderer CSP would block it.
+///   * relative `.md` `href="…"` resolving in-root → `/view?path=<abs>` (the
+///     shell handles the actual navigation via the parent path-authority gate),
+///   * any escape → the [`OUTSIDE_SENTINEL`] (`/outside`) marker.
+///   * absolute/external/`data:`/fragment URLs → left as-is.
+///
+/// `cap_url` is reached ONLY from here, and only after [`serve_confined`] passed,
+/// so it is unreachable from any unauthenticated / floor-failed path. If the
+/// static origin is not up yet (`static_base` is `None`) or a mint fails, the
+/// media `src` is left unchanged (it simply won't load under the renderer CSP) —
+/// fail closed, never leak a shell-origin path into the sandbox.
+fn rewrite_doc_caps(
+    body: &str,
+    roots: &Roots,
+    doc_canon: &Path,
+    caps: &Mutex<asset_origin::CapStore>,
+    static_base: Option<&str>,
+) -> String {
+    let doc_dir = doc_canon.parent().map(Path::to_path_buf).unwrap_or_default();
+    let union_owned: Vec<crate::roots::Root> = roots.union().into_iter().cloned().collect();
+    let union: Vec<&crate::roots::Root> = union_owned.iter().collect();
+
+    // href: a local `.md` -> /view (shell); other in-root href -> a capability
+    // URL; escapes -> /outside. (Non-media href to a non-.md asset is rare; route
+    // it to a capability URL too so it stays inside the isolation model.)
+    let out = rewrite_attr(body, "href=\"", |u| {
+        rewritten_cap_url(u, &doc_dir, &union, roots, caps, static_base, false)
+    });
+    // src: always media -> a capability URL on the static origin (or unchanged
+    // if no static origin / mint failure -> fail closed under the renderer CSP).
+    rewrite_attr(&out, "src=\"", |u| {
+        rewritten_cap_url(u, &doc_dir, &union, roots, caps, static_base, true)
+    })
+}
+
+/// Classify + rewrite one document URL for the capability content path (see
+/// [`rewrite_doc_caps`]). `src_attr` distinguishes media (`src`) from links
+/// (`href`): media in-root mints a capability URL; a `.md` `href` becomes a
+/// `/view?path=` shell link. Escapes → `/outside`; non-candidates → `None`.
+fn rewritten_cap_url(
     url: &str,
     doc_dir: &Path,
     union: &[&crate::roots::Root],
     roots: &Roots,
+    caps: &Mutex<asset_origin::CapStore>,
+    static_base: Option<&str>,
     src_attr: bool,
 ) -> Option<String> {
-    // Only plain relative URLs are candidates. The `://`/`scheme:` checks also
-    // cover `data:`, `mailto:`, `http:`, etc.
     if url.is_empty()
         || url.starts_with('#')
         || url.starts_with('/')
@@ -1090,8 +1164,6 @@ fn rewritten_doc_url(
     {
         return None;
     }
-
-    // Split off any #fragment / ?query so we resolve just the path part.
     let (path_part, suffix) = match url.find(['#', '?']) {
         Some(p) => (&url[..p], &url[p..]),
         None => (url, ""),
@@ -1100,16 +1172,23 @@ fn rewritten_doc_url(
         return None;
     }
 
-    let is_md = path_part.to_ascii_lowercase().ends_with(".md");
-    let route = if is_md && !src_attr { "/view" } else { "/asset" };
-
-    // Resolve relative to the current document's (absolute) directory, then
-    // classify via the funnel. An escape → the `/outside` 403 sentinel.
     let candidate = doc_dir.join(path_part);
     match confine::confine_link(&candidate, union, roots) {
         confine::LinkResolution::InRoot(canon) => {
-            let abs = canon.to_string_lossy().replace('\\', "/");
-            Some(format!("{}?path={}{}", route, encode_query_value(&abs), suffix))
+            let is_md = path_part.to_ascii_lowercase().ends_with(".md");
+            if is_md && !src_attr {
+                // A markdown link: route to the shell `/view` (the parent owns
+                // navigation; the iframe also reports the click up the bus).
+                let abs = canon.to_string_lossy().replace('\\', "/");
+                Some(format!("/view?path={}{}", encode_query_value(&abs), suffix))
+            } else {
+                // Media (or a non-.md asset): mint a per-doc capability URL on the
+                // static origin. cap_url is minted ONLY here, post-floor. With no
+                // static origin yet OR a mint failure, leave the ref unchanged —
+                // fail closed (the renderer CSP blocks a shell-origin path anyway).
+                let base = static_base?;
+                asset_origin::cap_url(caps, base, canon)
+            }
         }
         confine::LinkResolution::Outside => Some(OUTSIDE_SENTINEL.to_string()),
     }
@@ -1149,215 +1228,6 @@ fn encode_query_value(s: &str) -> String {
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
-    out
-}
-
-/// The injected `<head>` snippet: a WebSocket client that connects to `/ws` for
-/// this path and replaces `#doc`'s innerHTML on every pushed body. KaTeX's
-/// custom-element `connectedCallback` and the delegated copy-button handler
-/// (both already in the page) re-init automatically against the new nodes, so
-/// nothing is re-registered here.
-fn ws_client_head(rel: &str) -> String {
-    // Encode the path so it survives as a query value. Done in JS via the
-    // browser's encodeURIComponent over a JSON-escaped literal to avoid any
-    // server-side string-injection into the script.
-    let path_json = json_string(rel);
-    format!(
-        r#"
-        <script>
-        (function () {{
-            const path = {path_json};
-            function connect() {{
-                const url = "ws://" + location.host + "/ws?path=" + encodeURIComponent(path);
-                const ws = new WebSocket(url);
-                ws.onmessage = function (e) {{
-                    const doc = document.getElementById('doc');
-                    if (doc) doc.innerHTML = e.data;
-                }};
-                // Auto-reconnect if the daemon restarts or the socket drops.
-                ws.onclose = function () {{ setTimeout(connect, 1000); }};
-            }}
-            connect();
-        }})();
-        </script>"#
-    )
-}
-
-/// The `<head>` CSS for the three-view layout. Pure CSS, no per-request data:
-/// the active layout is selected by a `data-view` attribute on `<body>` (set by
-/// [`views_body`]'s script), so switching views is a class/attribute flip with
-/// no re-render. In `preview` mode the editor pane is hidden and the page looks
-/// exactly like the original editor-less live preview. `split` shows the editor
-/// (left) and the preview (right); `editor` is a full-page textarea.
-fn views_head() -> &'static str {
-    r#"
-        <style>
-        /* Three-view layout. The body is the preview surface (.markdown-body);
-           we lay it out as a flex row holding the editor pane + the preview
-           (#doc), with a fixed toolbar on top. `data-view` on <body> selects
-           which panes are visible. */
-        body.mdv { max-width: none; margin: 0; padding: 0; display: flex; flex-direction: column; min-height: 100vh; box-sizing: border-box; }
-        .mdv-toolbar {
-            position: sticky; top: 0; z-index: 10;
-            display: flex; gap: 6px; align-items: center;
-            padding: 6px 10px; border-bottom: 1px solid rgba(175,184,193,.3);
-            background: #f6f8fa; font: 13px/1 system-ui, sans-serif;
-        }
-        .mdv-toolbar button {
-            padding: 4px 10px; border: 1px solid rgba(175,184,193,.4);
-            border-radius: 6px; background: #fff; color: #24292f; cursor: pointer;
-        }
-        .mdv-toolbar button.active { background: #0969da; color: #fff; border-color: #0969da; }
-        .mdv-panes { flex: 1 1 auto; display: flex; min-height: 0; }
-        .mdv-editor {
-            box-sizing: border-box; width: 50%; border: none; outline: none; resize: none;
-            padding: 16px; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-            background: #fff; color: #24292f;
-            border-right: 1px solid rgba(175,184,193,.3);
-        }
-        /* #doc holds the rendered preview; it scrolls independently and is
-           centred like the standalone page via its own max-width. */
-        .mdv-panes #doc { flex: 1 1 auto; overflow: auto; padding: 0 45px; box-sizing: border-box; }
-        .mdv-panes #doc > * { max-width: 980px; margin-left: auto; margin-right: auto; }
-        @media (max-width: 767px) { .mdv-panes #doc { padding: 0 15px; } }
-
-        /* preview (default): editor hidden, preview full width. */
-        body[data-view="preview"] .mdv-editor { display: none; }
-        body[data-view="preview"] .mdv-panes #doc { width: 100%; }
-        /* split: editor + preview side by side. */
-        body[data-view="split"] .mdv-editor { display: block; }
-        /* editor: full-page textarea, preview hidden. */
-        body[data-view="editor"] .mdv-editor { display: block; width: 100%; border-right: none; }
-        body[data-view="editor"] .mdv-panes #doc { display: none; }
-
-        @media (prefers-color-scheme: dark) {
-            .mdv-toolbar { background: #161b22; border-color: rgba(99,110,123,.4); }
-            .mdv-toolbar button { background: #21262d; color: #c9d1d9; border-color: rgba(99,110,123,.4); }
-            .mdv-toolbar button.active { background: #1f6feb; color: #fff; border-color: #1f6feb; }
-            .mdv-editor { background: #0d1117; color: #c9d1d9; border-color: rgba(99,110,123,.4); }
-        }
-        </style>"#
-}
-
-/// The before-`</body>` markup + JS for the three-view toolbar and editor.
-///
-/// Vanilla JS, no deps. On load it: picks the initial view (`?view=` →
-/// `localStorage` → `preview`), wires the three toolbar buttons (each persists
-/// the choice in `localStorage`), fetches `/raw?path=` into the textarea, and on
-/// input **debounces ~400ms** then `POST`s the textarea to `/save?path=`. The
-/// preview pane (#doc) keeps updating via the existing `/ws` push — saving the
-/// file makes the watch loop re-render and broadcast, so the editor never pushes
-/// HTML itself.
-///
-/// **v1 caveat (last-write-wins):** the textarea is loaded once and is not
-/// re-synced from `/ws`; an external edit (or another tab) can leave it stale
-/// until reload. Acceptable for this non-collaborative first cut (ADR-0002
-/// describes the future ephemeral-CRDT editing model — not built here).
-fn views_body(rel: &str, initial_view: Option<&str>) -> String {
-    let path_json = json_string(rel);
-    // The server-side initial view (from ?view=), or JS `null` to let the client
-    // fall back to localStorage/preview. Always one of VIEW_MODES, so a bare
-    // identifier-safe string literal is injected via json_string.
-    let initial_json = match initial_view {
-        Some(v) => json_string(v),
-        None => "null".to_string(),
-    };
-    format!(
-        r#"
-        <div class="mdv-panes">
-            <textarea class="mdv-editor" spellcheck="false" aria-label="Markdown source"></textarea>
-        </div>
-        <script>
-        (function () {{
-            const path = {path_json};
-            const initialView = {initial_json};
-            const MODES = ["preview", "split", "editor"];
-            const KEY = "md-preview:view";
-            const body = document.body;
-
-            // The page renders #doc inside the body; move it into the panes row
-            // so the editor sits beside it.
-            const panes = document.querySelector('.mdv-panes');
-            const editor = panes.querySelector('.mdv-editor');
-            const doc = document.getElementById('doc');
-            if (doc) panes.appendChild(doc);
-
-            // Build the toolbar.
-            const bar = document.createElement('div');
-            bar.className = 'mdv-toolbar';
-            const buttons = {{}};
-            for (const m of MODES) {{
-                const b = document.createElement('button');
-                b.type = 'button';
-                b.textContent = m.charAt(0).toUpperCase() + m.slice(1);
-                b.addEventListener('click', function () {{ setView(m, true); }});
-                bar.appendChild(b);
-                buttons[m] = b;
-            }}
-            body.classList.add('mdv');
-            body.insertBefore(bar, body.firstChild);
-
-            function setView(mode, persist) {{
-                if (!MODES.includes(mode)) mode = 'preview';
-                body.setAttribute('data-view', mode);
-                for (const m of MODES) buttons[m].classList.toggle('active', m === mode);
-                if (persist) {{ try {{ localStorage.setItem(KEY, mode); }} catch (e) {{}} }}
-            }}
-
-            // Initial view: ?view= (server-validated) -> localStorage -> preview.
-            let stored = null;
-            try {{ stored = localStorage.getItem(KEY); }} catch (e) {{}}
-            setView(initialView || stored || 'preview', false);
-
-            // Load the raw source into the editor.
-            const rawUrl = "/raw?path=" + encodeURIComponent(path);
-            fetch(rawUrl).then(function (r) {{
-                if (r.ok) return r.text();
-                throw new Error('raw load failed: ' + r.status);
-            }}).then(function (text) {{
-                editor.value = text;
-            }}).catch(function (err) {{ console.error(err); }});
-
-            // Debounced save: POST the textarea to /save; the preview updates via
-            // the existing /ws push once the watch loop ingests the write.
-            let timer = null;
-            const saveUrl = "/save?path=" + encodeURIComponent(path);
-            editor.addEventListener('input', function () {{
-                if (timer) clearTimeout(timer);
-                timer = setTimeout(function () {{
-                    fetch(saveUrl, {{
-                        method: 'POST',
-                        headers: {{ 'Content-Type': 'text/plain; charset=utf-8' }},
-                        body: editor.value,
-                    }}).catch(function (err) {{ console.error('save failed:', err); }});
-                }}, 400);
-            }});
-        }})();
-        </script>"#
-    )
-}
-
-/// Serialize `s` as a JSON string literal (quotes included), safe to embed in a
-/// `<script>`. Escapes the characters that would break out of the literal or
-/// the script context.
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '<' => out.push_str("\\u003c"), // never let a literal </script> close the tag
-            '>' => out.push_str("\\u003e"),
-            '&' => out.push_str("\\u0026"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
     out
 }
 
@@ -1506,6 +1376,23 @@ fn rebuild_peer(root: &Path, target: &Path, last_good: &str) -> FilePeer<YrsSess
     }
 }
 
+/// The render-time dependencies the watch loop needs to turn markdown into the
+/// broadcast body fragment: the active root union snapshot (link confinement),
+/// the shared capability store, and the static origin base. Grouped so
+/// [`spawn_watch`] stays under the argument-count lint. Every broadcast body is
+/// relayed into the sandboxed renderer iframe, so its media is rewritten to
+/// capability URLs ([`rewrite_doc_caps`]) exactly like [`content_fragment`].
+struct WatchRenderDeps {
+    /// Snapshot of the active root union at spawn (link confinement).
+    roots: Roots,
+    /// The shared per-doc capability store (the SAME one the `/cap` route
+    /// resolves against); media refs mint short-TTL tokens here.
+    caps: Arc<Mutex<asset_origin::CapStore>>,
+    /// The static (capability) origin base, if bound yet; `None` leaves media
+    /// refs unchanged (fail closed under the renderer CSP).
+    static_base: Option<String>,
+}
+
 /// Spawn the dedicated watch thread that owns the [`FilePeer`]/[`YrsSession`]
 /// for one confined `target` path and broadcasts a re-rendered body fragment on
 /// every change.
@@ -1519,10 +1406,11 @@ fn rebuild_peer(root: &Path, target: &Path, last_good: &str) -> FilePeer<YrsSess
 /// thread (not `spawn_blocking`) keeps the blocking `notify`/`sync_from_disk`
 /// loop off tokio's worker pool entirely.
 ///
-/// The rendered fragment has cross-file `.md` links and local asset URLs
-/// rewritten relative to this document (via [`rewrite_doc_urls`]) before it is
-/// cached/broadcast, so every consumer (initial `/view`, initial `/ws` frame,
-/// live updates) is consistent.
+/// The rendered fragment has cross-file `.md` links and local media URLs
+/// rewritten relative to this document (via [`rewrite_doc_caps`] — capability
+/// URLs for media, the shell `/view` for `.md` links) before it is
+/// cached/broadcast, so every consumer (the initial `/ws` frame + live updates,
+/// relayed by the shell into the sandboxed iframe) is consistent.
 ///
 /// ## Phase 3: the single serialization point for ALL doc mutations
 /// This thread now also drains `collab_rx` (browser editors → here) alongside its
@@ -1542,8 +1430,13 @@ fn spawn_watch(
     latest_body: Arc<Mutex<String>>,
     mut collab_rx: mpsc::Receiver<CollabMsg>,
     collab_out: broadcast::Sender<Vec<u8>>,
-    roots: Roots,
+    render_deps: WatchRenderDeps,
 ) -> std::io::Result<()> {
+    let WatchRenderDeps {
+        roots,
+        caps,
+        static_base,
+    } = render_deps;
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
 
     std::thread::Builder::new()
@@ -1564,10 +1457,24 @@ fn spawn_watch(
                 return;
             }
 
-            // Links resolve against the document's CANONICAL path + the active
-            // root union (a snapshot taken at spawn). Escapes → the /outside
-            // sentinel (see rewrite_doc_urls).
-            let render = |text: &str| rewrite_doc_urls(&render_markdown(text), &roots, &target);
+            // Render isolation: every broadcast body is relayed by the trusted
+            // shell into the SANDBOXED renderer iframe, so its media MUST be
+            // capability URLs on the static origin (the renderer CSP allows
+            // img/media only from there and `connect-src 'none'`; a shell-origin
+            // `/asset?path=` would be blocked). Links resolve against the doc's
+            // CANONICAL path + the active root union (a snapshot at spawn); a `.md`
+            // link → the shell `/view`, an escape → the /outside sentinel. Caps
+            // are minted here only for an already-floor-gated entry (entries are
+            // created only via floor-gated routes) and re-confined at /cap serve.
+            let render = |text: &str| {
+                rewrite_doc_caps(
+                    &render_markdown(text),
+                    &roots,
+                    &target,
+                    &caps,
+                    static_base.as_deref(),
+                )
+            };
 
             // Initial render after `watch`'s catch-up sync. We cache the
             // *fragment* (inner HTML of #doc): both the cached value and every
@@ -2131,52 +2038,12 @@ mod tests {
     // --- pure helpers (unchanged behaviour) --------------------------------
 
     #[test]
-    fn json_string_escapes_script_breakers() {
-        let out = json_string("a</script>b");
-        assert!(!out.contains("</script>"));
-        assert!(out.contains("\\u003c/script\\u003e"));
-        assert_eq!(json_string("plain"), "\"plain\"");
-        assert_eq!(json_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
-    }
-
-    #[test]
-    fn wrap_doc_wraps_in_doc_div() {
-        assert_eq!(wrap_doc("<p>hi</p>"), "<div id=\"doc\"><p>hi</p></div>");
-    }
-
-    #[test]
-    fn ws_client_head_references_ws_and_doc() {
-        let head = ws_client_head("a.md");
-        assert!(head.contains("new WebSocket"));
-        assert!(head.contains("/ws?path="));
-        assert!(head.contains("getElementById('doc')"));
-        assert!(head.contains(".innerHTML"));
-    }
-
-    #[test]
-    fn content_type_for_infers_by_extension() {
-        assert_eq!(content_type_for(Path::new("pic.png")), "image/png");
-        assert_eq!(content_type_for(Path::new("a.JPG")), "image/jpeg");
-        assert_eq!(content_type_for(Path::new("logo.svg")), "image/svg+xml");
-        assert_eq!(content_type_for(Path::new("style.css")), "text/css; charset=utf-8");
-        assert_eq!(content_type_for(Path::new("blob.xyz")), "application/octet-stream");
-        assert_eq!(content_type_for(Path::new("noext")), "application/octet-stream");
-    }
-
-    #[test]
     fn has_uri_scheme_detects_schemes_not_relative_paths() {
         assert!(has_uri_scheme("https://x/y"));
         assert!(has_uri_scheme("data:image/png;base64,AAAA"));
         assert!(!has_uri_scheme("pic.png"));
         assert!(!has_uri_scheme("../up/pic.png"));
         assert!(!has_uri_scheme(""));
-    }
-
-    #[test]
-    fn normalize_view_accepts_known_modes_only() {
-        assert_eq!(normalize_view(Some("preview")), Some("preview"));
-        assert_eq!(normalize_view(Some("bogus")), None);
-        assert_eq!(normalize_view(None), None);
     }
 
     // --- multi-root AppState + confine routing (W3.1) ----------------------
@@ -2204,101 +2071,56 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_doc_urls_rewrites_relative_md_and_assets_to_abs_paths() {
-        let dir = temp_dir("rw");
-        write_mode(&dir, "a.md", "a", 0o644);
-        let b = write_mode(&dir, "b.md", "b", 0o644);
+    fn rewrite_doc_caps_media_to_cap_url_md_to_view_escape_to_outside() {
+        let dir = temp_dir("rwcaps");
         let img = write_mode(&dir, "img.png", "PNG", 0o644);
+        let b = write_mode(&dir, "b.md", "b", 0o644);
+        let state = state_for(&dir);
+        let roots = state.roots_snapshot();
+        let doc = dir.join("a.md");
+        let base = "http://127.0.0.1:8081";
+
+        let body = r##"<a href="b.md">B</a> <a href="https://x/y.md">ext</a> <a href="#frag">f</a> <img src="img.png"> <img src="../../../../../etc/hosts">"##;
+        let out = rewrite_doc_caps(body, &roots, &doc, &state.caps, Some(base));
+        // local .md href -> the shell /view (the parent owns navigation).
+        assert!(
+            out.contains(&format!("href=\"/view?path={}\"", encode_query_value(&b))),
+            "local .md href -> /view: {out}"
+        );
+        assert!(out.contains(r#"href="https://x/y.md""#), "external left alone");
+        assert!(out.contains(r##"href="#frag""##), "fragment left alone");
+        // in-root media -> a capability URL on the STATIC origin (not /asset).
+        assert!(out.contains(&format!("src=\"{base}/cap/")), "in-root img -> cap URL: {out}");
+        assert!(!out.contains("/asset?path="), "the old /asset rewrite is retired");
+        // escaping media -> the /outside sentinel (no capability minted for it).
+        assert!(out.contains(&format!("src=\"{OUTSIDE_SENTINEL}\"")), "escape -> /outside: {out}");
+        // The minted token resolves the in-root image in the shared store.
+        let token = out.split("/cap/").nth(1).and_then(|s| s.split('"').next()).unwrap();
+        assert_eq!(
+            state.caps.lock().unwrap().resolve(token, asset_origin::now_secs()),
+            Some(img.into())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewrite_doc_caps_without_static_origin_leaves_media_unchanged() {
+        // Fail closed: with no static origin yet, an in-root media ref is left
+        // unchanged (no shell-origin path leaks into the sandbox; the renderer
+        // CSP blocks it) and NO capability is minted.
+        let dir = temp_dir("rwcaps-nostatic");
+        write_mode(&dir, "img.png", "PNG", 0o644);
         let state = state_for(&dir);
         let roots = state.roots_snapshot();
         let doc = dir.join("a.md");
 
-        let body = r##"<a href="b.md">B</a> <a href="https://x/y.md">ext</a> <a href="#frag">f</a> <img src="img.png">"##;
-        let out = rewrite_doc_urls(body, &roots, &doc);
-        assert!(
-            out.contains(&format!("href=\"/view?path={}\"", encode_query_value(&b))),
-            "local .md href -> /view with abs path: {out}"
-        );
-        assert!(out.contains(r#"href="https://x/y.md""#), "external left alone");
-        assert!(out.contains(r##"href="#frag""##), "fragment left alone");
-        assert!(
-            out.contains(&format!("src=\"/asset?path={}\"", encode_query_value(&img))),
-            "relative img -> /asset with abs path: {out}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn rewrite_doc_urls_escape_becomes_outside_sentinel() {
-        let dir = temp_dir("rwesc");
-        std::fs::create_dir_all(dir.join("sub")).unwrap();
-        write_mode(&dir, "sub/child.md", "c", 0o644);
-        let top = write_mode(&dir, "top.md", "t", 0o644);
-        let state = state_for(&dir);
-        let roots = state.roots_snapshot();
-        let doc = dir.join("sub/child.md");
-
-        // ../top.md is in-root -> rewritten; ../../etc/passwd.md escapes -> /outside.
-        let body = r#"<a href="../top.md">up</a> <a href="../../../../../etc/passwd.md">escape</a>"#;
-        let out = rewrite_doc_urls(body, &roots, &doc);
-        assert!(
-            out.contains(&format!("href=\"/view?path={}\"", encode_query_value(&top))),
-            "in-root parent link rewritten: {out}"
-        );
-        assert!(
-            out.contains(&format!("href=\"{OUTSIDE_SENTINEL}\"")),
-            "escaping link rewritten to /outside sentinel: {out}"
-        );
+        let out = rewrite_doc_caps(r#"<img src="img.png">"#, &roots, &doc, &state.caps, None);
+        assert!(out.contains(r#"src="img.png""#), "media left unchanged: {out}");
+        assert_eq!(state.caps.lock().unwrap().live_len(), 0, "no cap minted without a static origin");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- read routes through the chokepoint -------------------------------
-
-    #[tokio::test]
-    async fn serve_asset_serves_world_readable_file() {
-        let dir = temp_dir("asset-ok");
-        let bytes: &[u8] = b"\x89PNG\r\n\x1a\nfake";
-        let p = dir.join("pic.png");
-        std::fs::write(&p, bytes).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let abs = p.canonicalize().unwrap().to_string_lossy().into_owned();
-        let state = state_for(&dir);
-
-        let resp = serve_asset(&state, &ctx(false), &abs);
-        assert_eq!(resp.status(), warp::http::StatusCode::OK);
-        assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
-        let body = warp::hyper::body::to_bytes(resp.into_body()).await.unwrap();
-        assert_eq!(&body[..], bytes);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn serve_asset_rejects_out_of_root_and_missing() {
-        let dir = temp_dir("asset-bad");
-        let outside = temp_dir("asset-outside");
-        // An EXISTING file outside every active root -> escape -> 400 (no leak).
-        let secret = outside.join("secret");
-        std::fs::write(&secret, "top secret").unwrap();
-        let state = state_for(&dir);
-        assert_eq!(
-            serve_asset(&state, &ctx(true), &secret.to_string_lossy()).status(),
-            warp::http::StatusCode::BAD_REQUEST,
-            "an out-of-root existing file is an escape (400)"
-        );
-        // A relative path is non-absolute -> 400.
-        assert_eq!(
-            serve_asset(&state, &ctx(true), "relative.png").status(),
-            warp::http::StatusCode::BAD_REQUEST
-        );
-        // In-root but nonexistent -> 404.
-        let missing = dir.join("nope.png");
-        assert_eq!(
-            serve_asset(&state, &ctx(true), &missing.to_string_lossy()).status(),
-            warp::http::StatusCode::NOT_FOUND
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&outside);
-    }
 
     #[tokio::test]
     async fn serve_raw_returns_source_text() {
@@ -2321,21 +2143,18 @@ mod tests {
         let state = state_for(&dir);
         let unauth = ctx(false);
 
-        // HTTP read routes: /asset, /raw, /view, /edit all 403.
+        // The byte-serving read routes all 403 on a private doc unauthenticated.
+        // (`/view` is now the floorless shell SPA — it serves no bytes; the floor
+        // moved to the SAME-ORIGIN `/content` API the shell fetches.)
         assert_eq!(
-            serve_asset(&state, &unauth, &priv_abs).status(),
+            content_fragment(&state, &unauth, &priv_abs).status(),
             warp::http::StatusCode::FORBIDDEN,
-            "/asset must deny a private file unauthenticated"
+            "/content must deny a private file unauthenticated (the floor)"
         );
         assert_eq!(
             serve_raw(&state, &unauth, &priv_abs).status(),
             warp::http::StatusCode::FORBIDDEN,
             "/raw must deny a private file unauthenticated"
-        );
-        assert_eq!(
-            view_page(&state, &unauth, &priv_abs, None).status(),
-            warp::http::StatusCode::FORBIDDEN,
-            "/view must deny a private file unauthenticated"
         );
         assert_eq!(
             edit_page(&state, &unauth, &priv_abs).status(),
@@ -2422,7 +2241,7 @@ mod tests {
         cross.origin = Some("http://evil.example".to_string());
         // Even a world-readable file is refused on a cross-origin request.
         assert_eq!(
-            serve_asset(&state, &cross, &pub_abs).status(),
+            content_fragment(&state, &cross, &pub_abs).status(),
             warp::http::StatusCode::FORBIDDEN
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2579,27 +2398,206 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // --- view page renders the toolbar/editor (adapted) --------------------
+    // --- render-isolation shell / srcdoc / content / navigate (W6, 3b-iii) -
+
+    /// Read a response header as an owned String (panics in tests on absence).
+    fn header(resp: &warp::reply::Response, name: &str) -> String {
+        resp.headers()
+            .get(name)
+            .unwrap_or_else(|| panic!("header {name} present"))
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
 
     #[tokio::test]
-    async fn view_page_contains_three_modes_and_abs_path() {
-        let dir = temp_dir("view-three");
-        let abs = write_mode(&dir, "doc.md", "# Hi", 0o644);
+    async fn view_serves_shell_with_coop_coep_and_frame_ancestors_none() {
+        let dir = temp_dir("view-shell");
+        let state = state_for(&dir);
+        // The shell needs a static origin to point its bundle CSP at.
+        state.set_static_base("http://127.0.0.1:8081".to_string());
+
+        let resp = view_page(&state, &ctx(false));
+        assert_eq!(resp.status(), warp::http::StatusCode::OK);
+        // Cross-origin isolation pair (Site Isolation backstop).
+        assert_eq!(header(&resp, "cross-origin-opener-policy"), "same-origin");
+        assert_eq!(header(&resp, "cross-origin-embedder-policy"), "require-corp");
+        // The shell CSP carries frame-ancestors 'none' and is the shell policy.
+        let csp = header(&resp, "content-security-policy");
+        assert!(csp.contains("frame-ancestors 'none'"), "csp: {csp}");
+        assert!(csp.contains("default-src 'none'"));
+        assert!(csp.contains("connect-src 'self'"));
+        // The body is the trusted SPA shell mounting the sandboxed iframe.
+        let html = String::from_utf8(
+            warp::hyper::body::to_bytes(resp.into_body()).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains(&format!(r#"sandbox="{}""#, crate::shell::IFRAME_SANDBOX)));
+        assert!(!html.contains("allow-same-origin"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn srcdoc_has_fresh_nonce_and_zero_egress_renderer_csp() {
+        let dir = temp_dir("srcdoc");
+        let state = state_for(&dir);
+        state.set_static_base("http://127.0.0.1:8081".to_string());
+
+        let body_of = |resp: warp::reply::Response| async {
+            String::from_utf8(
+                warp::hyper::body::to_bytes(resp.into_body()).await.unwrap().to_vec(),
+            )
+            .unwrap()
+        };
+
+        let a = body_of(srcdoc_page(&state, &ctx(false))).await;
+        let b = body_of(srcdoc_page(&state, &ctx(false))).await;
+        // Renderer CSP travels in the srcdoc meta and is zero-egress.
+        assert!(a.contains(r#"<meta http-equiv="Content-Security-Policy""#));
+        assert!(a.contains("connect-src &#x27;none&#x27;") || a.contains("connect-src 'none'"));
+        // A FRESH nonce per request (fresh iframe per navigation): the two differ.
+        assert_ne!(a, b, "each /srcdoc must mint a distinct nonce");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn content_api_enforces_the_floor() {
+        let dir = temp_dir("content-floor");
+        let priv_abs = write_mode(&dir, "secret.md", "# top secret", 0o600);
+        let pub_abs = write_mode(&dir, "public.md", "# hello world", 0o644);
         let state = state_for(&dir);
 
-        let resp = view_page(&state, &ctx(false), &abs, None);
+        // Unauthenticated request for a non-world-readable doc -> 403 (floor).
+        let denied = content_fragment(&state, &ctx(false), &priv_abs);
+        assert_eq!(
+            denied.status(),
+            warp::http::StatusCode::FORBIDDEN,
+            "content API must deny a private doc unauthenticated (the floor)"
+        );
+        // Authenticated unlocks the private doc.
+        let ok_auth = content_fragment(&state, &ctx(true), &priv_abs);
+        assert_eq!(ok_auth.status(), warp::http::StatusCode::OK);
+
+        // World-readable served even unauthenticated, as the rendered BODY.
+        let ok_pub = content_fragment(&state, &ctx(false), &pub_abs);
+        assert_eq!(ok_pub.status(), warp::http::StatusCode::OK);
+        assert_eq!(
+            header(&ok_pub, "content-type"),
+            "text/html; charset=utf-8"
+        );
+        let html = String::from_utf8(
+            warp::hyper::body::to_bytes(ok_pub.into_body()).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains("hello world"), "rendered body fragment: {html}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn content_api_rewrites_media_to_static_origin_capability_urls() {
+        let dir = temp_dir("content-cap");
+        let img = write_mode(&dir, "img.png", "PNG", 0o644);
+        let doc = dir.join("doc.md");
+        std::fs::write(&doc, "![pic](img.png)\n\n[next](other.md)\n").unwrap();
+        std::fs::set_permissions(&doc, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let other = write_mode(&dir, "other.md", "# other", 0o644);
+        let state = state_for(&dir);
+        state.set_static_base("http://127.0.0.1:8081".to_string());
+
+        let resp = content_fragment(&state, &ctx(false), &doc.to_string_lossy());
         assert_eq!(resp.status(), warp::http::StatusCode::OK);
         let html = String::from_utf8(
             warp::hyper::body::to_bytes(resp.into_body()).await.unwrap().to_vec(),
         )
         .unwrap();
-        for mode in VIEW_MODES {
-            assert!(html.contains(&format!("data-view=\"{mode}\"")));
-        }
-        assert!(html.contains("mdv-toolbar"));
-        assert!(html.contains("/raw?path="));
-        assert!(html.contains("/save?path="));
-        assert!(html.contains("id=\"doc\""));
+        // The in-root image is a capability URL on the STATIC origin (not /asset).
+        assert!(
+            html.contains("src=\"http://127.0.0.1:8081/cap/"),
+            "in-root media -> static-origin capability URL: {html}"
+        );
+        assert!(!html.contains("/asset?path="), "old /asset rewrite is retired");
+        // The markdown link routes to the shell /view (the parent navigates).
+        assert!(
+            html.contains(&format!("href=\"/view?path={}\"", encode_query_value(&other))),
+            "md link -> shell /view: {html}"
+        );
+        // The minted token resolves in the SHARED cap store (post-floor mint).
+        let token = html
+            .split("/cap/")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            state.caps.lock().unwrap().resolve(&token, asset_origin::now_secs()),
+            Some(img.into()),
+            "cap_url minted the in-root image path"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn content_api_escaping_media_becomes_outside_sentinel() {
+        let dir = temp_dir("content-esc");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let doc = dir.join("sub/child.md");
+        std::fs::write(&doc, "![evil](../../../../../etc/hosts)\n").unwrap();
+        std::fs::set_permissions(&doc, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let state = state_for(&dir);
+        state.set_static_base("http://127.0.0.1:8081".to_string());
+
+        let resp = content_fragment(&state, &ctx(false), &doc.to_string_lossy());
+        let html = String::from_utf8(
+            warp::hyper::body::to_bytes(resp.into_body()).await.unwrap().to_vec(),
+        )
+        .unwrap();
+        assert!(html.contains(&format!("src=\"{OUTSIDE_SENTINEL}\"")), "escape -> /outside: {html}");
+        assert!(!html.contains("/cap/"), "an escaping media ref must NOT mint a capability");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cap_url_is_unreachable_when_floor_fails() {
+        // The content API denies a private doc unauthenticated BEFORE any render
+        // or rewrite, so cap_url is never reached on a floor-failed path: the
+        // shared cap store stays empty.
+        let dir = temp_dir("cap-floor");
+        let _img = write_mode(&dir, "img.png", "PNG", 0o644);
+        let doc = dir.join("secret.md");
+        std::fs::write(&doc, "![pic](img.png)\n").unwrap();
+        std::fs::set_permissions(&doc, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let state = state_for(&dir);
+        state.set_static_base("http://127.0.0.1:8081".to_string());
+
+        let denied = content_fragment(&state, &ctx(false), &doc.to_string_lossy());
+        assert_eq!(denied.status(), warp::http::StatusCode::FORBIDDEN);
+        // No token was minted (cap_url unreachable from the floor-failed path).
+        assert_eq!(state.caps.lock().unwrap().live_len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn navigate_gate_rejects_out_of_root_and_admits_in_root() {
+        let dir = temp_dir("navigate");
+        let pub_abs = write_mode(&dir, "doc.md", "# doc", 0o644);
+        let state = state_for(&dir);
+
+        // In-root target -> 204 (the parent may mount a fresh srcdoc for it).
+        assert_eq!(
+            navigate_gate(&state, &ctx(false), &pub_abs).status(),
+            warp::http::StatusCode::NO_CONTENT
+        );
+        // An out-of-root target -> 403 (the /outside marker; parent refuses).
+        assert_eq!(
+            navigate_gate(&state, &ctx(false), "/etc/hosts").status(),
+            warp::http::StatusCode::FORBIDDEN,
+            "navigation to an out-of-root target is rejected by the parent"
+        );
+        // A relative (non-absolute) target is also refused.
+        assert_eq!(
+            navigate_gate(&state, &ctx(false), "../escape.md").status(),
+            warp::http::StatusCode::FORBIDDEN
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

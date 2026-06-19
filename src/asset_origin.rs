@@ -127,6 +127,14 @@ impl CapStore {
         self.live.retain(|(_, c)| c.expires_at > now);
     }
 
+    /// Number of currently-stored (not-yet-swept) capabilities. Used by the
+    /// server's render-isolation tests to assert that a floor-failed content
+    /// request mints NOTHING (i.e. `cap_url` is unreachable off the floor).
+    #[must_use]
+    pub fn live_len(&self) -> usize {
+        self.live.len()
+    }
+
     /// Mint an opaque capability token for `canonical_path`, valid for `ttl`
     /// seconds from `now`. Returns the token string (embed it in a `/cap/<token>`
     /// URL). `canonical_path` MUST already be a confined canonical absolute path
