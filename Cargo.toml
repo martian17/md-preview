@@ -9,7 +9,20 @@ license = "Apache-2.0"
 # binary, but the renderer + document core build with ZERO web deps when it is
 # disabled (`cargo build --no-default-features`), keeping the lib lean & reusable.
 default = ["daemon"]
-daemon = ["dep:tokio", "dep:warp", "dep:futures-util", "dep:webbrowser", "dep:serde"]
+daemon = [
+    "dep:tokio",
+    "dep:warp",
+    "dep:futures-util",
+    "dep:webbrowser",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:getrandom",
+    "dep:libc",
+    "dep:ureq",
+    "dep:sha2",
+    "dep:subtle",
+    "dep:base64",
+]
 
 [dependencies]
 pulldown-cmark = "0.13.3"  # Fast and GFM compatible
@@ -24,10 +37,19 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs"],
 warp = { version = "0.3", optional = true }
 futures-util = { version = "0.3", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }  # query deserialization for warp
+serde_json = { version = "1", optional = true }  # control-plane protocol + JSON frames
 webbrowser = { version = "1.2.1", optional = true }  # Opens the default browser cross-platform
+getrandom = { version = "0.2", optional = true }  # nonce/session/cap token entropy (pin 0.2; see 03-dependencies.md tail-risk)
+libc = { version = "0.2", optional = true }  # SO_PEERCRED, O_NOFOLLOW, fstat for the confinement funnel
+ureq = { version = "2", optional = true }  # bundle fetch (pin 2.x; 3.x major is tracked tail-risk)
+sha2 = { version = "0.10", optional = true }  # sha384 SRI verification for the bundle cache
+subtle = { version = "2", optional = true }  # constant-time compares for nonce/session/cap secrets (Track A2)
+base64 = { version = "0.22", optional = true }  # URL_SAFE_NO_PAD + STANDARD — replaces hand-rolled b64 copies
 
 [dev-dependencies]
 # A minimal WebSocket *client* for the `/collab` integration tests — the daemon
 # (warp) is the server. Pinned to the same version warp already pulls in, so it
 # resolves from cache with no new transitive deps. Used only by tests/collab.rs.
 tokio-tungstenite = "0.21"
+# Atomic temp-file write (bundle cache `store_atomic`) + hermetic test fixtures.
+tempfile = "3"
