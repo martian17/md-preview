@@ -67,6 +67,7 @@ use crate::asset_origin;
 use crate::auth::{self, Clock, NonceStore, SessionStore};
 use crate::bundle;
 use crate::confine::{self, ConfineError, ConfinedFile};
+use crate::{Confine, ConfineSnapshot};
 use crate::doc::DocSession;
 use crate::file_peer::{FilePeer, DEFAULT_MAX_FILE_SIZE};
 use crate::render_markdown;
@@ -219,52 +220,6 @@ impl AppState {
         }
     }
 
-    /// Confine `requested` (an absolute path from the `path=` query) through the
-    /// read funnel, registering/renewing its owning root, and return the held-fd
-    /// [`ConfinedFile`]. The Mutex over [`Roots`] is taken synchronously and
-    /// dropped before returning — never across an `.await`.
-    ///
-    /// This is the SOLE entry to the confinement funnel for reads in the daemon.
-    /// The auth permission floor is applied by [`serve_confined`] on the returned
-    /// metadata, NOT here.
-    fn confine_read(&self, requested: &Path) -> Result<ConfinedFile, ConfineError> {
-        let now = SystemTime::now();
-        // CONFINEMENT: fan out over the ALREADY-registered roots only. We do NOT
-        // auto-register a requested path as its own root — that would defeat
-        // confinement (any absolute path would become serveable). Roots are
-        // registered at startup / via the control plane (`md <file>`); here we
-        // only RENEW the owning root's sliding TTL. The lock is released at the
-        // end of this synchronous block (never held across an await).
-        let union_owned: Vec<crate::roots::Root>;
-        {
-            let mut roots = self.roots.lock().unwrap_or_else(|e| e.into_inner());
-            // Renew the TTL of whichever existing root owns this path (if any).
-            let _ = roots.owning_root(requested, now);
-            union_owned = roots.union().into_iter().cloned().collect();
-        }
-        let union_refs: Vec<&crate::roots::Root> = union_owned.iter().collect();
-        // The funnel needs a Roots reference purely for the denylist; lock again
-        // briefly (still synchronous, dropped before return).
-        let roots = self.roots.lock().unwrap_or_else(|e| e.into_inner());
-        confine::confine_read(requested, &union_refs, &roots, DEFAULT_MAX_FILE_SIZE)
-    }
-
-    /// Confine + atomically write `bytes` to `requested` through the save funnel,
-    /// against the already-registered roots only (no auto-registration — see
-    /// [`Self::confine_read`]). Mutex never held across an `.await`.
-    fn confine_save(&self, requested: &Path, bytes: &[u8]) -> Result<(), ConfineError> {
-        let now = SystemTime::now();
-        let union_owned: Vec<crate::roots::Root>;
-        {
-            let mut roots = self.roots.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = roots.owning_root(requested, now);
-            union_owned = roots.union().into_iter().cloned().collect();
-        }
-        let union_refs: Vec<&crate::roots::Root> = union_owned.iter().collect();
-        let roots = self.roots.lock().unwrap_or_else(|e| e.into_inner());
-        confine::confine_save(requested, &union_refs, &roots, bytes)
-    }
-
     /// Snapshot the current root union (cloned) for link rewriting (which needs
     /// `&[&Root]` + a `Roots` for the denylist). Mutex dropped before return.
     fn roots_snapshot(&self) -> Roots {
@@ -388,6 +343,34 @@ impl AppState {
         let mut reg = self.registry.lock().unwrap_or_else(|e| e.into_inner());
         let entry = reg.entry(canon.clone()).or_insert(entry).clone();
         Ok((canon, entry))
+    }
+}
+
+/// The daemon's confinement site, riding the single [`Confine`] fan-out
+/// (ADR-0008 Phase 2). `AppState::confine_read`/`confine_save` are now the
+/// trait's provided methods over this snapshot; the *decision* is unchanged from
+/// the prior inherent methods — same already-registered roots, same TTL renew,
+/// same denylist, same primitives.
+///
+/// This is the SOLE entry to the confinement funnel for direct reads/saves in
+/// the daemon. The auth permission floor is applied by [`serve_confined`] on the
+/// returned metadata, NOT here.
+impl Confine for AppState {
+    /// Snapshot the ALREADY-registered roots for one access, renewing the owning
+    /// root's sliding TTL first. We do NOT auto-register a requested path as its
+    /// own root — that would defeat confinement (any absolute path would become
+    /// serveable). Roots are registered at startup / via the control plane
+    /// (`md <file>`); here we only RENEW. The lock is taken synchronously and
+    /// dropped before the funnel runs — never held across an `.await`.
+    fn confinement_snapshot(&self, requested: &Path) -> ConfineSnapshot {
+        let now = SystemTime::now();
+        let mut roots = self.roots.lock().unwrap_or_else(|e| e.into_inner());
+        // Renew the TTL of whichever existing root owns this path (if any).
+        let _ = roots.owning_root(requested, now);
+        let union = roots.union().into_iter().cloned().collect();
+        // Clone the registry for the denylist consult; the lock drops here.
+        let registry = roots.clone();
+        ConfineSnapshot { union, registry }
     }
 }
 
@@ -833,11 +816,11 @@ fn navigate_gate(state: &AppState, ctx: &ReqContext, requested: &str) -> warp::r
     if let Some(resp) = network_guard(ctx) {
         return resp;
     }
+    // Classify against a plain (non-mutating) snapshot via the single `Confine`
+    // fan-out — link probes never renew a root's sliding TTL, so this rides the
+    // `impl Confine for Roots` (read-only) gate, not `AppState`'s renewing one.
     let roots = state.roots_snapshot();
-    let union_owned: Vec<crate::roots::Root> =
-        roots.union().into_iter().cloned().collect();
-    let union: Vec<&crate::roots::Root> = union_owned.iter().collect();
-    match confine::confine_link(Path::new(requested), &union, &roots) {
+    match roots.confine_link(Path::new(requested)) {
         // In-root: the parent may mount a fresh srcdoc for the canonical path.
         confine::LinkResolution::InRoot(_) => {
             warp::reply::with_status("", StatusCode::NO_CONTENT).into_response()

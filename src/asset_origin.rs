@@ -43,9 +43,9 @@ use std::time::SystemTime;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-use crate::confine::{self, ConfinedFile};
-use crate::file_peer::DEFAULT_MAX_FILE_SIZE;
+use crate::confine;
 use crate::roots;
+use crate::{Confine, ConfineSnapshot};
 
 /// Capability-token lifetime: ~5 minutes. Long enough to load a document's
 /// assets (and seek around a video), short enough that a leaked token is inert
@@ -224,25 +224,31 @@ impl Confiner {
         }
     }
 
-    /// Re-confine an (already canonical) absolute `candidate` through the unified
-    /// §1 funnel ([`confine::confine_read`]) and return the **held descriptor**.
-    ///
-    /// This is the TOCTOU-free path (audit HIGH-2): `confine_read` canonicalizes,
-    /// applies the sensitive denylist + containment, then **opens the canonical
-    /// path exactly once with `O_NOFOLLOW`** and **`fstat`s that same fd** for the
-    /// size cap and permission mode. The caller serves bytes from the returned
-    /// [`ConfinedFile::file`] and reads the floor from [`ConfinedFile::metadata`]
-    /// — never a second `stat` or re-`open` by path — so a symlink swapped in
-    /// after canonicalize cannot redirect the read, and a mode tightened after
-    /// minting is observed on the very fd the bytes come from.
-    ///
-    /// Confinement fans out over the registered roots, with the `primary_root`
-    /// fallback used when the registry is empty (single-root daemon / tests).
-    /// The registry `Mutex` is held only for the synchronous snapshot and the
-    /// denylist consult — never across the held fd's later reads or an `.await`.
-    fn confine_read(&self, candidate: &Path) -> Result<ConfinedFile, confine::ConfineError> {
+}
+
+/// Re-confine an (already canonical) absolute `candidate` through the unified §1
+/// funnel and return the **held descriptor**, riding the single [`Confine`]
+/// fan-out (ADR-0008 Phase 2). `Confiner::confine_read` is now the trait's
+/// provided method over this snapshot; the *decision* is unchanged from the prior
+/// inherent method — same registered-roots union, same empty-registry
+/// `primary_root` fallback, same denylist, same primitive.
+///
+/// This is the TOCTOU-free path (audit HIGH-2): `confine_read` canonicalizes,
+/// applies the sensitive denylist + containment, then **opens the canonical path
+/// exactly once with `O_NOFOLLOW`** and **`fstat`s that same fd** for the size
+/// cap and permission mode. The caller serves bytes from the returned
+/// [`ConfinedFile::file`] and reads the floor from [`ConfinedFile::metadata`] —
+/// never a second `stat` or re-`open` by path — so a symlink swapped in after
+/// canonicalize cannot redirect the read, and a mode tightened after minting is
+/// observed on the very fd the bytes come from.
+impl Confine for Confiner {
+    /// Snapshot the active root union (+ the empty-registry `primary_root`
+    /// fallback) and the registry for the denylist. The registry `Mutex` is held
+    /// only for the synchronous snapshot — never across the held fd's later reads
+    /// or an `.await`.
+    fn confinement_snapshot(&self, _candidate: &Path) -> ConfineSnapshot {
         // Snapshot the active root union (cloned), dropping the lock immediately.
-        let mut union_owned: Vec<roots::Root> = {
+        let mut union: Vec<roots::Root> = {
             let reg = self
                 .roots
                 .lock()
@@ -252,27 +258,29 @@ impl Confiner {
 
         // Empty registry: synthesize a Directory root from the primary-root
         // fallback so the funnel has something to confine against (matches
-        // `AppState::confine_*`'s single-root behavior). With no primary root
-        // (file-less daemon) the union stays empty and confine_read denies — the
-        // denylist is still applied unconditionally by `confine_path`.
-        if union_owned.is_empty()
+        // `AppState`'s single-root behavior). With no primary root (file-less
+        // daemon) the union stays empty and the funnel denies — the denylist is
+        // still applied unconditionally by `confine_path`. A *sensitive* primary
+        // root is still placed here and rejected by that denylist first (audit
+        // MED-4), preserving the prior behavior exactly.
+        if union.is_empty()
             && let Some(root) = self.primary_root.clone()
         {
-            union_owned.push(roots::Root {
+            union.push(roots::Root {
                 kind: roots::RootKind::Directory,
                 path: root,
                 last_used: SystemTime::now(),
             });
         }
 
-        let union_refs: Vec<&roots::Root> = union_owned.iter().collect();
-        // Re-lock briefly for the denylist consult (still synchronous; dropped
-        // before the held fd is read from in the route).
-        let reg = self
+        // Clone the registry for the denylist consult (its `is_sensitive` reads
+        // only the injected `home`); the lock drops here.
+        let registry = self
             .roots
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        confine::confine_read(candidate, &union_refs, &reg, DEFAULT_MAX_FILE_SIZE)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        ConfineSnapshot { union, registry }
     }
 }
 
@@ -846,7 +854,7 @@ mod tests {
     #[tokio::test]
     async fn cap_oversize_is_413() {
         let dir = temp_dir("big");
-        let big = vec![b'x'; (DEFAULT_MAX_FILE_SIZE + 1) as usize];
+        let big = vec![b'x'; (confine::DEFAULT_MAX_FILE_SIZE + 1) as usize];
         std::fs::write(dir.join("big.bin"), &big).unwrap();
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(

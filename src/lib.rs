@@ -40,6 +40,12 @@ pub mod server;
 // `--no-default-features` still drops the entire daemon stack.
 #[cfg(feature = "daemon")]
 pub use fs_confine::{confine, roots};
+// The `Confine` trait single-sources the root-union fan-out (ADR-0008 Phase 2
+// ruling (e)); the daemon's confinement sites (`AppState`, `asset_origin`'s
+// `Confiner`, `navigate_gate`) implement/ride it. Re-exported so those sites
+// reference it as `crate::Confine`.
+#[cfg(feature = "daemon")]
+pub use fs_confine::{Confine, ConfineSnapshot};
 
 // Always-on, multi-root, isolated preview daemon modules (Track-3 rebuild,
 // shipped `eb02537`–`ece1ef0`). See HANDOFF.md §3–§4 for the architectural
