@@ -38,7 +38,10 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use crate::confine::{self, ConfinedFile};
 use crate::file_peer::DEFAULT_MAX_FILE_SIZE;
@@ -54,39 +57,6 @@ pub const CAP_TTL_SECS: u64 = 5 * 60;
 /// beyond brute-force for a loopback, short-lived secret. Mirrors the auth
 /// nonce/session token sizing.
 const TOKEN_BYTES: usize = 32;
-
-/// Current unix-epoch seconds (the injected-clock convention used across the
-/// daemon). A pre-epoch clock (impossible in practice) saturates to 0.
-pub fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// URL- and path-safe base64 (RFC 4648 §5, no padding) — same alphabet as the
-/// auth tokens, so a capability token is safe inside a `/cap/<token>` URL path
-/// with no escaping (it never contains `+`, `/`, or `=`).
-fn b64url_nopad(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((n >> 18) & 0x3f) as usize] as char);
-        out.push(ALPHABET[((n >> 12) & 0x3f) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[((n >> 6) & 0x3f) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[(n & 0x3f) as usize] as char);
-        }
-    }
-    out
-}
 
 // ===========================================================================
 // Capability store
@@ -106,20 +76,50 @@ struct Cap {
 /// In-memory store of minted, not-yet-expired capability tokens.
 ///
 /// `mint` returns an opaque token bound to one canonical path; `resolve` returns
-/// that path iff the token exists and has not expired at `now`. Expired entries
-/// are swept lazily on every `mint`/`resolve` (no background timer). The token
-/// is high-entropy and single-doc scoped; it is **never** the only gate — the
-/// route re-confines the resolved path before serving.
-#[derive(Default)]
+/// that path iff the token exists and has not expired. Expired entries are swept
+/// lazily on every `mint`/`resolve` (no background timer). The token is
+/// high-entropy and single-doc scoped; it is **never** the only gate — the route
+/// re-confines the resolved path before serving.
+///
+/// ## Injected clock (audit C §1g / §4)
+/// Time comes from an injected [`crate::auth::Clock`], exactly like
+/// [`crate::auth::NonceStore`] / `SessionStore`, so TTL expiry is
+/// deterministically testable without touching the wall clock. Production builds
+/// it with [`crate::auth::Clock::system`] ([`CapStore::new`]); tests pass a
+/// closure over a shared counter ([`CapStore::with_clock`]).
 pub struct CapStore {
     live: Vec<(String, Cap)>,
+    /// The injected time source. Stored in millis (the [`Clock`] unit);
+    /// capability TTLs are in seconds, so [`Self::now`] divides down.
+    clock: crate::auth::Clock,
+}
+
+impl Default for CapStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CapStore {
-    /// A fresh, empty store.
+    /// A fresh, empty store driven by the real wall clock.
     #[must_use]
     pub fn new() -> Self {
-        Self { live: Vec::new() }
+        Self::with_clock(crate::auth::Clock::system())
+    }
+
+    /// A fresh, empty store driven by an injected `clock` (deterministic tests).
+    #[must_use]
+    pub fn with_clock(clock: crate::auth::Clock) -> Self {
+        Self {
+            live: Vec::new(),
+            clock,
+        }
+    }
+
+    /// Current unix-epoch time in **seconds**, from the injected clock (which is
+    /// in millis). The TTL arithmetic is all in seconds, matching [`CAP_TTL_SECS`].
+    fn now(&self) -> u64 {
+        self.clock.now_secs()
     }
 
     /// Drop every capability whose TTL has elapsed at `now`.
@@ -136,19 +136,23 @@ impl CapStore {
     }
 
     /// Mint an opaque capability token for `canonical_path`, valid for `ttl`
-    /// seconds from `now`. Returns the token string (embed it in a `/cap/<token>`
-    /// URL). `canonical_path` MUST already be a confined canonical absolute path
-    /// (the caller resolves+confines first); the route re-confines it anyway.
+    /// seconds from now (the injected clock). Returns the token string (embed it
+    /// in a `/cap/<token>` URL). `canonical_path` MUST already be a confined
+    /// canonical absolute path (the caller resolves+confines first); the route
+    /// re-confines it anyway.
     pub fn mint(
         &mut self,
         canonical_path: PathBuf,
         ttl: u64,
-        now: u64,
     ) -> Result<String, getrandom::Error> {
+        let now = self.now();
         self.sweep(now);
         let mut buf = [0u8; TOKEN_BYTES];
         getrandom::getrandom(&mut buf)?;
-        let token = b64url_nopad(&buf);
+        // URL- and path-safe base64 (no padding) — same alphabet as the auth
+        // tokens, so the token is safe in a `/cap/<token>` URL with no escaping
+        // (never `+`, `/`, or `=`). Uses the already-present `base64` crate.
+        let token = URL_SAFE_NO_PAD.encode(buf);
         self.live.push((
             token.clone(),
             Cap {
@@ -160,13 +164,15 @@ impl CapStore {
     }
 
     /// Resolve `token` to its granted canonical path iff it exists and is not
-    /// expired at `now`. Unknown or expired → `None`. Token comparison goes
-    /// through [`crate::auth::ct_eq_str`] (the mandated constant-time chokepoint)
-    /// so a timing side-channel cannot leak how much of a guessed token matched.
-    /// Tokens are reusable within their TTL (a browser re-requests an `<img>` and
-    /// a video range-streams over many requests), so `resolve` does **not** burn.
+    /// expired now (the injected clock). Unknown or expired → `None`. Token
+    /// comparison goes through [`crate::auth::ct_eq_str`] (the mandated
+    /// constant-time chokepoint) so a timing side-channel cannot leak how much of
+    /// a guessed token matched. Tokens are reusable within their TTL (a browser
+    /// re-requests an `<img>` and a video range-streams over many requests), so
+    /// `resolve` does **not** burn.
     #[must_use]
-    pub fn resolve(&mut self, token: &str, now: u64) -> Option<PathBuf> {
+    pub fn resolve(&mut self, token: &str) -> Option<PathBuf> {
+        let now = self.now();
         self.sweep(now);
         self.live
             .iter()
@@ -289,7 +295,7 @@ pub fn cap_url(
 ) -> Option<String> {
     let token = {
         let mut s = store.lock().ok()?;
-        s.mint(confined, CAP_TTL_SECS, now_secs()).ok()?
+        s.mint(confined, CAP_TTL_SECS).ok()?
     };
     Some(format!("{}/cap/{token}", static_base.trim_end_matches('/')))
 }
@@ -353,7 +359,6 @@ enum CapTarget {
 /// to [`serve_cap`] so the floor and the served bytes come from the SAME fd
 /// (audit HIGH-2). The store `Mutex` is dropped before any filesystem work.
 fn resolve_target(store: &Mutex<CapStore>, token: &str) -> CapTarget {
-    let now = now_secs();
     let Ok(mut s) = store.lock() else {
         return CapTarget::NotFound;
     };
@@ -365,7 +370,7 @@ fn resolve_target(store: &Mutex<CapStore>, token: &str) -> CapTarget {
     // already evicted the expired token before this check, which would
     // falsely return 404 for a known-but-expired token.
     let exists = s.contains_token(token);
-    match s.resolve(token, now) {
+    match s.resolve(token) {
         Some(p) => CapTarget::Ok(p),
         None if exists => CapTarget::Expired,
         None => CapTarget::NotFound,
@@ -594,6 +599,21 @@ mod tests {
     use std::sync::Arc;
     use std::time::SystemTime;
 
+    /// A settable mock clock (millis) and the [`CapStore`] driven by it, so TTL
+    /// expiry is exercised deterministically without the wall clock (audit C §4).
+    /// The returned handle lets a test advance time between `mint` and `resolve`.
+    fn store_with_mock_clock() -> (Arc<std::sync::Mutex<u64>>, CapStore) {
+        let millis = Arc::new(std::sync::Mutex::new(0u64));
+        let m = Arc::clone(&millis);
+        let clock = crate::auth::Clock::new(move || *m.lock().unwrap_or_else(|e| e.into_inner()));
+        (millis, CapStore::with_clock(clock))
+    }
+
+    /// Advance the mock clock to `secs` seconds (it is stored in millis).
+    fn set_secs(millis: &std::sync::Mutex<u64>, secs: u64) {
+        *millis.lock().unwrap_or_else(|e| e.into_inner()) = secs.saturating_mul(1_000);
+    }
+
     /// A canonicalized tempdir registered as a single root, plus a `Confiner`
     /// over it (empty-registry fallback also covered by `primary_root`).
     fn confiner_over(dir: &Path) -> Confiner {
@@ -616,33 +636,47 @@ mod tests {
 
     #[test]
     fn mint_then_resolve_round_trips() {
-        let mut store = CapStore::new();
+        let (millis, mut store) = store_with_mock_clock();
+        set_secs(&millis, 1000);
         let p = PathBuf::from("/some/canonical/pic.png");
-        let token = store.mint(p.clone(), CAP_TTL_SECS, 1000).expect("mint");
-        assert_eq!(store.resolve(&token, 1001), Some(p));
+        let token = store.mint(p.clone(), CAP_TTL_SECS).expect("mint");
+        set_secs(&millis, 1001);
+        assert_eq!(store.resolve(&token), Some(p));
     }
 
+    /// TTL expiry via the INJECTED clock (audit C §4): a token live just before
+    /// its expiry second and gone just after, driven entirely by advancing the
+    /// mock clock — no wall-clock dependency.
     #[test]
     fn expired_token_resolves_to_none() {
-        let mut store = CapStore::new();
-        let token = store
-            .mint(PathBuf::from("/x"), CAP_TTL_SECS, 1000)
-            .expect("mint");
-        assert_eq!(store.resolve(&token, 1000 + CAP_TTL_SECS + 1), None);
+        let (millis, mut store) = store_with_mock_clock();
+        set_secs(&millis, 1000);
+        let token = store.mint(PathBuf::from("/x"), CAP_TTL_SECS).expect("mint");
+
+        // Still live one second before expiry.
+        set_secs(&millis, 1000 + CAP_TTL_SECS - 1);
+        assert_eq!(store.resolve(&token), Some(PathBuf::from("/x")), "live pre-expiry");
+
+        // Gone the second after the TTL elapses.
+        set_secs(&millis, 1000 + CAP_TTL_SECS + 1);
+        assert_eq!(store.resolve(&token), None, "expired post-TTL");
     }
 
     #[test]
     fn unknown_token_resolves_to_none() {
-        let mut store = CapStore::new();
-        let _ = store.mint(PathBuf::from("/x"), CAP_TTL_SECS, 1000).expect("mint");
-        assert_eq!(store.resolve("not-a-real-token", 1001), None);
+        let (millis, mut store) = store_with_mock_clock();
+        set_secs(&millis, 1000);
+        let _ = store.mint(PathBuf::from("/x"), CAP_TTL_SECS).expect("mint");
+        set_secs(&millis, 1001);
+        assert_eq!(store.resolve("not-a-real-token"), None);
     }
 
     #[test]
     fn tokens_are_unguessable_and_distinct() {
-        let mut store = CapStore::new();
-        let a = store.mint(PathBuf::from("/a"), CAP_TTL_SECS, 1).expect("a");
-        let b = store.mint(PathBuf::from("/b"), CAP_TTL_SECS, 1).expect("b");
+        let (millis, mut store) = store_with_mock_clock();
+        set_secs(&millis, 1);
+        let a = store.mint(PathBuf::from("/a"), CAP_TTL_SECS).expect("a");
+        let b = store.mint(PathBuf::from("/b"), CAP_TTL_SECS).expect("b");
         assert_ne!(a, b, "CSPRNG tokens must differ");
         assert!(a.len() >= 40, "256-bit base64url token ≈ 43 chars");
     }
@@ -662,7 +696,7 @@ mod tests {
         let token = store
             .lock()
             .unwrap()
-            .mint(outside, CAP_TTL_SECS, now_secs())
+            .mint(outside, CAP_TTL_SECS)
             .unwrap();
         let resp = serve_cap(&store, &confiner, &token, None);
         assert_eq!(resp.status(), warp::http::StatusCode::NOT_FOUND);
@@ -689,7 +723,7 @@ mod tests {
         let token = store
             .lock()
             .unwrap()
-            .mint(dir.join("pic.png"), CAP_TTL_SECS, now_secs())
+            .mint(dir.join("pic.png"), CAP_TTL_SECS)
             .unwrap();
 
         let routes = asset_origin_routes(store, confiner);
@@ -744,11 +778,12 @@ mod tests {
         .unwrap();
         let confiner = confiner_over(&dir);
         let store = Arc::new(Mutex::new(CapStore::new()));
-        // Mint with ttl=0 and a past `now` so expires_at is in the past.
+        // Mint with ttl=0: expires_at == now, and resolve requires expires_at >
+        // now, so the token is "known but expired" the instant it is minted.
         let expired = store
             .lock()
             .unwrap()
-            .mint(dir.join("f.png"), 0, now_secs().saturating_sub(10))
+            .mint(dir.join("f.png"), 0)
             .unwrap();
 
         let routes = asset_origin_routes(store, confiner);
@@ -777,7 +812,7 @@ mod tests {
         let token = store
             .lock()
             .unwrap()
-            .mint(dir.join("v.mp4"), CAP_TTL_SECS, now_secs())
+            .mint(dir.join("v.mp4"), CAP_TTL_SECS)
             .unwrap();
 
         let routes = asset_origin_routes(store, confiner);
@@ -824,7 +859,7 @@ mod tests {
         let token = store
             .lock()
             .unwrap()
-            .mint(dir.join("big.bin"), CAP_TTL_SECS, now_secs())
+            .mint(dir.join("big.bin"), CAP_TTL_SECS)
             .unwrap();
 
         let routes = asset_origin_routes(store, confiner);
@@ -855,7 +890,7 @@ mod tests {
         let token = store
             .lock()
             .unwrap()
-            .mint(dir.join("secret.png"), CAP_TTL_SECS, now_secs())
+            .mint(dir.join("secret.png"), CAP_TTL_SECS)
             .unwrap();
 
         let routes = asset_origin_routes(store, confiner);
@@ -894,7 +929,7 @@ mod tests {
         let token = store
             .lock()
             .unwrap()
-            .mint(asset.clone(), CAP_TTL_SECS, now_secs())
+            .mint(asset.clone(), CAP_TTL_SECS)
             .unwrap();
 
         // THE SWAP: replace the in-root file with a symlink to the outside secret
@@ -938,7 +973,7 @@ mod tests {
         let token = store
             .lock()
             .unwrap()
-            .mint(asset.clone(), CAP_TTL_SECS, now_secs())
+            .mint(asset.clone(), CAP_TTL_SECS)
             .unwrap();
 
         // THE SWAP: tighten the mode between mint and serve.
@@ -982,7 +1017,7 @@ mod tests {
         let token = store
             .lock()
             .unwrap()
-            .mint(key.clone(), CAP_TTL_SECS, now_secs())
+            .mint(key.clone(), CAP_TTL_SECS)
             .unwrap();
 
         let routes = asset_origin_routes(store, confiner);

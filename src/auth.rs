@@ -65,6 +65,14 @@ impl Clock {
         (self.0)()
     }
 
+    /// Current time in **whole seconds** (the unit the capability store's TTLs
+    /// use). Derived from [`Self::now`] so a single injected clock drives both
+    /// the millis-based auth stores and the secs-based [`crate::asset_origin::CapStore`].
+    #[must_use]
+    pub fn now_secs(&self) -> u64 {
+        self.now() / 1_000
+    }
+
     /// A clock backed by the real wall clock (`SystemTime`). Falls back to `0`
     /// if the system clock is before the Unix epoch (never panics).
     pub fn system() -> Self {

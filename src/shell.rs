@@ -397,22 +397,30 @@ fn escape_csp_token(s: &str) -> String {
         .collect()
 }
 
-/// Mint a fresh CSP nonce: 16 CSPRNG bytes mapped to a URL-safe alphabet
-/// (`A–Z a–z 0–9 - _`), which is valid inside a `'nonce-…'` source and an HTML
-/// attribute without escaping. No-panic: if the OS RNG is unavailable we fall back
-/// to a non-secret placeholder so this builder never aborts production (a missing
-/// OS RNG is fatal to the daemon elsewhere; this is not the layer that should
-/// panic).
+/// Length of a CSP nonce in base64url characters. 16 chars ≈ 96 bits of
+/// entropy — more than sufficient for a per-page-load CSP nonce.
+const NONCE_LEN: usize = 16;
+
+/// Mint a fresh CSP nonce: a URL-safe-no-pad token (`A–Z a–z 0–9 - _`) valid
+/// inside a `'nonce-…'` source and an HTML attribute without escaping.
+///
+/// Consolidated onto [`crate::auth::generate_token`] (the shared 256-bit
+/// CSPRNG/base64url token helper) and truncated to [`NONCE_LEN`] chars, so there
+/// is one token generator in the daemon (audit C §1h). No-panic: if the OS RNG
+/// is unavailable we fall back to a non-secret placeholder so this builder never
+/// aborts production (a missing OS RNG is fatal to the daemon elsewhere; this is
+/// not the layer that should panic).
 pub fn gen_nonce() -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut bytes = [0u8; 16];
-    if getrandom::getrandom(&mut bytes).is_err() {
-        return "nonce-unavailable".to_string();
+    match crate::auth::generate_token() {
+        // The token is ≥ 43 base64url chars; take a NONCE_LEN-char prefix. Every
+        // character is from the same URL-safe alphabet, so the prefix is itself a
+        // valid CSP nonce / HTML-attribute value.
+        Ok(mut token) => {
+            token.truncate(NONCE_LEN);
+            token
+        }
+        Err(_) => "nonce-unavailable".to_string(),
     }
-    bytes
-        .iter()
-        .map(|b| ALPHABET[(b & 0x3f) as usize] as char)
-        .collect()
 }
 
 #[cfg(test)]

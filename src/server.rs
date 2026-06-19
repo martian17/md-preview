@@ -173,11 +173,6 @@ struct AppState {
     roots: Arc<Mutex<Roots>>,
     /// Auth: bootstrap nonces + session tokens (shared across all routes).
     auth: Arc<AuthState>,
-    /// Injected wall clock (millis). The auth stores own their own [`Clock`]s;
-    /// this one is held for parity with the design's "injected clock" and for a
-    /// future periodic nonce/session sweep. Not read on the hot path yet.
-    #[allow(dead_code)]
-    clock: Arc<Clock>,
     /// Short-TTL, per-doc capability tokens for the **secondary static origin**'s
     /// asset server (design §3 / ADR-0007). The trusted shell mints a token here
     /// for each confined asset path; the static origin's `/cap/<token>` route
@@ -213,8 +208,10 @@ impl AppState {
         Self {
             roots: Arc::new(Mutex::new(roots)),
             auth: Arc::new(AuthState::new(&clock_factory, secure_cookies)),
-            clock: Arc::new(clock_factory()),
-            caps: Arc::new(Mutex::new(asset_origin::CapStore::new())),
+            // The cap store shares the daemon's injected clock (one fresh
+            // `Clock` from the factory), so its TTL tracks the same time source
+            // as the auth stores and is deterministic under the test factory.
+            caps: Arc::new(Mutex::new(asset_origin::CapStore::with_clock(clock_factory()))),
             static_base: Arc::new(Mutex::new(None)),
             registry: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1452,7 +1449,10 @@ fn spawn_watch(
                     return;
                 }
             };
-            if let Err(e) = peer.watch().map_err(|e| std::io::Error::other(e.to_string())) {
+            // Preserve the underlying `notify::Error` (it is `std::error::Error`)
+            // by boxing it into the io error rather than flattening to a string,
+            // so the error chain/source survives (audit C §5).
+            if let Err(e) = peer.watch().map_err(std::io::Error::other) {
                 let _ = ready_tx.send(Err(e));
                 return;
             }
@@ -2174,7 +2174,7 @@ mod tests {
         // The minted token resolves the in-root image in the shared store.
         let token = out.split("/cap/").nth(1).and_then(|s| s.split('"').next()).unwrap();
         assert_eq!(
-            state.caps.lock().unwrap().resolve(token, asset_origin::now_secs()),
+            state.caps.lock().unwrap().resolve(token),
             Some(img.into())
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2606,7 +2606,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert_eq!(
-            state.caps.lock().unwrap().resolve(&token, asset_origin::now_secs()),
+            state.caps.lock().unwrap().resolve(&token),
             Some(img.into()),
             "cap_url minted the in-root image path"
         );
@@ -2832,7 +2832,6 @@ mod tests {
             .mint(
                 dir.join("pic.png"),
                 asset_origin::CAP_TTL_SECS,
-                asset_origin::now_secs(),
             )
             .unwrap();
         let cache_dir = temp_dir("static-cap-cache");
@@ -2876,7 +2875,6 @@ mod tests {
             .mint(
                 dir.join("pic.png"),
                 asset_origin::CAP_TTL_SECS,
-                asset_origin::now_secs(),
             )
             .unwrap();
         let cache_dir = temp_dir("static-host-cache");
@@ -2959,7 +2957,6 @@ mod tests {
             .mint(
                 dir.join("secret.png"),
                 asset_origin::CAP_TTL_SECS,
-                asset_origin::now_secs(),
             )
             .unwrap();
         let cache_dir = temp_dir("static-floor-cache");
