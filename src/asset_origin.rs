@@ -40,9 +40,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::file_peer::{FilePeer, DEFAULT_MAX_FILE_SIZE};
+use crate::confine::{self, ConfinedFile};
+use crate::file_peer::DEFAULT_MAX_FILE_SIZE;
 use crate::roots;
-use crate::session::YrsSession;
 
 /// Capability-token lifetime: ~5 minutes. Long enough to load a document's
 /// assets (and seek around a video), short enough that a leaked token is inert
@@ -152,16 +152,17 @@ impl CapStore {
     }
 
     /// Resolve `token` to its granted canonical path iff it exists and is not
-    /// expired at `now`. Unknown or expired → `None`. Comparison is exact-string
-    /// (the token is high-entropy; there is no user-controlled prefix). Tokens
-    /// are reusable within their TTL (a browser re-requests an `<img>` and a
-    /// video range-streams over many requests), so `resolve` does **not** burn.
+    /// expired at `now`. Unknown or expired → `None`. Token comparison goes
+    /// through [`crate::auth::ct_eq_str`] (the mandated constant-time chokepoint)
+    /// so a timing side-channel cannot leak how much of a guessed token matched.
+    /// Tokens are reusable within their TTL (a browser re-requests an `<img>` and
+    /// a video range-streams over many requests), so `resolve` does **not** burn.
     #[must_use]
     pub fn resolve(&mut self, token: &str, now: u64) -> Option<PathBuf> {
         self.sweep(now);
         self.live
             .iter()
-            .find(|(t, c)| t == token && c.expires_at > now)
+            .find(|(t, c)| crate::auth::ct_eq_str(t, token) && c.expires_at > now)
             .map(|(_, c)| c.path.clone())
     }
 
@@ -169,9 +170,12 @@ impl CapStore {
     /// expiry checking**. Used by [`resolve_target`] to distinguish a known-but-
     /// expired token (→ 410 Gone) from a never-issued / already-swept token
     /// (→ 404). Does NOT mutate the live set, so it cannot accidentally remove
-    /// tokens in the presence of concurrent requests.
+    /// tokens in the presence of concurrent requests. Comparison goes through
+    /// [`crate::auth::ct_eq_str`] (constant-time), matching [`Self::resolve`].
     fn contains_token(&self, token: &str) -> bool {
-        self.live.iter().any(|(t, _)| t == token)
+        self.live
+            .iter()
+            .any(|(t, _)| crate::auth::ct_eq_str(t, token))
     }
 }
 
@@ -206,34 +210,55 @@ impl Confiner {
         }
     }
 
-    /// Re-confine an (already canonical) absolute `candidate` against the union
-    /// of registered roots, returning the canonical confined path or `None` if it
-    /// escapes every root. Same funnel ([`FilePeer::within`] per root) the direct
-    /// `?path=` requests use, so a token is never a weaker path than a typed one.
-    /// The registry `Mutex` is only held for the synchronous snapshot/lookup,
-    /// never across a filesystem `within` call or an `.await`.
-    fn confine(&self, candidate: &Path) -> Option<PathBuf> {
-        let root_paths: Vec<PathBuf> = {
-            let reg = self.roots.lock().ok()?;
-            reg.union().iter().map(|r| r.path.clone()).collect()
+    /// Re-confine an (already canonical) absolute `candidate` through the unified
+    /// §1 funnel ([`confine::confine_read`]) and return the **held descriptor**.
+    ///
+    /// This is the TOCTOU-free path (audit HIGH-2): `confine_read` canonicalizes,
+    /// applies the sensitive denylist + containment, then **opens the canonical
+    /// path exactly once with `O_NOFOLLOW`** and **`fstat`s that same fd** for the
+    /// size cap and permission mode. The caller serves bytes from the returned
+    /// [`ConfinedFile::file`] and reads the floor from [`ConfinedFile::metadata`]
+    /// — never a second `stat` or re-`open` by path — so a symlink swapped in
+    /// after canonicalize cannot redirect the read, and a mode tightened after
+    /// minting is observed on the very fd the bytes come from.
+    ///
+    /// Confinement fans out over the registered roots, with the `primary_root`
+    /// fallback used when the registry is empty (single-root daemon / tests).
+    /// The registry `Mutex` is held only for the synchronous snapshot and the
+    /// denylist consult — never across the held fd's later reads or an `.await`.
+    fn confine_read(&self, candidate: &Path) -> Result<ConfinedFile, confine::ConfineError> {
+        // Snapshot the active root union (cloned), dropping the lock immediately.
+        let mut union_owned: Vec<roots::Root> = {
+            let reg = self
+                .roots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reg.union().into_iter().cloned().collect()
         };
 
-        // Empty registry: fall back to the primary root (single-root daemon /
-        // tests). With no primary root (file-less daemon) there is nothing to
-        // confine against → deny.
-        if root_paths.is_empty() {
-            let root = self.primary_root.as_ref()?;
-            return FilePeer::within(root, candidate, YrsSession::from_text(""))
-                .ok()
-                .map(|p| p.path().to_path_buf());
+        // Empty registry: synthesize a Directory root from the primary-root
+        // fallback so the funnel has something to confine against (matches
+        // `AppState::confine_*`'s single-root behavior). With no primary root
+        // (file-less daemon) the union stays empty and confine_read denies — the
+        // denylist is still applied unconditionally by `confine_path`.
+        if union_owned.is_empty()
+            && let Some(root) = self.primary_root.clone()
+        {
+            union_owned.push(roots::Root {
+                kind: roots::RootKind::Directory,
+                path: root,
+                last_used: SystemTime::now(),
+            });
         }
 
-        for root in &root_paths {
-            if let Ok(peer) = FilePeer::within(root, candidate, YrsSession::from_text("")) {
-                return Some(peer.path().to_path_buf());
-            }
-        }
-        None
+        let union_refs: Vec<&roots::Root> = union_owned.iter().collect();
+        // Re-lock briefly for the denylist consult (still synchronous; dropped
+        // before the held fd is read from in the route).
+        let reg = self
+            .roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        confine::confine_read(candidate, &union_refs, &reg, DEFAULT_MAX_FILE_SIZE)
     }
 }
 
@@ -269,14 +294,20 @@ pub fn cap_url(
 /// bytes, read-only, CORP-tagged, CORS-less, with HTTP Range support.
 ///
 /// Pipeline (every gate independent of the token's mere existence):
-///   1. resolve `token` → canonical path (unknown/expired → **404**),
-///   2. **re-confine** that path against the registered roots (escaped → **404**),
-///   3. re-stat at read time: directory/missing → **404**, oversize → **413**,
-///   4. Track-A floor: file must be world-readable at serve time (stale token
-///      for a now-private file → **403**),
-///   5. serve the bytes with an extension-inferred `Content-Type`,
-///      `Cross-Origin-Resource-Policy: cross-origin`, and **no** CORS header;
-///      a `Range` request streams a **206** partial slice (bad range → **416**).
+///   1. resolve `token` against the cap-store → stored path (unknown → **404**,
+///      known-but-expired → **410 Gone**),
+///   2. **re-confine** that path through the unified §1 funnel
+///      ([`confine::confine_read`]), which opens the canonical path ONCE with
+///      `O_NOFOLLOW` and `fstat`s that held fd — escape / sensitive denylist /
+///      non-regular / symlinked-final / missing → **404**, oversize → **413**.
+///      This is TOCTOU-free: the floor and the served bytes come from the SAME
+///      descriptor, never a re-`open` by path (audit HIGH-2),
+///   3. Track-A floor on the held fd's fstat'd mode: must be world-readable
+///      (stale token for a now-private file → **403**),
+///   4. serve the bytes from the held descriptor with an extension-inferred
+///      `Content-Type`, `Cross-Origin-Resource-Policy: cross-origin`, and **no**
+///      CORS header; a `Range` request streams a **206** partial slice (bad
+///      range → **416**).
 ///
 /// SVG is served as `image/svg+xml` (the renderer embeds it as `<img>`, so its
 /// external refs are inert under the renderer CSP). A resolve/confine failure is
@@ -297,45 +328,38 @@ pub fn asset_origin_routes(
         })
 }
 
-/// The outcome of resolving + confining a capability token, separating a never-
-/// existed/escaped token (a flat 404) from a known-but-expired one (410 Gone).
+/// The outcome of resolving a capability token against the store, separating a
+/// never-existed/swept token (a flat 404) from a known-but-expired one (410).
+/// Re-confinement + the held-fd open happen *after* this, in [`serve_cap`].
 enum CapTarget {
-    /// Resolved + re-confined to this canonical path.
+    /// Resolved to this stored canonical path (still to be re-confined at serve).
     Ok(PathBuf),
     /// The token is known but its TTL has elapsed — `410 Gone` (re-mint).
     Expired,
-    /// Unknown token, or one whose path no longer confines — flat `404`.
+    /// Unknown / already-swept token — flat `404` (no existence leak).
     NotFound,
 }
 
-/// Resolve `token` and re-confine its path. A token that resolves but whose path
-/// no longer sits under any registered root is treated as `NotFound` (no leak).
-fn resolve_target(store: &Mutex<CapStore>, confiner: &Confiner, token: &str) -> CapTarget {
+/// Resolve `token` to its stored path against the cap-store ONLY. The actual
+/// re-confinement (and the single `O_NOFOLLOW` open of the held fd) is deferred
+/// to [`serve_cap`] so the floor and the served bytes come from the SAME fd
+/// (audit HIGH-2). The store `Mutex` is dropped before any filesystem work.
+fn resolve_target(store: &Mutex<CapStore>, token: &str) -> CapTarget {
     let now = now_secs();
-    // Resolve under the lock, then drop it before any filesystem work.
-    let resolved = {
-        let Ok(mut s) = store.lock() else {
-            return CapTarget::NotFound;
-        };
-        // Distinguish "known but expired" (410) from "unknown" (404).
-        // Check token presence WITHOUT sweeping first (contains_token is a raw
-        // iter, no mutation), then resolve with current time. If the token is
-        // present but not live, it must be expired → 410. Using contains_token
-        // (non-sweeping) avoids a race where a concurrent request's sweep has
-        // already evicted the expired token before this check, which would
-        // falsely return 404 for a known-but-expired token.
-        let exists = s.contains_token(token);
-        match s.resolve(token, now) {
-            Some(p) => Some(p),
-            None if exists => return CapTarget::Expired,
-            None => None,
-        }
+    let Ok(mut s) = store.lock() else {
+        return CapTarget::NotFound;
     };
-    match resolved {
-        Some(path) => match confiner.confine(&path) {
-            Some(canon) => CapTarget::Ok(canon),
-            None => CapTarget::NotFound,
-        },
+    // Distinguish "known but expired" (410) from "unknown" (404).
+    // Check token presence WITHOUT sweeping first (contains_token is a raw
+    // iter, no mutation), then resolve with current time. If the token is
+    // present but not live, it must be expired → 410. Using contains_token
+    // (non-sweeping) avoids a race where a concurrent request's sweep has
+    // already evicted the expired token before this check, which would
+    // falsely return 404 for a known-but-expired token.
+    let exists = s.contains_token(token);
+    match s.resolve(token, now) {
+        Some(p) => CapTarget::Ok(p),
+        None if exists => CapTarget::Expired,
         None => CapTarget::NotFound,
     }
 }
@@ -352,66 +376,65 @@ fn serve_cap(
 
     let status = |code| warp::reply::with_status("", code).into_response();
 
-    let canon = match resolve_target(store, confiner, token) {
+    // 1. Resolve the token against the cap-store only (410 vs 404).
+    let stored = match resolve_target(store, token) {
         CapTarget::Ok(p) => p,
         CapTarget::Expired => return status(StatusCode::GONE),
         CapTarget::NotFound => return status(StatusCode::NOT_FOUND),
     };
 
-    // Re-stat at read time (size cap + dir/missing + Track-A floor check),
-    // mirroring `serve_asset`.
-    let (total, is_world_readable) = match std::fs::metadata(&canon) {
-        Ok(meta) if meta.is_dir() => return status(StatusCode::NOT_FOUND),
-        Ok(meta) if meta.len() > DEFAULT_MAX_FILE_SIZE => {
+    // 2. Re-confine through the unified funnel, which opens the canonical path
+    //    EXACTLY ONCE with O_NOFOLLOW and fstat's that held fd (audit HIGH-2:
+    //    no separate `metadata` + `read`/`open` path syscalls). The denylist is
+    //    applied unconditionally inside confine_path, which also closes the
+    //    legacy denylist gap. Mapping mirrors `serve_asset`:
+    //      escape / sensitive / not-a-regular-file / O_NOFOLLOW-refused → 404,
+    //      oversize (fstat'd len) → 413.
+    let confined = match confiner.confine_read(&stored) {
+        Ok(c) => c,
+        Err(confine::ConfineError::TooLarge { .. }) => {
             return status(StatusCode::PAYLOAD_TOO_LARGE)
         }
-        Ok(meta) => (
-            meta.len(),
-            crate::auth::is_world_readable(crate::auth::mode_of(&meta)),
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return status(StatusCode::NOT_FOUND)
-        }
-        Err(_) => return status(StatusCode::INTERNAL_SERVER_ERROR),
+        // Escape, sensitive, non-absolute, missing, symlinked-final-component
+        // (ELOOP), or non-regular file: a flat 404, no existence leak.
+        Err(_) => return status(StatusCode::NOT_FOUND),
     };
 
-    // Track-A hardening (audit 02 /cap floor finding): defensive re-stat for
-    // world-readability. A token was minted only from a floor-passed/authenticated
-    // context (W6 mint-time contract), but if the file's mode was tightened after
-    // minting we must not serve it on the stale token.
-    //
-    // W6 mint-time contract: cap_url() is called ONLY from a serve_confined() /
-    // floor-passed context. The token IS the capability. This re-stat ensures a
-    // now-private file cannot be served on a stale token.
-    if !is_world_readable {
+    // 3. Track-A floor on the SAME fstat'd metadata the bytes come from. A token
+    //    is minted only from a floor-passed context (W6 mint-time contract), but
+    //    if the mode was tightened after minting we must not serve the stale
+    //    token. Because this reads the held fd's fstat — not a fresh path stat —
+    //    a swap between mint and serve cannot smuggle a private file past it.
+    if !crate::auth::is_world_readable(crate::auth::mode_of(&confined.metadata)) {
         return status(StatusCode::FORBIDDEN);
     }
 
-    let content_type = content_type_for(&canon);
+    let total = confined.metadata.len();
+    let content_type = content_type_for(&confined.canonical);
 
+    // 4. Serve bytes from the HELD fd (seek/read on the handle) — never re-open
+    //    by path. Both the full 200 and the Range 206 read from `confined.file`.
     match range.and_then(|r| parse_range(r, total)) {
         // A Range header that is present but unsatisfiable → 416.
         _ if range.is_some() && parse_range(range.unwrap_or(""), total).is_none() => {
             range_not_satisfiable(total)
         }
-        Some((start, end)) => serve_range(&canon, start, end, total, content_type),
-        None => serve_full(&canon, content_type),
+        Some((start, end)) => serve_range(confined.file, start, end, total, content_type),
+        None => serve_full(confined.file, content_type),
     }
 }
 
-/// Serve the whole file (200) with CORP + Accept-Ranges, no CORS.
-fn serve_full(canon: &Path, content_type: &'static str) -> warp::reply::Response {
+/// Serve the whole file (200) with CORP + Accept-Ranges, no CORS. Reads from the
+/// **held descriptor** opened once through the funnel (audit HIGH-2) — never a
+/// re-`open` by path — so the bytes are exactly those the floor was checked on.
+fn serve_full(mut file: std::fs::File, content_type: &'static str) -> warp::reply::Response {
+    use std::io::Read as _;
     use warp::http::StatusCode;
     use warp::reply::Reply;
-    let bytes = match std::fs::read(canon) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return warp::reply::with_status("", StatusCode::NOT_FOUND).into_response()
-        }
-        Err(_) => {
-            return warp::reply::with_status("", StatusCode::INTERNAL_SERVER_ERROR).into_response()
-        }
-    };
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return warp::reply::with_status("", StatusCode::INTERNAL_SERVER_ERROR).into_response();
+    }
     let mut resp = warp::reply::Response::new(bytes.into());
     *resp.status_mut() = StatusCode::OK;
     decorate(resp.headers_mut(), content_type);
@@ -422,7 +445,7 @@ fn serve_full(canon: &Path, content_type: &'static str) -> warp::reply::Response
 /// Serve a byte range `[start, end]` (inclusive) as a 206 partial response. We
 /// read only the requested slice so a giant video never buffers in full.
 fn serve_range(
-    canon: &Path,
+    mut file: std::fs::File,
     start: u64,
     end: u64,
     total: u64,
@@ -432,15 +455,8 @@ fn serve_range(
     use warp::http::StatusCode;
     use warp::reply::Reply;
 
-    let mut file = match std::fs::File::open(canon) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return warp::reply::with_status("", StatusCode::NOT_FOUND).into_response()
-        }
-        Err(_) => {
-            return warp::reply::with_status("", StatusCode::INTERNAL_SERVER_ERROR).into_response()
-        }
-    };
+    // Seek/read on the HELD fd from `serve_cap` (audit HIGH-2): never re-open
+    // `canon` by path, so a swap after the funnel's open cannot redirect bytes.
     if file.seek(SeekFrom::Start(start)).is_err() {
         return warp::reply::with_status("", StatusCode::INTERNAL_SERVER_ERROR).into_response();
     }
@@ -843,6 +859,134 @@ mod tests {
         assert_eq!(resp.status(), 403, "non-world-readable asset must be denied");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cap_toctou_path_swapped_to_outside_symlink_is_not_served() {
+        // Audit HIGH-2 regression: mint a token for a real in-root world-readable
+        // file, then SWAP that path's final component to a symlink pointing at a
+        // private file OUTSIDE the root (the classic stat-then-reopen TOCTOU).
+        // Because serve_cap routes through confine_read — which opens the
+        // canonical path ONCE with O_NOFOLLOW and confines the canonicalized
+        // result — the swapped symlink is refused (ELOOP on open AND/OR escape on
+        // confine): the private content is NEVER served.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir("toctou-sym");
+        let outside = temp_dir("toctou-sym-out");
+        let secret = outside.join("secret.png");
+        std::fs::write(&secret, b"TOPSECRET-PRIVATE-BYTES").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let asset = dir.join("pic.png");
+        std::fs::write(&asset, b"public").unwrap();
+        std::fs::set_permissions(&asset, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let confiner = confiner_over(&dir);
+        let store = Arc::new(Mutex::new(CapStore::new()));
+        let token = store
+            .lock()
+            .unwrap()
+            .mint(asset.clone(), CAP_TTL_SECS, now_secs())
+            .unwrap();
+
+        // THE SWAP: replace the in-root file with a symlink to the outside secret
+        // between mint and serve.
+        std::fs::remove_file(&asset).unwrap();
+        std::os::unix::fs::symlink(&secret, &asset).unwrap();
+
+        let routes = asset_origin_routes(store, confiner);
+        let resp = warp::test::request()
+            .method("GET")
+            .path(&format!("/cap/{token}"))
+            .reply(&routes)
+            .await;
+        assert_ne!(resp.status(), 200, "must not serve the swapped-in target");
+        assert_ne!(
+            resp.body().as_ref(),
+            b"TOPSECRET-PRIVATE-BYTES",
+            "private outside-root bytes must never be served on the stale token"
+        );
+        // The O_NOFOLLOW open refuses the symlinked final component → flat 404.
+        assert_eq!(resp.status(), 404);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[tokio::test]
+    async fn cap_toctou_mode_tightened_after_mint_is_forbidden() {
+        // Audit HIGH-2 regression (floor arm): mint for a world-readable file,
+        // then tighten its mode to 0o600 before serve. The floor is read from the
+        // held fd's fstat (same descriptor the bytes would come from), so the
+        // now-private file is denied with 403 — the swap cannot smuggle it past.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir("toctou-mode");
+        let asset = dir.join("pic.png");
+        std::fs::write(&asset, b"\x89PNGsecret").unwrap();
+        std::fs::set_permissions(&asset, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let confiner = confiner_over(&dir);
+        let store = Arc::new(Mutex::new(CapStore::new()));
+        let token = store
+            .lock()
+            .unwrap()
+            .mint(asset.clone(), CAP_TTL_SECS, now_secs())
+            .unwrap();
+
+        // THE SWAP: tighten the mode between mint and serve.
+        std::fs::set_permissions(&asset, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let routes = asset_origin_routes(store, confiner);
+        let resp = warp::test::request()
+            .method("GET")
+            .path(&format!("/cap/{token}"))
+            .reply(&routes)
+            .await;
+        assert_eq!(resp.status(), 403, "floor on the held fd must deny the now-private file");
+        assert_ne!(resp.body().as_ref(), b"\x89PNGsecret");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cap_sensitive_world_readable_path_is_rejected() {
+        // Denylist-gap regression (finding #2): even a WORLD-READABLE file on the
+        // sensitive denylist (e.g. under the registry home's `.ssh`) must be
+        // rejected — confine_read applies `is_sensitive` unconditionally, which
+        // the legacy FilePeer::within funnel did not. We register `.ssh` as a
+        // root AND set the registry home so it is denylisted, then confirm the
+        // (world-readable) key cannot be served.
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = temp_dir("sensitive-home");
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let key = ssh.join("id_rsa");
+        std::fs::write(&key, b"PRIVATE-KEY-EVEN-IF-CHMOD-644").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Build a confiner whose registry home is the tempdir home (so `.ssh` is
+        // sensitive) and whose root is `.ssh` itself (so containment would pass).
+        let mut reg = roots::Roots::new(&home);
+        let _ = reg.register_root(&ssh, SystemTime::now());
+        let confiner = Confiner::new(Arc::new(Mutex::new(reg)), Some(ssh.clone()));
+
+        let store = Arc::new(Mutex::new(CapStore::new()));
+        let token = store
+            .lock()
+            .unwrap()
+            .mint(key.clone(), CAP_TTL_SECS, now_secs())
+            .unwrap();
+
+        let routes = asset_origin_routes(store, confiner);
+        let resp = warp::test::request()
+            .method("GET")
+            .path(&format!("/cap/{token}"))
+            .reply(&routes)
+            .await;
+        assert_eq!(resp.status(), 404, "sensitive denylist must reject even a world-readable key");
+        assert_ne!(resp.body().as_ref(), b"PRIVATE-KEY-EVEN-IF-CHMOD-644");
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
