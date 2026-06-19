@@ -317,10 +317,14 @@ fn resolve_target(store: &Mutex<CapStore>, confiner: &Confiner, token: &str) -> 
         let Ok(mut s) = store.lock() else {
             return CapTarget::NotFound;
         };
-        // Distinguish "known but expired" (410) from "unknown" (404): resolve
-        // sweeps first, so probe with a far-future clock to see if the token
-        // exists at all, then apply the real TTL check.
-        let exists = s.resolve(token, 0).is_some() || s.resolve(token, now).is_some();
+        // Distinguish "known but expired" (410) from "unknown" (404).
+        // Check token presence WITHOUT sweeping first (contains_token is a raw
+        // iter, no mutation), then resolve with current time. If the token is
+        // present but not live, it must be expired → 410. Using contains_token
+        // (non-sweeping) avoids a race where a concurrent request's sweep has
+        // already evicted the expired token before this check, which would
+        // falsely return 404 for a known-but-expired token.
+        let exists = s.contains_token(token);
         match s.resolve(token, now) {
             Some(p) => Some(p),
             None if exists => return CapTarget::Expired,
