@@ -132,10 +132,11 @@ pub fn is_update_bytes_safe(update: &[u8]) -> bool {
 /// bytes. Returns `false` if the input is not valid base64 or the decoded bytes are
 /// unsafe.
 ///
-/// Gated on `daemon` because the `base64` dependency is daemon-only (the lib core
-/// builds with `--no-default-features` and no web deps); the raw-bytes
-/// [`is_update_bytes_safe`] is always available.
-#[cfg(feature = "daemon")]
+/// Gated on the optional `base64` feature: the `base64` dependency is not part of
+/// the minimal kernel (the crate builds with `--no-default-features` and no extra
+/// deps); the raw-bytes [`is_update_bytes_safe`] is always available. md-preview's
+/// `daemon` feature turns this on so it is present identically in daemon builds.
+#[cfg(feature = "base64")]
 pub fn is_update_b64_safe(update_b64: &str) -> bool {
     use base64::Engine as _;
     let trimmed = update_b64.trim();
@@ -688,7 +689,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "daemon")]
+    #[cfg(feature = "base64")]
     #[test]
     fn base64_entry_point_round_trips_and_rejects_garbage() {
         use base64::Engine as _;

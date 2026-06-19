@@ -15,12 +15,14 @@ pub use md_render::{
 };
 
 // Real-time collaborative editing (see ADR-0001 "CRDT over OT" and ADR-0003).
-// The renderer (in `md-render`) stays pure and reusable; these modules add the
-// document model behind a stable contract (`doc::DocSession`).
-pub mod doc;
-pub mod diff;
-pub mod file_peer;
-pub mod session;
+// The web-free document/CRDT kernel now lives in the standalone `doc-core` crate
+// (`crates/doc-core`, ADR-0008 Phase 1): the CRDT doc model, the diff bridge, the
+// session + UB validator, the pure collab wire codec, and the `FilePeer` file
+// bridge. Re-exported here as `md_preview::{doc, diff, file_peer, session,
+// validate}` so existing call sites (`crate::doc::…`, `md_preview::diff::…`, the
+// integration tests) resolve exactly as before the split. doc-core carries ZERO
+// web/async deps, so `--no-default-features` still drops the entire daemon stack.
+pub use doc_core::{diff, doc, file_peer, session, validate};
 
 // The persistent daemon (warp + tokio live preview). Feature-gated so the lib
 // stays usable on its own — `--no-default-features` builds the pure renderer and
@@ -40,8 +42,6 @@ pub mod auth;
 pub mod control;
 #[cfg(feature = "daemon")]
 pub mod shell;
-#[cfg(feature = "daemon")]
-pub mod validate;
 #[cfg(feature = "daemon")]
 pub mod bundle;
 #[cfg(feature = "daemon")]

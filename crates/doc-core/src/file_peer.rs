@@ -35,6 +35,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
+#[cfg(feature = "watch")]
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::diff::diff;
@@ -60,17 +61,22 @@ pub struct FilePeer<S: DocSession> {
     /// Canonical path of the watched file (events are filtered to this path).
     target: PathBuf,
     /// Canonical parent directory — what we actually hand to `notify`, so that
-    /// atomic-rename saves (new inode, same path) keep being delivered.
+    /// atomic-rename saves (new inode, same path) keep being delivered. Only the
+    /// `watch` feature consumes it (the watcher watches this directory).
+    #[cfg_attr(not(feature = "watch"), allow(dead_code))]
     parent: PathBuf,
     /// The watcher handle. Kept alive for as long as the peer lives; dropping it
     /// stops the watch. `Some` once [`FilePeer::watch`] has been called.
+    #[cfg(feature = "watch")]
     watcher: Option<RecommendedWatcher>,
     /// Wake-up signals from the watcher thread. Each `()` means "something
     /// touched the directory; consider re-syncing". The payload is intentionally
     /// trivial — all truth comes from re-reading the file in `sync_from_disk`.
     rx: Receiver<()>,
     /// Sender handed to the watcher closure. Stored so [`FilePeer::watch`] can
-    /// clone it into the closure; held here to keep the channel open.
+    /// clone it into the closure; held here to keep the channel open. Only the
+    /// `watch` feature clones it into the watcher thread.
+    #[cfg_attr(not(feature = "watch"), allow(dead_code))]
     tx: mpsc::Sender<()>,
     /// Confinement root, if this peer was built via [`FilePeer::within`]. When
     /// `Some`, `target` is re-validated to be inside this canonical directory
@@ -125,6 +131,7 @@ impl<S: DocSession> FilePeer<S> {
             session,
             target,
             parent,
+            #[cfg(feature = "watch")]
             watcher: None,
             rx,
             tx,
@@ -195,6 +202,7 @@ impl<S: DocSession> FilePeer<S> {
             session,
             target,
             parent,
+            #[cfg(feature = "watch")]
             watcher: None,
             rx,
             tx,
@@ -217,6 +225,18 @@ impl<S: DocSession> FilePeer<S> {
     /// The canonical path of the watched file.
     pub fn path(&self) -> &Path {
         &self.target
+    }
+
+    /// The peer's confinement root, if it was built via [`FilePeer::within`];
+    /// `None` for the non-confining [`FilePeer::new`] constructor.
+    ///
+    /// Exposed so a confinement-aware embedder (the daemon) can re-confine a
+    /// write-back against the same boundary the peer was pinned to at spawn —
+    /// keeping the confinement funnel (`fs-confine`) out of this kernel crate
+    /// (ADR-0008 acyclic DAG: no inter-kernel edge to confine). See the daemon's
+    /// `write_within` for the symlink-safe write-back that uses this.
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
     }
 
     /// Borrow the underlying session (read-only access to e.g. `text()`).
@@ -313,72 +333,16 @@ impl<S: DocSession> FilePeer<S> {
     /// **NON-CONFINING / trusted-local write.** This is a plain `fs::write` that
     /// *follows symlinks* and is not atomic-rename. Like [`FilePeer::new`] it is
     /// appropriate only for the trusted-local CLI. A confined, network-facing
-    /// peer (built via [`FilePeer::within`]) MUST write through
-    /// [`FilePeer::write_within`], which routes the write-back through the same
-    /// symlink-safe `confine_save` funnel `/save` uses and re-confines at flush
-    /// time (audit B-security F1).
+    /// peer (built via [`FilePeer::within`]) MUST write through the daemon's
+    /// confinement-aware `write_within`, which routes the write-back through the
+    /// same symlink-safe `confine_save` funnel `/save` uses and re-confines at
+    /// flush time (audit B-security F1). That write-back lives in the daemon
+    /// crate, not here: it depends on the confinement funnel (`fs-confine`), and
+    /// this kernel crate must stay free of inter-kernel edges (ADR-0008). It
+    /// drives this peer through [`FilePeer::root`] / [`FilePeer::path`] /
+    /// [`FilePeer::session`].
     pub fn write_to_disk(&self) -> std::io::Result<()> {
         std::fs::write(&self.target, self.session.text())
-    }
-
-    /// Write the session's current text to the file through the **symlink-safe
-    /// save funnel**, re-confining the target at flush time (audit B-security F1).
-    ///
-    /// This is the confinement-aware write-back a network-facing daemon must use
-    /// for the debounced collab flush. Unlike [`FilePeer::write_to_disk`]'s plain
-    /// `fs::write` (which follows symlinks and is not atomic), this routes through
-    /// [`crate::confine::confine_save`]: it holds the confined parent as a dirfd
-    /// opened with `O_DIRECTORY | O_NOFOLLOW` and commits via a temp +
-    /// `renameat`, so a final-component OR intermediate-parent symlink swapped in
-    /// **between spawn and this flush** cannot redirect the write outside the
-    /// confined root.
-    ///
-    /// The write is confined against **this peer's own confinement root**
-    /// ([`FilePeer::within`]'s `root`) — the same directory boundary the peer was
-    /// pinned to at spawn — so the re-confinement matches exactly what the peer is
-    /// allowed to touch (this also covers a single-file root, whose confinement
-    /// boundary is the file's parent directory). `registry` supplies the sensitive
-    /// denylist, exactly as the `/save` route does. Returns the same
-    /// [`ConfineError`](crate::confine::ConfineError) as the funnel on any
-    /// confinement/IO failure, so a swapped-in escape surfaces as a refusal
-    /// rather than an out-of-root write.
-    ///
-    /// A peer built via the non-confining [`FilePeer::new`] has no root and gets a
-    /// [`ConfineError::Escapes`](crate::confine::ConfineError::Escapes); such a
-    /// peer should use [`FilePeer::write_to_disk`] (it is trusted-local by
-    /// construction). The network-facing daemon always builds peers via `within`.
-    ///
-    /// The resulting filesystem event still diffs to nothing in
-    /// [`FilePeer::sync_from_disk`] (the stateless content-compare guard), so this
-    /// does not feed back as an external edit.
-    ///
-    /// Daemon-only: the `confine` / `roots` funnel modules are feature-gated, and
-    /// the pure-lib (`--no-default-features`) build has no network-facing peer.
-    #[cfg(feature = "daemon")]
-    pub fn write_within(
-        &self,
-        registry: &crate::roots::Roots,
-    ) -> Result<(), crate::confine::ConfineError> {
-        let Some(root) = &self.root else {
-            // A non-confined (trusted-local) peer has no boundary to re-confine
-            // against; refuse rather than fall back to an unconfined write.
-            return Err(crate::confine::ConfineError::Escapes(self.target.clone()));
-        };
-        // Confine the write against the peer's OWN confinement root (a directory
-        // boundary), so the save funnel re-resolves the parent dirfd-relative and
-        // refuses any symlink swap that would escape that root.
-        let confine_root = crate::roots::Root {
-            kind: crate::roots::RootKind::Directory,
-            path: root.clone(),
-            last_used: std::time::SystemTime::now(),
-        };
-        let union_refs: Vec<&crate::roots::Root> = vec![&confine_root];
-        crate::confine::confine_save(
-            &self.target,
-            &union_refs,
-            registry,
-            self.session.text().as_bytes(),
-        )
     }
 
     /// Start watching the file's parent directory and wire events to a wake-up
@@ -392,6 +356,7 @@ impl<S: DocSession> FilePeer<S> {
     ///
     /// Performs an initial [`FilePeer::sync_from_disk`] so any change that
     /// happened before the watch was established is not missed.
+    #[cfg(feature = "watch")]
     pub fn watch(&mut self) -> notify::Result<()> {
         let tx = self.tx.clone();
         let target = self.target.clone();
@@ -658,6 +623,7 @@ mod tests {
     /// tolerates a slow/coalescing backend. If your environment makes inotify
     /// flaky, this is the test to `#[ignore]`; it passes locally here, so it is
     /// left enabled.
+    #[cfg(feature = "watch")]
     #[test]
     fn watcher_converges_within_timeout() {
         let dir = TempDir::new("watch");
@@ -761,89 +727,7 @@ mod tests {
         assert_eq!(peer.session().text(), "small");
     }
 
-    // --- write_within: symlink-safe write-back (audit B-security F1) ------
-
-    /// A registry whose `home` is an out-of-the-way path so the sensitive
-    /// denylist never flags the temp targets. `write_within` derives the
-    /// confinement union from the peer's own root, so the registry is consulted
-    /// only for the denylist (mirrors `confine`'s test helpers).
-    #[cfg(feature = "daemon")]
-    fn denylist_registry() -> crate::roots::Roots {
-        crate::roots::Roots::new(PathBuf::from("/nonexistent-home"))
-    }
-
-    /// `write_within` lands the session text in-root through the save funnel,
-    /// and a subsequent sync is a no-op (no feedback loop).
-    #[cfg(feature = "daemon")]
-    #[test]
-    fn write_within_lands_in_root_no_feedback() {
-        let dir = TempDir::new("ww-ok");
-        let canon = dir.path.canonicalize().unwrap();
-        std::fs::write(canon.join("doc.md"), "start").unwrap();
-
-        let reg = denylist_registry();
-        let mut peer = FilePeer::within(&canon, "doc.md", YrsSession::from_text("start")).unwrap();
-
-        peer.session_mut()
-            .apply(&[crate::doc::TextEdit::insert(5, "!")]);
-        peer.write_within(&reg).expect("write_within confines");
-        assert_eq!(std::fs::read_to_string(canon.join("doc.md")).unwrap(), "start!");
-
-        // Our own write must not feed back as an external change.
-        assert!(
-            !peer.sync_from_disk().unwrap(),
-            "write_within must not feed back as an external edit"
-        );
-    }
-
-    /// F1 regression: if the target's final path component is swapped to a
-    /// symlink-to-outside *after* the peer was confined at spawn, `write_within`
-    /// must NOT follow it — the outside victim stays untouched and the bytes land
-    /// on a real in-root file (the symlink-safe `renameat` funnel), unlike the
-    /// old plain `fs::write` write-back.
-    #[cfg(feature = "daemon")]
-    #[test]
-    fn write_within_does_not_follow_swapped_symlink_at_flush() {
-        let dir = TempDir::new("ww-sym");
-        let canon = dir.path.canonicalize().unwrap();
-        // The file exists in-root at spawn so `within` confines cleanly.
-        std::fs::write(canon.join("doc.md"), "original").unwrap();
-
-        // An OUTSIDE victim a malicious symlink would point at.
-        let outside = TempDir::new("ww-sym-out");
-        let victim = outside.file("victim.md");
-        std::fs::write(&victim, "VICTIM ORIGINAL").unwrap();
-
-        let reg = denylist_registry();
-        let mut peer =
-            FilePeer::within(&canon, "doc.md", YrsSession::from_text("original")).unwrap();
-        peer.session_mut()
-            .apply(&[crate::doc::TextEdit::insert(8, " edited")]);
-
-        // ATTACK: between spawn and flush, swap the final component for a
-        // symlink pointing OUTSIDE the root.
-        std::fs::remove_file(canon.join("doc.md")).unwrap();
-        std::os::unix::fs::symlink(&victim, canon.join("doc.md")).unwrap();
-
-        // The funnel commits via renameat, replacing the symlink ENTRY rather
-        // than writing through it.
-        peer.write_within(&reg).expect("write_within still confines");
-
-        // The outside victim is UNTOUCHED — no out-of-root write occurred.
-        assert_eq!(
-            std::fs::read_to_string(&victim).unwrap(),
-            "VICTIM ORIGINAL",
-            "write_within must not follow the swapped-in symlink (no out-of-root write)"
-        );
-        // The in-root entry is now a real file with the new bytes.
-        let meta = std::fs::symlink_metadata(canon.join("doc.md")).unwrap();
-        assert!(
-            meta.file_type().is_file(),
-            "target is now a real in-root file, not a symlink"
-        );
-        assert_eq!(
-            std::fs::read_to_string(canon.join("doc.md")).unwrap(),
-            "original edited"
-        );
-    }
+    // NOTE: the confinement-aware `write_within` write-back and its F1 symlink
+    // regression tests live in the daemon crate (md-preview), which owns the
+    // `fs-confine` funnel; doc-core stays free of that inter-kernel edge.
 }

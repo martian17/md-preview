@@ -3,7 +3,7 @@
 # depends on it via a path dependency. In-repo workspace is the deliberately
 # reversible first crate-split step (see audit E-module-boundaries).
 [workspace]
-members = ["crates/md-render"]
+members = ["crates/md-render", "crates/doc-core"]
 
 [package]
 name = "md-preview"
@@ -29,26 +29,33 @@ daemon = [
     "dep:sha2",
     "dep:subtle",
     "dep:base64",
+    # Keep the validator's base64 entry point (`is_update_b64_safe`) present in
+    # daemon builds exactly as before the doc-core split.
+    "doc-core/base64",
 ]
 
-# F3 — assumption-breaking knobs for the `/collab` UB guard (`src/validate.rs`).
-# These exist ONLY to make a silent bypass impossible: the validator's grammar
-# is pinned to default `yrs` features on the v1 wire format, so enabling any of
-# these is a `compile_error!` until that grammar is revisited. They forward the
-# corresponding `yrs` flags / select a v2 path; do NOT enable one without
-# updating `validate.rs`. Off by default (declared, unused).
-yrs-small-client = ["yrs/small-client"]
-yrs-weak = ["yrs/weak"]
-yrs-v2-collab = []
+# F3 — assumption-breaking knobs for the `/collab` UB guard (now in
+# `doc-core`'s `validate.rs`). These exist ONLY to make a silent bypass
+# impossible: the validator's grammar is pinned to default `yrs` features on the
+# v1 wire format, so enabling any of these is a `compile_error!` until that
+# grammar is revisited. They forward into doc-core's same-named features (which
+# forward the `yrs` flags), so the interlock fires from either crate; do NOT
+# enable one without updating `validate.rs`. Off by default (declared, unused).
+yrs-small-client = ["doc-core/yrs-small-client"]
+yrs-weak = ["doc-core/yrs-weak"]
+yrs-v2-collab = ["doc-core/yrs-v2-collab"]
 
 [dependencies]
 # Pure Markdown renderer, split out into its own workspace crate. Re-exported
 # from `lib.rs`; carries no web/async/CRDT deps (pulldown-cmark + syntect live
 # there now), so `--no-default-features` still drops the whole daemon stack.
 md-render = { path = "crates/md-render" }
-yrs = { version = "0.27.2", features = ["sync"] }  # `sync` enables y-protocols framing types (Message/SyncMessage) for /collab (ADR-0004)
-similar = "3.1.1"
-notify = "8.2.0"
+# Web-free document/CRDT kernel (ADR-0008 Phase 1): the CRDT doc model, diff,
+# session + UB validator, the pure collab wire codec, and the `FilePeer` bridge.
+# Carries yrs/similar/notify but ZERO web/async deps, so `--no-default-features`
+# still drops the whole daemon stack. The `watch` feature (notify filewatcher) is
+# on by default — md-preview's watch thread uses `FilePeer::watch`.
+doc-core = { path = "crates/doc-core" }
 
 # Daemon-only (optional): the async server stack. Picked per ADR-0003 so
 # `yrs-warp` (y-sync + awareness) drops in for Phase 3.

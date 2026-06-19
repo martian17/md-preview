@@ -73,11 +73,13 @@ use crate::render_markdown;
 use crate::roots::Roots;
 use crate::session::YrsSession;
 
-// The Phase-3 collaborative-editing WebSocket lives in its own module, declared
-// FROM here (not `lib.rs`): `server.rs` owns the registry/`Entry`/watch thread it
-// plugs into, so the wiring stays local to the daemon. The module is itself
-// daemon-only (this whole file is `pub mod server` behind the `daemon` feature).
-#[path = "collab.rs"]
+// The Phase-3 collaborative-editing WebSocket pump lives in its own module,
+// declared FROM here (not `lib.rs`): `server.rs` owns the registry/`Entry`/watch
+// thread it plugs into, so the warp/tokio wiring stays local to the daemon. The
+// module is daemon-only (this whole file is `pub mod server` behind `daemon`). It
+// re-exports the transport-agnostic codec from `doc_core::collab` (ADR-0008: the
+// pure half moved to the kernel; only this socket pump stays in the daemon).
+#[path = "collab_pump.rs"]
 pub mod collab;
 use collab::{CollabMsg, COLLAB_BROADCAST_CAP, MAX_UPDATE_BYTES};
 
@@ -1373,6 +1375,56 @@ fn rebuild_peer(root: &Path, target: &Path, last_good: &str) -> FilePeer<YrsSess
     }
 }
 
+/// Write a confined [`FilePeer`]'s session text to disk through the **symlink-safe
+/// save funnel**, re-confining the target at flush time (audit B-security F1).
+///
+/// This is the confinement-aware collab write-back. It lives in the daemon (not in
+/// `doc-core`) because it depends on the confinement funnel (`confine`/`roots`),
+/// and the kernel crate must stay free of inter-kernel edges (ADR-0008 acyclic
+/// DAG). It drives the peer through doc-core's public API
+/// ([`FilePeer::root`]/[`FilePeer::path`]/[`FilePeer::session`]).
+///
+/// Unlike [`FilePeer::write_to_disk`]'s plain `fs::write` (which follows symlinks
+/// and is not atomic), this routes through [`confine::confine_save`]: it holds the
+/// confined parent as a dirfd opened with `O_DIRECTORY | O_NOFOLLOW` and commits
+/// via a temp + `renameat`, so a final-component OR intermediate-parent symlink
+/// swapped in **between spawn and this flush** cannot redirect the write outside
+/// the confined root.
+///
+/// The write is confined against **the peer's own confinement root**
+/// ([`FilePeer::within`]'s `root`) — the same directory boundary the peer was
+/// pinned to at spawn. `registry` supplies the sensitive denylist, exactly as the
+/// `/save` route does. A peer built via the non-confining [`FilePeer::new`] has no
+/// root and gets a [`ConfineError::Escapes`]; such a peer should use
+/// [`FilePeer::write_to_disk`] (it is trusted-local by construction). The
+/// network-facing daemon always builds peers via `within`.
+///
+/// The resulting filesystem event still diffs to nothing in
+/// [`FilePeer::sync_from_disk`] (the stateless content-compare guard), so this
+/// does not feed back as an external edit.
+fn write_within(peer: &FilePeer<YrsSession>, registry: &Roots) -> Result<(), ConfineError> {
+    let Some(root) = peer.root() else {
+        // A non-confined (trusted-local) peer has no boundary to re-confine
+        // against; refuse rather than fall back to an unconfined write.
+        return Err(ConfineError::Escapes(peer.path().to_path_buf()));
+    };
+    // Confine the write against the peer's OWN confinement root (a directory
+    // boundary), so the save funnel re-resolves the parent dirfd-relative and
+    // refuses any symlink swap that would escape that root.
+    let confine_root = crate::roots::Root {
+        kind: crate::roots::RootKind::Directory,
+        path: root.to_path_buf(),
+        last_used: std::time::SystemTime::now(),
+    };
+    let union_refs: Vec<&crate::roots::Root> = vec![&confine_root];
+    confine::confine_save(
+        peer.path(),
+        &union_refs,
+        registry,
+        peer.session().text().as_bytes(),
+    )
+}
+
 /// The render-time dependencies the watch loop needs to turn markdown into the
 /// broadcast body fragment: the active root union snapshot (link confinement),
 /// the shared capability store, and the static origin base. Grouped so
@@ -1562,7 +1614,7 @@ fn spawn_watch(
                         CollabMsg::ClientUpdate(update) => {
                             // THE apply funnel (#5). This inlines the same guard
                             // as `collab::apply_client_update` (which is unit-tested
-                            // in isolation in `collab.rs`); it is inlined here only
+                            // in isolation in `doc_core::collab`); it is inlined here only
                             // because the merge and rebuild steps both need `&mut
                             // peer`, which two `FnMut` closures cannot co-borrow.
                             // Keep the two in lockstep. Snapshot the last-known-good
@@ -1632,7 +1684,7 @@ fn spawn_watch(
                     // between spawn and now cannot redirect the write outside the
                     // root. The content-compare guard means our own resulting fs
                     // event is a no-op (no feedback loop).
-                    let _ = peer.write_within(&roots);
+                    let _ = write_within(&peer, &roots);
                     dirty_since = None;
                 }
 
@@ -2976,5 +3028,95 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    // --- write_within: symlink-safe collab write-back (audit B-security F1) ---
+    //
+    // The confinement-aware write-back moved to the daemon (this file) when the
+    // pure `FilePeer` was extracted into `doc-core` (ADR-0008): doc-core must not
+    // depend on the `confine`/`roots` funnel. These tests follow it here.
+
+    /// A registry whose `home` is an out-of-the-way path so the sensitive denylist
+    /// never flags the temp targets. [`write_within`] derives the confinement
+    /// union from the peer's own root, so the registry is consulted only for the
+    /// denylist (mirrors `confine`'s test helpers).
+    fn denylist_registry() -> Roots {
+        Roots::new(PathBuf::from("/nonexistent-home"))
+    }
+
+    /// `write_within` lands the session text in-root through the save funnel, and
+    /// a subsequent sync is a no-op (no feedback loop).
+    #[test]
+    fn write_within_lands_in_root_no_feedback() {
+        let canon = temp_dir("ww-ok");
+        std::fs::write(canon.join("doc.md"), "start").unwrap();
+
+        let reg = denylist_registry();
+        let mut peer = FilePeer::within(&canon, "doc.md", YrsSession::from_text("start")).unwrap();
+
+        peer.session_mut()
+            .apply(&[crate::doc::TextEdit::insert(5, "!")]);
+        write_within(&peer, &reg).expect("write_within confines");
+        assert_eq!(std::fs::read_to_string(canon.join("doc.md")).unwrap(), "start!");
+
+        // Our own write must not feed back as an external change.
+        assert!(
+            !peer.sync_from_disk().unwrap(),
+            "write_within must not feed back as an external edit"
+        );
+
+        let _ = std::fs::remove_dir_all(&canon);
+    }
+
+    /// F1 regression: if the target's final path component is swapped to a
+    /// symlink-to-outside *after* the peer was confined at spawn, `write_within`
+    /// must NOT follow it — the outside victim stays untouched and the bytes land
+    /// on a real in-root file (the symlink-safe `renameat` funnel), unlike the old
+    /// plain `fs::write` write-back.
+    #[test]
+    fn write_within_does_not_follow_swapped_symlink_at_flush() {
+        let canon = temp_dir("ww-sym");
+        // The file exists in-root at spawn so `within` confines cleanly.
+        std::fs::write(canon.join("doc.md"), "original").unwrap();
+
+        // An OUTSIDE victim a malicious symlink would point at.
+        let outside = temp_dir("ww-sym-out");
+        let victim = outside.join("victim.md");
+        std::fs::write(&victim, "VICTIM ORIGINAL").unwrap();
+
+        let reg = denylist_registry();
+        let mut peer =
+            FilePeer::within(&canon, "doc.md", YrsSession::from_text("original")).unwrap();
+        peer.session_mut()
+            .apply(&[crate::doc::TextEdit::insert(8, " edited")]);
+
+        // ATTACK: between spawn and flush, swap the final component for a symlink
+        // pointing OUTSIDE the root.
+        std::fs::remove_file(canon.join("doc.md")).unwrap();
+        std::os::unix::fs::symlink(&victim, canon.join("doc.md")).unwrap();
+
+        // The funnel commits via renameat, replacing the symlink ENTRY rather than
+        // writing through it.
+        write_within(&peer, &reg).expect("write_within still confines");
+
+        // The outside victim is UNTOUCHED — no out-of-root write occurred.
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "VICTIM ORIGINAL",
+            "write_within must not follow the swapped-in symlink (no out-of-root write)"
+        );
+        // The in-root entry is now a real file with the new bytes.
+        let meta = std::fs::symlink_metadata(canon.join("doc.md")).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "target is now a real in-root file, not a symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(canon.join("doc.md")).unwrap(),
+            "original edited"
+        );
+
+        let _ = std::fs::remove_dir_all(&canon);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

@@ -1,12 +1,20 @@
-//! `/collab` — the multi-user collaborative-editing WebSocket (Phase 3 backend).
+//! The **transport-agnostic** half of `/collab`: the y-websocket wire codec and
+//! the untrusted-update apply funnel (the `#5` UB guard core).
 //!
-//! The browser opens a binary WebSocket to `/collab?path=<rel>` and speaks the
-//! **y-websocket** wire format: each frame is `varint(messageType) ++ payload`,
-//! where **type 0 = sync** (the `y-protocols/sync` sub-protocol — SyncStep1 is a
-//! state vector, SyncStep2 / Update are updates) and **type 1 = awareness** (an
-//! opaque `y-protocols/awareness` update we only relay). The shared document is a
-//! single `Y.Text` named `"content"`, which is exactly what [`YrsSession`]
-//! exposes (see `session.rs`, `const ROOT = "content"`).
+//! This is the pure, web-free slice extracted into `doc-core` (ADR-0008 ruling
+//! (a)): it touches only `yrs` and `doc` types — **no warp/tokio/futures** — so a
+//! future LAN/WAN relay (goal D2) reuses the exact same y-sync framing the
+//! browser speaks without dragging in the daemon's websocket stack. The async WS
+//! pump that drives a real socket (`collab_ws`, the `tokio::select!` loop) lives
+//! beside the server in the daemon crate (`md-preview`'s `server::collab`).
+//!
+//! The browser opens a binary WebSocket and speaks the **y-websocket** wire
+//! format: each frame is `varint(messageType) ++ payload`, where **type 0 = sync**
+//! (the `y-protocols/sync` sub-protocol — SyncStep1 is a state vector, SyncStep2 /
+//! Update are updates) and **type 1 = awareness** (an opaque
+//! `y-protocols/awareness` update we only relay). The shared document is a single
+//! `Y.Text` named `"content"`, which is exactly what
+//! [`YrsSession`](crate::session::YrsSession) exposes (`const ROOT = "content"`).
 //!
 //! ## Why the framing is decoded with `yrs::sync`, not hand-rolled
 //! We enable `yrs/sync` (ADR-0004) and reuse [`yrs::sync::Message`] /
@@ -14,21 +22,17 @@
 //! framing. They are wire-compatible with the yjs client and save us from
 //! re-implementing the varint/length-prefixed framing by hand. We do **not** use
 //! `yrs::sync::{Awareness, Protocol}` — those want to own a `Doc`, but the doc
-//! (`!Send` [`YrsSession`]) lives *only* on the per-path watch thread (see
-//! `server.rs`). Instead we decode a frame down to its raw `state_vector` /
-//! `update` bytes and drive the document exclusively through the `session.rs`
-//! primitives (`state_vector`, `update_since`, `merge`) on that one thread.
+//! (`!Send` [`YrsSession`](crate::session::YrsSession)) lives *only* on the
+//! per-path watch thread (see the daemon). Instead we decode a frame down to its
+//! raw `state_vector` / `update` bytes and drive the document exclusively through
+//! the `session.rs` primitives (`state_vector`, `update_since`, `merge`).
 //!
 //! ## Threading invariant (the whole point)
-//! The async WS task here never touches the session. It is a pure byte pump:
-//!   * inbound binary frame → decode type → `CollabMsg` carrying **Send bytes**
-//!     → the per-path watch thread (`collab_in`);
-//!   * the watch thread is the **sole** owner/mutator of the `YrsSession`; it
-//!     applies updates in arrival order (the single serialization point that
-//!     removes the "two writers" problem — fs edits and browser edits commute by
-//!     CRDT semantics, ADR-0001) and rebroadcasts the resulting frames;
-//!   * outbound frames arrive on `collab_out` (a broadcast) and are forwarded to
-//!     the socket as **binary** (y-protocols frames are not UTF-8).
+//! The async WS pump (in the daemon) never touches the session. It is a pure byte
+//! pump: an inbound binary frame is decoded here into a `Send`-bytes message and
+//! handed to the per-path watch thread, which is the **sole** owner/mutator of the
+//! `YrsSession`. The session is `!Send`; that invariant is a documented kernel
+//! constraint that propagates to `FilePeer` and the future relay wrapper.
 //!
 //! ## #5 security guard (the apply funnel)
 //! `yrs 0.27.2`'s integrate path has reachable panics on malformed-but-decodable
@@ -43,13 +47,12 @@
 //!      drops that update and **rebuilds the session from the last-known-good
 //!      text** the watch thread snapshotted *before* applying. Because the watch
 //!      thread alone owns the session, a caught panic poisons no shared mutex.
+//!
+//! The UB validator interlock ([`crate::validate::is_update_bytes_safe`]) guards
+//! the inbound apply path *before* `apply_client_update` is reached on the watch
+//! thread — see the daemon's watch loop.
 
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
-
-use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{broadcast, mpsc, oneshot};
-use warp::ws::{Message as WsMessage, WebSocket};
 
 use yrs::sync::{Message as YMessage, SyncMessage};
 use yrs::updates::decoder::{Decode, DecoderV1};
@@ -71,20 +74,24 @@ pub const COLLAB_BROADCAST_CAP: usize = 64;
 /// A `Send` message from an async `/collab` task to its path's watch thread.
 /// Carries **only** plain bytes / a `Send` reply channel — never the `!Send`
 /// session, which lives solely on the watch thread.
-pub enum CollabMsg {
+///
+/// The reply channel is generic (`Reply`) so this stays transport-free: the
+/// daemon instantiates it with a `tokio::sync::oneshot::Sender<Vec<u8>>`; a relay
+/// can use any `Send` one-shot. The codec crate never names a runtime.
+pub enum CollabMsg<Reply> {
     /// A decoded y-sync update (SyncStep2 or Update payload — both are raw v1
     /// update bytes) from a browser editor, to merge into the canonical doc.
     ClientUpdate(Vec<u8>),
     /// A client's y-sync **SyncStep1** = its state vector. The watch thread
     /// answers with a SyncStep2 (`update_since(sv)`) sent only to this client.
-    SyncStep1(Vec<u8>, oneshot::Sender<Vec<u8>>),
+    SyncStep1(Vec<u8>, Reply),
     /// An opaque type-1 awareness frame to relay verbatim to the other peers.
     /// Never touches the doc.
     AwarenessFrame(Vec<u8>),
     /// A fresh client's request for the server's *own* SyncStep1 frame (the
     /// server state vector), sent on connect so the client replies with its
-    /// SyncStep2. Answered via the oneshot with a fully-encoded type-0 frame.
-    SnapshotRequest(oneshot::Sender<Vec<u8>>),
+    /// SyncStep2. Answered via the reply with a fully-encoded type-0 frame.
+    SnapshotRequest(Reply),
 }
 
 /// Build an encoded **type-0 sync / SyncStep1** frame from an encoded state
@@ -131,7 +138,10 @@ pub fn sync_update_payload(frame: &[u8]) -> Option<Vec<u8>> {
 /// type. Only the variants the protocol uses are surfaced; anything else (auth,
 /// awareness-query, custom tags, or a decode failure) is reported as `Ignore`
 /// so the caller drops it without disturbing the session or the connection.
-enum Inbound {
+///
+/// Public so the daemon's WS pump can classify a frame and route it to the watch
+/// thread without re-decoding (the pump owns no `yrs` types itself).
+pub enum Inbound {
     /// A SyncStep1 (client state vector) → its encoded SV bytes.
     SyncStep1(Vec<u8>),
     /// A SyncStep2 or Update → its raw v1 update bytes (both merge identically).
@@ -151,7 +161,7 @@ enum Inbound {
 /// re-encoded: it is ephemeral peer state the server does not interpret, so
 /// round-tripping it through `AwarenessUpdate` would be wasted work and a needless
 /// decode-failure surface.
-fn decode_inbound(raw: &[u8]) -> Inbound {
+pub fn decode_inbound(raw: &[u8]) -> Inbound {
     let mut decoder = DecoderV1::new(yrs::encoding::read::Cursor::new(raw));
     match YMessage::decode(&mut decoder) {
         Ok(YMessage::Sync(SyncMessage::SyncStep1(sv))) => Inbound::SyncStep1(sv.encode_v1()),
@@ -167,8 +177,8 @@ fn decode_inbound(raw: &[u8]) -> Inbound {
 }
 
 /// The result of applying one client update on the watch thread: whether the
-/// canonical text changed (so the caller knows to re-render / broadcast) and the
-/// update bytes to fan out to the other editors. See [`apply_client_update`].
+/// canonical text changed (so the caller knows to re-render / broadcast). See
+/// [`apply_client_update`].
 pub struct ApplyOutcome {
     /// `true` if the document text changed (drives re-render + preview broadcast).
     pub changed: bool,
@@ -186,6 +196,10 @@ pub struct ApplyOutcome {
 ///   2. **decode guard** — `merge_fn` returns `false` on an undecodable update;
 ///   3. **catch_unwind** — a panic in integrate drops the update and triggers a
 ///      rebuild from `last_good`, leaving the doc at its last-known-good state.
+///
+/// The UB pre-decode validator ([`crate::validate::is_update_bytes_safe`]) must be
+/// run by the caller on the update bytes *before* this funnel (it guards the
+/// uncatchable `from_utf8_unchecked` abort that `catch_unwind` cannot contain).
 ///
 /// Returns whether the document changed; on a caught panic it returns
 /// `changed = false` (the doc was restored, not advanced). The caught panic
@@ -216,114 +230,6 @@ where
             // Integrate panicked (#5). Restore the canonical doc to last-good.
             rebuild(last_good);
             ApplyOutcome { changed: false }
-        }
-    }
-}
-
-/// Per-connection `/collab` handler: confine `rel`, find/create the shared
-/// per-path [`Entry`](crate::server::Entry), seed the client, then pump frames
-/// both ways. The session is never touched here — all doc work goes to the watch
-/// thread over `collab_in`, and outbound frames arrive on `collab_out`.
-///
-/// On a confinement failure the socket is simply closed (the 400-equivalent for
-/// an already-upgraded WebSocket), mirroring `/ws`'s `client_ws`.
-pub(crate) async fn collab_ws(
-    ws: WebSocket,
-    collab_in: mpsc::Sender<CollabMsg>,
-    collab_out: broadcast::Sender<Vec<u8>>,
-    _rel: PathBuf,
-) {
-    let (mut ws_tx, mut ws_rx) = ws.split();
-    let mut out_rx = collab_out.subscribe();
-
-    // --- Connect handshake -------------------------------------------------
-    // 1. Send the server's own SyncStep1 (its state vector). The client answers
-    //    with a SyncStep2 carrying what we are missing.
-    // 2. The client also sends *its* SyncStep1; we answer with a SyncStep2 of
-    //    what it is missing. Both directions are driven entirely by the watch
-    //    thread (it owns the session); we only relay the encoded frames.
-    let (snap_tx, snap_rx) = oneshot::channel();
-    if collab_in
-        .send(CollabMsg::SnapshotRequest(snap_tx))
-        .await
-        .is_err()
-    {
-        return; // watch thread gone
-    }
-    let server_step1 = match snap_rx.await {
-        Ok(frame) => frame,
-        Err(_) => return,
-    };
-    if ws_tx.send(WsMessage::binary(server_step1)).await.is_err() {
-        return;
-    }
-
-    // --- Frame pump --------------------------------------------------------
-    loop {
-        tokio::select! {
-            // Outbound: a frame produced by the watch thread (a peer's update,
-            // an awareness relay, or this client's own SyncStep2 answer) → socket.
-            out = out_rx.recv() => match out {
-                Ok(frame) => {
-                    if ws_tx.send(WsMessage::binary(frame)).await.is_err() {
-                        break; // client gone
-                    }
-                }
-                // Lagged: skip ahead. The client's provider re-syncs on the next
-                // update; CRDT apply is idempotent so a skipped frame is safe.
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
-            },
-            // Inbound: a binary frame from the browser → classify → watch thread.
-            inbound = ws_rx.next() => match inbound {
-                Some(Ok(m)) if m.is_close() => break,
-                Some(Ok(m)) if m.is_binary() => {
-                    let bytes = m.as_bytes();
-                    // #5 step 1: cap the raw frame before any decode. A keystroke
-                    // frame is tiny; anything over the cap is dropped (optionally
-                    // we could disconnect — we drop and keep the socket).
-                    if bytes.len() > MAX_UPDATE_BYTES {
-                        continue;
-                    }
-                    match decode_inbound(bytes) {
-                        Inbound::SyncStep1(sv) => {
-                            // Answer this client's SyncStep1 with a SyncStep2 of
-                            // exactly what it is missing — sent only to it.
-                            let (reply_tx, reply_rx) = oneshot::channel();
-                            if collab_in
-                                .send(CollabMsg::SyncStep1(sv, reply_tx))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                            match reply_rx.await {
-                                Ok(frame) => {
-                                    if ws_tx.send(WsMessage::binary(frame)).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        Inbound::Update(update) => {
-                            if collab_in.send(CollabMsg::ClientUpdate(update)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Inbound::Awareness(frame) => {
-                            if collab_in.send(CollabMsg::AwarenessFrame(frame)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Inbound::Ignore => {}
-                    }
-                }
-                // Non-binary (text/ping/pong) frames are not part of the protocol;
-                // ignore their content but keep the socket.
-                Some(Ok(_)) => {}
-                Some(Err(_)) | None => break,
-            },
         }
     }
 }
@@ -505,8 +411,8 @@ mod tests {
     /// `from_utf8_unchecked` — genuine UB, which a debug build's `-Zub-checks`
     /// turns into a **non-unwinding abort** that `catch_unwind` cannot intercept
     /// (and which release builds turn into silent memory unsafety). That is an
-    /// upstream yrs soundness bug, outside this module's reach without
-    /// reimplementing the v1 binary reader.
+    /// upstream yrs soundness bug, defended by `crate::validate` (the pre-decode
+    /// UB guard), outside this module's reach without reimplementing the v1 reader.
     ///
     /// What our funnel *does* defend (and what this corpus exercises): the size
     /// cap, the decode-guard (Err → no-op), and `catch_unwind` over the *unwinding*
