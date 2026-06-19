@@ -1,3 +1,10 @@
+# Workspace root. The pure Markdown renderer lives in `crates/md-render` (no
+# web/async/CRDT deps); this `md-preview` package is the binary/daemon crate and
+# depends on it via a path dependency. In-repo workspace is the deliberately
+# reversible first crate-split step (see audit E-module-boundaries).
+[workspace]
+members = ["crates/md-render"]
+
 [package]
 name = "md-preview"
 version = "0.1.0"
