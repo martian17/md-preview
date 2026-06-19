@@ -1626,9 +1626,13 @@ fn spawn_watch(
                 if let Some(since) = dirty_since
                     && since.elapsed() >= WRITE_BACK_DEBOUNCE
                 {
-                    // Best-effort write; the content-compare guard means our own
-                    // resulting fs event is a no-op (no feedback loop).
-                    let _ = peer.write_to_disk();
+                    // Best-effort write through the SYMLINK-SAFE save funnel,
+                    // re-confining the target at flush time (audit B-security F1):
+                    // a final-component / intermediate-parent symlink swapped in
+                    // between spawn and now cannot redirect the write outside the
+                    // root. The content-compare guard means our own resulting fs
+                    // event is a no-op (no feedback loop).
+                    let _ = peer.write_within(&roots);
                     dirty_since = None;
                 }
 

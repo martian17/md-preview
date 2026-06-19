@@ -111,9 +111,21 @@ impl DocSession for YrsSession {
     }
 
     fn update_since(&self, state_vector: &[u8]) -> Vec<u8> {
-        // A malformed/empty state vector from a peer is treated as "knows
-        // nothing", yielding the full document update.
-        let sv = StateVector::decode_v1(state_vector).unwrap_or_default();
+        // Defense-in-depth on the attacker-controlled inbound SyncStep1 SV bytes
+        // (audit B-security F3): in addition to the upstream size cap, decode
+        // under `catch_unwind` so a panic on size-bounded malformed bytes cannot
+        // unwind into the watch loop. A `StateVector` is a varint `(client_id,
+        // clock)` stream with NO embedded strings, so unlike `Update::decode_v1`
+        // it does not reach the `from_utf8_unchecked` UB site the `is_update_
+        // bytes_safe` validator guards — this `catch_unwind` is the consistent
+        // belt-and-suspenders for the SV path. A malformed/empty/panicking SV is
+        // treated as "knows nothing", yielding the full document update (the
+        // documented fallback, defused against bandwidth amplification by the
+        // SyncStep1 size cap at the call site).
+        let sv = std::panic::catch_unwind(|| StateVector::decode_v1(state_vector))
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
         let txn = self.doc.transact();
         txn.encode_diff_v1(&sv)
     }
@@ -231,6 +243,43 @@ mod tests {
         let sv = a.state_vector();
         let self_update = a.update_since(&sv); // empty diff
         assert!(!a.merge(&self_update));
+    }
+
+    /// F3 regression: a malformed inbound SyncStep1 state vector must not panic
+    /// or corrupt the session — `update_since` decodes it under `catch_unwind`
+    /// and falls back to "knows nothing" (the full document), exactly as an empty
+    /// SV does. No panic / UB escapes into the caller.
+    #[test]
+    fn update_since_tolerates_malformed_state_vector() {
+        let s = YrsSession::from_text("hello world");
+        // The full update an empty (knows-nothing) SV yields — the documented
+        // fallback any unparseable SV must also produce.
+        let full = s.update_since(&[]);
+        assert!(!full.is_empty(), "non-empty doc yields a non-empty full update");
+
+        // A spread of adversarial / malformed SV byte strings: truncated varints,
+        // an over-long varint run, random noise, and a valid prefix + garbage.
+        let malformed: &[&[u8]] = &[
+            &[0xFF],
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            &[0x80, 0x80, 0x80, 0x80, 0x80],
+            &[0x01, 0x80],
+            &[0xDE, 0xAD, 0xBE, 0xEF],
+            &[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        ];
+        for bytes in malformed {
+            // Must not panic; result is the safe full-doc fallback (or possibly a
+            // partial diff for a coincidentally-parseable prefix — never a crash).
+            let out = s.update_since(bytes);
+            // A peer that "knows nothing" gets the full doc back; the key
+            // invariant is no panic and a well-formed (decodable) update.
+            assert!(
+                Update::decode_v1(&out).is_ok(),
+                "produced update must itself be a valid v1 update"
+            );
+        }
+        // Session is untouched and still serves the same text.
+        assert_eq!(s.text(), "hello world");
     }
 
     #[test]
