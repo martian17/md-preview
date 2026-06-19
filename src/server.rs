@@ -1753,6 +1753,144 @@ pub async fn serve(file: &Path, addr: SocketAddr) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Build the [`AppState`] from the first opened `file`, binding the HTTP server
+/// with an ephemeral-fallback port strategy (try 7878, fall back to OS-assigned)
+/// and running the control-plane accept loop alongside it.
+///
+/// The single-instance election is done by the caller via
+/// [`crate::control::bind_or_detect`]; if the election returned `Daemon`, pass
+/// the resulting [`std::os::unix::net::UnixListener`] here as `ctrl`. Returns
+/// the bound HTTP address so the caller can embed it in the `Opened` response.
+///
+/// The control-plane loop lives on a dedicated blocking thread (since
+/// [`crate::control::serve_connection`] is synchronous), so the tokio runtime
+/// is free for the async HTTP stack.
+pub async fn serve_with_control(
+    file: &Path,
+    ctrl: std::os::unix::net::UnixListener,
+) -> std::io::Result<()> {
+    let abs = file.canonicalize()?;
+
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let mut roots = Roots::new(home);
+    if let Ok(loaded) = roots.load() {
+        roots = loaded;
+    }
+    let _ = roots.register_for(&abs);
+    let _ = roots.save();
+
+    let state = AppState::new(roots);
+
+    // Try the preferred port first; fall back to OS-assigned on AddrInUse.
+    let preferred: SocketAddr = ([127, 0, 0, 1], 7878).into();
+    let ephemeral: SocketAddr = ([127, 0, 0, 1], 0).into();
+
+    let (bound_addr, fut) = warp::serve(routes(state.clone()))
+        .try_bind_ephemeral(preferred)
+        .or_else(|_| warp::serve(routes(state.clone())).try_bind_ephemeral(ephemeral))
+        .map_err(|e| {
+            let kind = {
+                let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
+                let mut found = std::io::ErrorKind::Other;
+                while let Some(s) = src {
+                    if let Some(io) = s.downcast_ref::<std::io::Error>() {
+                        found = io.kind();
+                        break;
+                    }
+                    src = s.source();
+                }
+                found
+            };
+            std::io::Error::new(kind, e)
+        })?;
+
+    let state_ctrl = state.clone();
+    std::thread::Builder::new()
+        .name("md-preview-control".into())
+        .spawn(move || {
+            for conn in ctrl.incoming() {
+                match conn {
+                    Ok(stream) => {
+                        let state_conn = state_ctrl.clone();
+                        let http_addr = bound_addr;
+                        std::thread::Builder::new()
+                            .name("md-preview-control-conn".into())
+                            .spawn(move || {
+                                let _ = crate::control::serve_connection(stream, |req| {
+                                    handle_control_request(&state_conn, req, http_addr)
+                                });
+                            })
+                            .ok();
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .map_err(std::io::Error::other)?;
+
+    fut.await;
+    Ok(())
+}
+
+/// Handle one control-plane request on the daemon side.
+///
+/// `Open{path,root}` → register the root, mint a bootstrap nonce, return
+/// `Opened{url,nonce}`. `Ping` → `Pong`. Errors are returned as
+/// `Response::Error` so the connection is never silently dropped.
+fn handle_control_request(
+    state: &AppState,
+    req: crate::control::Request,
+    http_addr: SocketAddr,
+) -> crate::control::Response {
+    use crate::control::{Request, Response};
+    match req {
+        Request::Ping => Response::Pong,
+        Request::Open { path, root } => {
+            // Register the root in the multi-root registry.
+            let root_path = std::path::Path::new(&root);
+            let file_path = std::path::Path::new(&path);
+            {
+                let now = std::time::SystemTime::now();
+                let mut roots = state.roots.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = roots.register_root(root_path, now);
+                let _ = roots.save();
+            }
+            // Mint a bootstrap nonce. The Mutex is held synchronously and
+            // dropped before returning (never across an await).
+            let nonce = {
+                let mut nonces = state.auth.nonces.lock().unwrap_or_else(|e| e.into_inner());
+                match nonces.mint() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        return Response::Error {
+                            message: format!("failed to mint nonce: {e}"),
+                        }
+                    }
+                }
+            };
+            // Build the view URL: the absolute path, encoded, on the daemon's
+            // HTTP address.
+            let abs_path = if file_path.is_absolute() {
+                file_path.to_path_buf()
+            } else {
+                match file_path.canonicalize() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Response::Error {
+                            message: format!("cannot resolve path: {e}"),
+                        }
+                    }
+                }
+            };
+            let encoded = encode_query_value(&abs_path.to_string_lossy());
+            let url = format!("http://{http_addr}/view?path={encoded}");
+            Response::Opened { url, nonce }
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
