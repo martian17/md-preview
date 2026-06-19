@@ -59,8 +59,9 @@ use crate::roots::Root;
 ///
 /// The cap is checked against the length read from the *held fd's* `fstat`, so a
 /// pathological multi-GB file is refused before the caller streams it. 8 MiB
-/// comfortably covers any realistic Markdown document; mirrors
-/// [`crate::file_peer::DEFAULT_MAX_FILE_SIZE`].
+/// comfortably covers any realistic Markdown document; mirrors the same-named
+/// const in `doc-core`'s `file_peer` (a sibling kernel; the two crates carry no
+/// dependency edge, so the value is duplicated rather than shared — see ADR-0008).
 pub const DEFAULT_MAX_FILE_SIZE: u64 = 8 * 1024 * 1024;
 
 /// Why a confinement attempt was refused. Mapped onto HTTP / CLI responses by

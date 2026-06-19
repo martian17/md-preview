@@ -30,12 +30,21 @@ pub use doc_core::{diff, doc, file_peer, session, validate};
 #[cfg(feature = "daemon")]
 pub mod server;
 
+// Web-free filesystem-confinement kernel (ADR-0008 Phase 2): the multi-root
+// registry (`roots`) and the single hardened confinement funnel (`confine`) now
+// live in the standalone `fs-confine` crate (`crates/fs-confine`), an
+// independent DAG leaf with no edge to doc-core/md-render. Re-exported here as
+// `md_preview::{roots, confine}` so existing call sites (`crate::roots::…`,
+// `crate::confine::confine_read`, the daemon, tests) resolve exactly as before
+// the split. fs-confine carries std + libc only — ZERO web deps — so
+// `--no-default-features` still drops the entire daemon stack.
+#[cfg(feature = "daemon")]
+pub use fs_confine::{confine, roots};
+
 // Always-on, multi-root, isolated preview daemon modules (Track-3 rebuild,
 // shipped `eb02537`–`ece1ef0`). See HANDOFF.md §3–§4 for the architectural
 // decisions; ADR-0005 (registry), ADR-0006 (auth/trust), ADR-0007 (render-
 // isolation). All daemon-gated.
-#[cfg(feature = "daemon")]
-pub mod roots;
 #[cfg(feature = "daemon")]
 pub mod auth;
 #[cfg(feature = "daemon")]
@@ -46,5 +55,3 @@ pub mod shell;
 pub mod bundle;
 #[cfg(feature = "daemon")]
 pub mod asset_origin;
-#[cfg(feature = "daemon")]
-pub mod confine;

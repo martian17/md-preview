@@ -3,7 +3,7 @@
 # depends on it via a path dependency. In-repo workspace is the deliberately
 # reversible first crate-split step (see audit E-module-boundaries).
 [workspace]
-members = ["crates/md-render", "crates/doc-core"]
+members = ["crates/md-render", "crates/doc-core", "crates/fs-confine"]
 
 [package]
 name = "md-preview"
@@ -29,6 +29,11 @@ daemon = [
     "dep:sha2",
     "dep:subtle",
     "dep:base64",
+    # The filesystem-confinement kernel (ADR-0008 Phase 2): `roots` + the
+    # `confine` funnel, formerly daemon-gated modules in this crate. Web-free
+    # leaf; re-exported as `md_preview::{roots, confine}` so call sites are
+    # unchanged. Daemon-only, matching the prior `#[cfg(feature="daemon")]` gate.
+    "dep:fs-confine",
     # Keep the validator's base64 entry point (`is_update_b64_safe`) present in
     # daemon builds exactly as before the doc-core split.
     "doc-core/base64",
@@ -56,6 +61,14 @@ md-render = { path = "crates/md-render" }
 # still drops the whole daemon stack. The `watch` feature (notify filewatcher) is
 # on by default — md-preview's watch thread uses `FilePeer::watch`.
 doc-core = { path = "crates/doc-core" }
+# Web-free filesystem-confinement kernel (ADR-0008 Phase 2): the multi-root
+# registry + the single hardened confinement funnel (canonicalize + O_NOFOLLOW +
+# fstat on a held fd, dirfd-relative atomic save, sensitive-path denylist).
+# An independent LEAF (std + libc only; NO web deps, NO doc-core/md-render edge),
+# so `cargo tree -p fs-confine -e normal` shows no web/kernel crates. Re-exported
+# as `md_preview::{roots, confine}`. Daemon-gated (optional) — the funnel was a
+# daemon-only module, so `--no-default-features` still drops it with the web stack.
+fs-confine = { path = "crates/fs-confine", optional = true }
 
 # Daemon-only (optional): the async server stack. Picked per ADR-0003 so
 # `yrs-warp` (y-sync + awareness) drops in for Phase 3.

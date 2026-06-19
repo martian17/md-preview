@@ -335,6 +335,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-confine"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "fsevent-sys"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -828,6 +835,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "doc-core",
+ "fs-confine",
  "futures-util",
  "getrandom 0.2.17",
  "libc",
