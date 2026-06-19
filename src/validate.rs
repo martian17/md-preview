@@ -41,6 +41,35 @@
 //! If any of those feature flags are enabled, or a v2 decode path is introduced on
 //! `/collab`, this validator MUST be revisited.
 
+// --- F3: loud guard against silently invalidating the UB-guard's assumptions ---
+//
+// This validator's grammar is pinned to **default `yrs` features** (`sync`, but
+// NOT `small-client`, NOT `weak`) on the **v1** wire format (see the module
+// residual note). Enabling `small-client` (client IDs become `u32`), `weak`
+// (adds the `LinkSource` sub-grammar under `TYPE_REFS_WEAK`), or routing v2
+// updates through `/collab` would make a structurally-different update pass this
+// walk and reach `decode_v1`'s `from_utf8_unchecked` — a SILENT bypass.
+//
+// Our crate does not currently expose a passthrough feature that flips any of
+// those `yrs` flags (we depend on `yrs = { features = ["sync"] }`; verified via
+// `cargo tree -e features -i yrs`). To make a *future* silent bypass impossible
+// rather than merely unlikely, this `compile_error!` fires if anyone ever adds a
+// crate feature that forwards one of the assumption-breaking knobs. If you add
+// such a feature, you MUST first revisit this validator's grammar — do not just
+// delete the guard. The locked `decode_path_assumptions_hold` test below is the
+// runtime counterpart for the case where the flip arrives via transitive feature
+// unification (which a cfg on our own features cannot observe).
+#[cfg(any(
+    feature = "yrs-small-client",
+    feature = "yrs-weak",
+    feature = "yrs-v2-collab",
+))]
+compile_error!(
+    "validate.rs UB guard assumes DEFAULT yrs features (sync; not small-client, not weak) \
+     on the v1 wire format. A feature forwarding small-client/weak or enabling a v2 /collab \
+     decode path would silently bypass the guard — revisit the grammar walk before enabling it."
+);
+
 use std::str;
 use yrs::encoding::read::{Cursor, Error as ReadError, Read};
 
@@ -607,6 +636,56 @@ mod tests {
         let safe = is_update_bytes_safe(&update);
         let decodes = yrs::Update::decode_v1(&update).is_ok();
         assert_eq!(safe, decodes, "validator must agree with decode_v1 on empty doc");
+    }
+
+    /// F3 LOCKED ASSUMPTION TEST. The validator's grammar is pinned to the v1
+    /// wire format under default yrs features. A transitive feature flip
+    /// (`small-client`/`weak`) or a v2 decode path on `/collab` cannot be seen by
+    /// a `cfg` on our own crate features, so this runtime test is the backstop:
+    /// it locks in that a real, default-feature yrs document still encodes to a
+    /// **v1** update that this validator accepts AND that `decode_v1` consumes.
+    /// If yrs's wire format or default features ever change underneath us so that
+    /// this no longer holds, this test fails loudly — pointing at the residual
+    /// note — rather than the guard being silently bypassed at runtime.
+    #[test]
+    fn decode_path_assumptions_hold() {
+        // A document touching String, Map and nested content exercises the
+        // string/block grammar this walk mirrors.
+        let doc = Doc::new();
+        let txt = doc.get_or_insert_text("content");
+        let map = doc.get_or_insert_map("meta");
+        {
+            use yrs::Map;
+            let mut txn = doc.transact_mut();
+            txt.insert(&mut txn, 0, "locked v1 assumption");
+            map.insert(&mut txn, "k", "v");
+        }
+        let txn = doc.transact();
+        let update = txn.encode_state_as_update_v1(&yrs::StateVector::default());
+
+        // 1. The validator accepts the v1 update produced by default-feature yrs.
+        assert!(
+            is_update_bytes_safe(&update),
+            "default-feature yrs v1 update must still validate; if this fails the \
+             wire format/features changed — revisit the validate.rs grammar walk"
+        );
+
+        // 2. And `decode_v1` actually consumes exactly what we accept (no drift
+        //    between the validator's v1 walk and yrs's v1 decoder).
+        let decoded = yrs::Update::decode_v1(&update);
+        assert!(
+            decoded.is_ok(),
+            "the v1 update we accepted must decode via decode_v1 (v1 path locked)"
+        );
+
+        // 3. The same bytes must NOT decode as v2 — proof we are genuinely on the
+        //    v1 path the grammar assumes, not a v2 format that has its own
+        //    (out-of-scope) unchecked-UTF-8 site. If a future yrs makes v1==v2
+        //    here, the assumption note must be revisited.
+        assert!(
+            yrs::Update::decode_v2(&update).is_err(),
+            "a v1-encoded update must not also decode as v2 — confirms v1 wire format"
+        );
     }
 
     #[cfg(feature = "daemon")]

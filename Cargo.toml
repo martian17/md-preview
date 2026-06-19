@@ -24,6 +24,16 @@ daemon = [
     "dep:base64",
 ]
 
+# F3 — assumption-breaking knobs for the `/collab` UB guard (`src/validate.rs`).
+# These exist ONLY to make a silent bypass impossible: the validator's grammar
+# is pinned to default `yrs` features on the v1 wire format, so enabling any of
+# these is a `compile_error!` until that grammar is revisited. They forward the
+# corresponding `yrs` flags / select a v2 path; do NOT enable one without
+# updating `validate.rs`. Off by default (declared, unused).
+yrs-small-client = ["yrs/small-client"]
+yrs-weak = ["yrs/weak"]
+yrs-v2-collab = []
+
 [dependencies]
 pulldown-cmark = "0.13.3"  # Fast and GFM compatible
 syntect = "5.3.0"

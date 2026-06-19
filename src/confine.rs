@@ -23,12 +23,15 @@
 //!    metadata. There is no second `stat`, no re-`open`, and the final component
 //!    can never be a followed symlink.
 //!
-//! 3. **Symlink-safe saves (audit HIGH-2).** [`confine_save`] never writes
-//!    through a possibly-symlinked path with `fs::write`. It writes a temp file
-//!    in the *same directory* using `O_NOFOLLOW | O_EXCL` (so a pre-planted
-//!    symlink at the temp name is refused, not followed) and then `rename(2)`s
-//!    it over the target. A symlink swap of the final component cannot redirect
-//!    the write outside the directory.
+//! 3. **Symlink-safe saves (audit HIGH-2, follow-up F1).** [`confine_save`]
+//!    never writes through a possibly-symlinked path with `fs::write`, and never
+//!    re-resolves the parent by path after confining it. It holds the confined
+//!    parent as a **dirfd** opened with `O_DIRECTORY | O_NOFOLLOW`, then creates
+//!    the temp via `openat(dirfd, …, O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW)` and
+//!    commits via `renameat(dirfd, temp, dirfd, target)`. Every step is relative
+//!    to the held dirfd, so neither the final component NOR an intermediate
+//!    parent component swapped to a symlink *after* the dirfd is held can
+//!    redirect the write outside the confined directory.
 //!
 //! 4. **Denylist always applies (audit MED-4).** Sensitive / denylisted paths
 //!    are rejected even on the empty-registry fallback. `roots::is_sensitive`
@@ -45,7 +48,9 @@
 //!
 //! No `unwrap` / `expect` / `panic` in production code paths.
 
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 
 use crate::roots::Root;
@@ -282,18 +287,28 @@ pub fn confine_read(
     })
 }
 
-/// Atomically write `bytes` to `requested`, confined and without following a
-/// symlinked final component (audit HIGH-2).
+/// Atomically write `bytes` to `requested`, confined and TOCTOU-free against an
+/// intermediate-parent-dir symlink swap (audit HIGH-2, follow-up F1).
 ///
 /// The target file need not exist yet, so we cannot canonicalize it directly.
 /// Instead the **parent directory** is canonicalized and confined (it must be
-/// in-root and not sensitive), the final component is taken verbatim, and the
-/// write goes to a temp file created in that same directory with
-/// `O_NOFOLLOW | O_EXCL` — so a symlink pre-planted at the temp name is refused
-/// (`O_EXCL`) rather than followed (`O_NOFOLLOW`). The temp is then
-/// `rename(2)`'d over the target. A symlink swap of the target's final component
-/// cannot redirect the write outside the (confined) directory, because `rename`
-/// operates on the directory entry, not on a followed link.
+/// in-root and not sensitive). We then **hold that confined parent as a dirfd**
+/// opened with `O_DIRECTORY | O_NOFOLLOW`, and perform *every* subsequent
+/// filesystem operation relative to that dirfd:
+///
+/// - the temp file is created with
+///   `openat(dirfd, tempname, O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW, 0600)` —
+///   `O_EXCL` refuses a pre-planted entry at the temp name, `O_NOFOLLOW` refuses
+///   to follow one that raced in;
+/// - the commit is `renameat(dirfd, tempname, dirfd, target)`, which acts on the
+///   directory entry and never follows a symlinked target.
+///
+/// Because the dirfd is opened ONCE (the kernel pins that inode) and all
+/// `*at`-syscalls resolve `tempname`/`target` relative to it, a swap of an
+/// **intermediate parent component** to a symlink *after* the dirfd is held
+/// cannot redirect the write: there is no second by-path resolution of the
+/// parent. This closes the residual F1 TOCTOU left by the prior path-relative
+/// `open`/`rename(2)` version, which guarded only the final temp name.
 pub fn confine_save(
     requested: &Path,
     roots_union: &[&Root],
@@ -321,34 +336,100 @@ pub fn confine_save(
         return Err(ConfineError::Sensitive(canonical_target));
     }
 
-    // Temp file in the SAME directory (so rename is atomic / same filesystem).
-    // O_EXCL refuses a pre-existing entry at the temp name (incl. a planted
-    // symlink); O_NOFOLLOW refuses to follow one if it raced in.
-    let temp_name = temp_sibling_name(file_name);
-    let temp_path = canonical_parent.join(&temp_name);
+    // Hold the confined parent as a dirfd. `O_DIRECTORY` makes the open fail if
+    // it is not a directory; `O_NOFOLLOW` makes it fail if the final component
+    // of the confined parent path is itself a symlink. From here on every
+    // operation is relative to THIS fd — an intermediate parent swapped to a
+    // symlink after this point cannot be re-resolved (no second by-path open).
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(&canonical_parent)
+        .map_err(ConfineError::Io)?;
+    let dirfd = dir.as_raw_fd();
 
-    let write_result = (|| -> std::io::Result<()> {
+    // The C-string names passed to the `*at` syscalls. A NUL byte in a path is
+    // impossible from a real filesystem path, but guard it rather than panic.
+    let temp_name = temp_sibling_name(file_name);
+    let temp_cstr = path_to_cstring(&temp_name).ok_or_else(|| {
+        ConfineError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "temp file name contains an interior NUL byte",
+        ))
+    })?;
+    let target_cstr = path_to_cstring(file_name).ok_or_else(|| {
+        ConfineError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "save target name contains an interior NUL byte",
+        ))
+    })?;
+
+    // Create the temp via openat, relative to the held dirfd.
+    // SAFETY: `dirfd` is borrowed from the live, owned `dir` File for the whole
+    // call, so it is a valid descriptor; `temp_cstr` is a NUL-terminated C
+    // string we own that outlives the call; the flags and mode are plain
+    // integers passed by value. `openat` writes nothing through our pointers —
+    // it only reads the path — and we check the returned fd before using it.
+    let temp_raw = unsafe {
+        libc::openat(
+            dirfd,
+            temp_cstr.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if temp_raw < 0 {
+        return Err(ConfineError::Io(std::io::Error::last_os_error()));
+    }
+    // Take ownership so the fd is closed on every path (incl. early returns).
+    // SAFETY: `temp_raw` is a fresh, valid, owned fd just returned by `openat`
+    // (we checked it is non-negative); nothing else owns it.
+    let temp_file = unsafe { std::fs::File::from_raw_fd(temp_raw) };
+
+    // Write + fsync + commit, cleaning the temp entry up on any failure. The
+    // commit is renameat relative to the SAME dirfd on both sides.
+    let commit = (|| -> std::io::Result<()> {
         use std::io::Write;
-        let mut temp = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_EXCL)
-            .open(&temp_path)?;
-        temp.write_all(bytes)?;
-        temp.sync_all()?;
-        // Atomically replace the target. rename(2) acts on the directory entry,
-        // so it does not follow a symlinked target — the bytes land in the
-        // confined directory regardless of a swapped final component.
-        std::fs::rename(&temp_path, &canonical_target)
+        // Re-borrow the owned File for buffered writes; this does not duplicate
+        // or close the fd.
+        let mut w = &temp_file;
+        w.write_all(bytes)?;
+        w.sync_all()?;
+        // SAFETY: both dirfds are the same live, owned `dir` descriptor (valid
+        // for the call); `temp_cstr`/`target_cstr` are NUL-terminated C strings
+        // we own that outlive the call. `renameat` only reads through the
+        // pointers. We check the rc below.
+        let rc = unsafe {
+            libc::renameat(dirfd, temp_cstr.as_ptr(), dirfd, target_cstr.as_ptr())
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     })();
 
-    if let Err(e) = write_result {
-        // Best-effort cleanup of the temp file; ignore its own error.
-        let _ = std::fs::remove_file(&temp_path);
+    if let Err(e) = commit {
+        // Best-effort cleanup of the temp entry via unlinkat on the held dirfd
+        // (so cleanup, too, cannot be redirected); ignore its own error.
+        // SAFETY: `dirfd` is the live, owned `dir` descriptor; `temp_cstr` is an
+        // owned NUL-terminated C string outliving the call; `unlinkat` only
+        // reads the path. The result is intentionally ignored (best-effort).
+        unsafe {
+            libc::unlinkat(dirfd, temp_cstr.as_ptr(), 0);
+        }
         return Err(ConfineError::Io(e));
     }
 
+    // `temp_file` and `dir` drop here, closing both fds.
     Ok(())
+}
+
+/// Convert a path component (single file name, no separators) into a
+/// NUL-terminated [`std::ffi::CString`] for the `*at` syscalls. Returns `None`
+/// if the bytes contain an interior NUL (impossible for a real path component,
+/// but handled rather than panicking).
+fn path_to_cstring(name: &std::ffi::OsStr) -> Option<std::ffi::CString> {
+    std::ffi::CString::new(name.as_bytes()).ok()
 }
 
 /// Build a sibling temp-file name for an atomic save: `.<name>.<pid>.<n>.tmp`.
@@ -713,6 +794,74 @@ mod tests {
             "target is now a real file, not a symlink"
         );
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "SAFE");
+    }
+
+    #[test]
+    fn confine_save_dirfd_relative_resists_intermediate_parent_swap() {
+        // F1 regression: an INTERMEDIATE parent component swapped to a
+        // symlink-to-outside between confine and the write must NOT escape.
+        //
+        // Layout: root/realdir is the real (confined) directory; root/link is a
+        // symlink that initially resolves to realdir. We confine the parent
+        // `root/link` — it canonicalizes to root/realdir, and confine_save holds
+        // a dirfd on root/realdir. A racing thread then repeatedly re-points
+        // `link` at an OUTSIDE victim dir. Because every write/rename is relative
+        // to the held dirfd (root/realdir), the swap can never redirect the
+        // bytes: they always land in realdir, and the outside victim is untouched.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as O};
+
+        for _ in 0..40 {
+            let root = TempDir::new("save-swap-root");
+            let outside = TempDir::new("save-swap-out");
+            let victim_dir = outside.file("victim_dir");
+            std::fs::create_dir(&victim_dir).unwrap();
+
+            let realdir = root.file("realdir");
+            std::fs::create_dir(&realdir).unwrap();
+            let link = root.file("link");
+            std::os::unix::fs::symlink(&realdir, &link).unwrap();
+
+            // The root covers everything under root/ (incl. realdir and link).
+            let droot = dir_root(&root.path);
+            let union = vec![&droot];
+            let reg = registry_home(Path::new("/nonexistent-home"));
+
+            // Racing swapper: flip `link` between realdir and the outside victim.
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_t = Arc::clone(&stop);
+            let link_t = link.clone();
+            let realdir_t = realdir.clone();
+            let victim_t = victim_dir.clone();
+            let handle = std::thread::spawn(move || {
+                let mut to_victim = true;
+                while !stop_t.load(O::Relaxed) {
+                    let _ = std::fs::remove_file(&link_t);
+                    let dest = if to_victim { &victim_t } else { &realdir_t };
+                    let _ = std::os::unix::fs::symlink(dest, &link_t);
+                    to_victim = !to_victim;
+                }
+            });
+
+            // Save through the symlinked parent path.
+            let target = link.join("doc.md");
+            let _ = confine_save(&target, &union, &reg, b"SAFE");
+
+            stop.store(true, O::Relaxed);
+            handle.join().unwrap();
+
+            // INVARIANT: the outside victim dir never received the file, no matter
+            // how the swap raced. If the write landed (it confines fine when link
+            // points at realdir), it landed in realdir — never outside.
+            assert!(
+                !victim_dir.join("doc.md").exists(),
+                "dirfd-relative write must never escape into the swapped-in parent"
+            );
+            let in_realdir = realdir.join("doc.md");
+            if in_realdir.exists() {
+                assert_eq!(std::fs::read_to_string(&in_realdir).unwrap(), "SAFE");
+            }
+        }
     }
 
     #[test]

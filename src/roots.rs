@@ -13,7 +13,8 @@
 //!   root would land on `$HOME`/a denylisted dir, only that one file is served
 //!   (no directory scope, no recursion).
 //! - **Sensitive-path denylist** ([`Roots::is_sensitive`]) — `~/.ssh`,
-//!   `~/.gnupg`, `~/.aws`, `/etc`, and `$HOME` itself as a recursive root.
+//!   `~/.gnupg`, `~/.aws`, `~/.config`, `~/.netrc`, `~/.kube`, `~/.docker`,
+//!   `~/.local/share/keyrings`, `/etc`, and `$HOME` itself as a recursive root.
 //! - **30-day sliding TTL** — a root's expiry renews on access; only abandoned
 //!   roots are GC'd ([`Roots::gc`]).
 //! - **Plain-text persistence** — [`Roots::save`] / [`Roots::load`] round-trip
@@ -216,9 +217,20 @@ impl Roots {
     }
 
     /// Is `path` a **sensitive** target that must never become a recursive
-    /// root? Denylist: `$HOME` itself, `~/.ssh`, `~/.gnupg`, `~/.aws`, and any
-    /// path under `/etc`. The home-relative entries are computed from the
-    /// *injected* `home`, so this stays deterministic.
+    /// root (and that the confinement funnel must refuse outright)? Denylist:
+    /// `$HOME` itself, any path under `/etc`, and the home-relative
+    /// credential/secret stores below. The home-relative entries are computed
+    /// from the *injected* `home`, so this stays deterministic.
+    ///
+    /// Home-relative denylist (follow-up F2 widened this set):
+    ///   * `~/.ssh`, `~/.gnupg`, `~/.aws` — key material / cloud creds;
+    ///   * `~/.config` — broad app-config tree (browser profiles, tokens, …);
+    ///   * `~/.netrc` — plaintext login credentials;
+    ///   * `~/.kube`, `~/.docker` — cluster/registry credentials & contexts;
+    ///   * `~/.local/share/keyrings` — the secret-service keyring store.
+    ///
+    /// A trailing component is matched both exactly and as a path prefix, so a
+    /// file (`~/.netrc`) and a directory subtree (`~/.ssh/...`) are both covered.
     ///
     /// INTEGRATOR: this MUST be consulted on the empty-registry / single-file
     /// fallback path too (audit/02-security.md MED-4) — never skip it just
@@ -232,8 +244,19 @@ impl Roots {
             return true;
         }
 
-        // Home-relative sensitive dirs and anything beneath them.
-        for rel in [".ssh", ".gnupg", ".aws"] {
+        // Home-relative sensitive dirs/files and anything beneath them. Each
+        // entry is a path relative to the injected $HOME; `.local/share/keyrings`
+        // is multi-component (join handles the separator).
+        for rel in [
+            ".ssh",
+            ".gnupg",
+            ".aws",
+            ".config",
+            ".netrc",
+            ".kube",
+            ".docker",
+            ".local/share/keyrings",
+        ] {
             let sensitive = self.home.join(rel);
             if path == sensitive || path.starts_with(&sensitive) {
                 return true;
@@ -679,7 +702,41 @@ mod tests {
         assert!(r.is_sensitive("/etc/passwd"));
         // Ordinary project paths are fine.
         assert!(!r.is_sensitive("/home/alice/proj"));
-        assert!(!r.is_sensitive("/home/alice/.config")); // not on the denylist
+    }
+
+    #[test]
+    fn is_sensitive_covers_widened_denylist() {
+        // Follow-up F2: each newly-denylisted home-relative store is refused,
+        // both as the exact path and as a path beneath it.
+        let r = Roots::new(home());
+
+        // ~/.config (broad app-config tree)
+        assert!(r.is_sensitive("/home/alice/.config"));
+        assert!(r.is_sensitive("/home/alice/.config/gh/hosts.yml"));
+
+        // ~/.netrc (a plaintext-credentials FILE)
+        assert!(r.is_sensitive("/home/alice/.netrc"));
+
+        // ~/.kube (cluster credentials)
+        assert!(r.is_sensitive("/home/alice/.kube"));
+        assert!(r.is_sensitive("/home/alice/.kube/config"));
+
+        // ~/.docker (registry credentials)
+        assert!(r.is_sensitive("/home/alice/.docker"));
+        assert!(r.is_sensitive("/home/alice/.docker/config.json"));
+
+        // ~/.local/share/keyrings (secret-service store)
+        assert!(r.is_sensitive("/home/alice/.local/share/keyrings"));
+        assert!(r.is_sensitive("/home/alice/.local/share/keyrings/login.keyring"));
+
+        // Sibling paths that merely share a prefix segment are NOT swept in:
+        // .local itself (and other .local/share subtrees) stay servable.
+        assert!(!r.is_sensitive("/home/alice/.local"));
+        assert!(!r.is_sensitive("/home/alice/.local/share/app"));
+        // A path whose name only starts with a denylisted token is not matched
+        // (component-wise starts_with, not a string prefix).
+        assert!(!r.is_sensitive("/home/alice/.configuration"));
+        assert!(!r.is_sensitive("/home/alice/.netrc-backup"));
     }
 
     #[test]
