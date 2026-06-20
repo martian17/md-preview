@@ -474,6 +474,29 @@ fn routes(
         .and(warp::get())
         .map(|| warp::reply::with_header("ok", "content-type", "text/plain; charset=utf-8"));
 
+    // GET /outside -> the escape sentinel. When a navigation target escapes every
+    // active root (or /navigate refuses it), the shell sends the top frame here
+    // instead of leaking a path. A plain 403 page with no path echo (no existence
+    // leak); design §1 "the /outside path". Previously there was no route, so an
+    // escaped cross-link 404'd; this gives the human a clear, contained sentinel.
+    let outside = warp::path("outside")
+        .and(warp::path::end())
+        .and(warp::get())
+        .map(|| {
+            use warp::reply::Reply;
+            warp::reply::with_status(
+                warp::reply::html(
+                    "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+                     <title>Outside the preview roots</title></head><body>\
+                     <h1>Outside the preview roots</h1><p>That link points outside the \
+                     folders md-preview is allowed to read, so it was not opened.</p>\
+                     </body></html>",
+                ),
+                warp::http::StatusCode::FORBIDDEN,
+            )
+            .into_response()
+        });
+
     // POST /claim (body = the bootstrap nonce) -> consume the nonce, issue a
     // session, Set-Cookie. Origin-EXEMPT per design §2 (the bootstrap file:// page
     // POSTs with `Origin: null`), but still host-guarded. See `claim`.
@@ -510,7 +533,10 @@ fn routes(
         .and(warp::path::end())
         .and(warp::get())
         .and(with_context(state.clone()))
-        .map(move |ctx: ReqContext| srcdoc_page(&srcdoc_state, &ctx));
+        .and(warp::query::<NonceQuery>())
+        .map(move |ctx: ReqContext, q: NonceQuery| {
+            srcdoc_page(&srcdoc_state, &ctx, q.n.as_deref())
+        });
 
     // GET /content?path=<abs> -> the rendered markdown BODY fragment for one doc,
     // SAME-ORIGIN + authenticated. Goes through `serve_confined` (the floor): a
@@ -600,6 +626,7 @@ fn routes(
         });
 
     health
+        .or(outside)
         .or(claim)
         .or(view)
         .or(srcdoc)
@@ -618,6 +645,18 @@ fn routes(
 #[derive(serde::Deserialize)]
 struct PathQuery {
     path: String,
+}
+
+/// Query for `GET /srcdoc?n=<nonce>`: the **shell page's CSP nonce**, which the
+/// srcdoc's inline bootstrap must carry so it passes the *inherited* shell CSP (a
+/// srcdoc iframe inherits + enforces the embedder's CSP on top of its own). The
+/// shell threads its nonce here on every per-navigation mount. Optional + bounded:
+/// a missing/oversized/ill-formed value falls back to a fresh-minted nonce (a
+/// direct `/srcdoc` hit outside the shell won't render anyway), and the builders
+/// (`render_srcdoc` → `escape_attr`/`escape_csp_token`) neutralize any injection.
+#[derive(serde::Deserialize)]
+struct NonceQuery {
+    n: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -741,7 +780,11 @@ fn view_page(state: &AppState, ctx: &ReqContext) -> warp::reply::Response {
 /// srcdoc's `<meta http-equiv>` (a srcdoc has no response headers of its own).
 /// The frame is mounted null-origin sandboxed (`sandbox="allow-scripts"`) by the
 /// shell. Network-guarded; serves no file bytes (content arrives over the bus).
-fn srcdoc_page(state: &AppState, ctx: &ReqContext) -> warp::reply::Response {
+fn srcdoc_page(
+    state: &AppState,
+    ctx: &ReqContext,
+    nonce: Option<&str>,
+) -> warp::reply::Response {
     use warp::reply::Reply;
 
     if let Some(resp) = network_guard(ctx) {
@@ -750,9 +793,24 @@ fn srcdoc_page(state: &AppState, ctx: &ReqContext) -> warp::reply::Response {
     let static_origin = state
         .static_base_snapshot()
         .unwrap_or_else(|| "http://127.0.0.1".to_string());
+    // The srcdoc's inline bootstrap must carry the SHELL page's nonce so it passes
+    // the inherited shell CSP (a srcdoc iframe inherits + enforces the embedder's
+    // CSP on top of its own <meta>). Accept the shell-supplied nonce ONLY if it is
+    // well-formed (the URL-safe nonce alphabet, bounded length) — otherwise mint a
+    // fresh one (a direct /srcdoc hit outside the shell renders nothing anyway).
+    // The builders also escape it, so this is defense-in-depth, not the only gate.
+    let nonce = nonce
+        .filter(|n| {
+            !n.is_empty()
+                && n.len() <= 64
+                && n.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(crate::shell::gen_nonce);
     // One secondary origin serves both the bundle and the capability assets
     // (ADR-0007 interpretation), so the asset origin == the static origin here.
-    let doc = crate::shell::render_srcdoc(&static_origin, &static_origin);
+    let doc = crate::shell::render_srcdoc(&static_origin, &static_origin, &nonce);
     warp::reply::html(doc).into_response()
 }
 
@@ -2550,6 +2608,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outside_sentinel_route_serves_403_not_404() {
+        // The shell sends the top frame to /outside when a navigation escapes the
+        // roots. Previously there was no route, so the click 404'd; now it is a
+        // contained 403 sentinel page with no path echo.
+        let dir = temp_dir("outside");
+        let state = Arc::new(state_for(&dir));
+        let routes = routes(state);
+        let resp = warp::test::request()
+            .method("GET")
+            .path("/outside")
+            .header("host", "127.0.0.1:7878")
+            .reply(&routes)
+            .await;
+        assert_eq!(resp.status(), 403, "/outside must be a 403 sentinel, not a 404");
+        let body = String::from_utf8(resp.body().to_vec()).unwrap();
+        assert!(body.contains("Outside the preview roots"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn srcdoc_has_fresh_nonce_and_zero_egress_renderer_csp() {
         let dir = temp_dir("srcdoc");
         let state = state_for(&dir);
@@ -2562,13 +2640,20 @@ mod tests {
             .unwrap()
         };
 
-        let a = body_of(srcdoc_page(&state, &ctx(false))).await;
-        let b = body_of(srcdoc_page(&state, &ctx(false))).await;
+        // With the SHELL's nonce threaded in (?n=), the srcdoc echoes it verbatim
+        // so its inline bootstrap passes the inherited shell CSP.
+        let with_nonce = body_of(srcdoc_page(&state, &ctx(false), Some("sharedN0nce"))).await;
+        assert!(with_nonce.contains(r#"<script nonce="sharedN0nce">"#));
+        assert!(with_nonce.contains("&#x27;nonce-sharedN0nce&#x27;") || with_nonce.contains("'nonce-sharedN0nce'"));
+
         // Renderer CSP travels in the srcdoc meta and is zero-egress.
+        let a = body_of(srcdoc_page(&state, &ctx(false), None)).await;
+        let b = body_of(srcdoc_page(&state, &ctx(false), None)).await;
         assert!(a.contains(r#"<meta http-equiv="Content-Security-Policy""#));
         assert!(a.contains("connect-src &#x27;none&#x27;") || a.contains("connect-src 'none'"));
-        // A FRESH nonce per request (fresh iframe per navigation): the two differ.
-        assert_ne!(a, b, "each /srcdoc must mint a distinct nonce");
+        // With NO shell nonce supplied (a direct /srcdoc hit), a fresh one is minted
+        // per request, so the two differ — defense-in-depth for off-shell hits.
+        assert_ne!(a, b, "a nonce-less /srcdoc hit mints a distinct nonce");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -490,6 +490,17 @@ fn serve_bundle(cache: &BundleCache, fetcher: &dyn Fetcher, id: &str) -> warp::r
             insert_header(headers, "content-type", asset.content_type);
             // Required so the COEP shell can load this cross-origin asset.
             insert_header(headers, "cross-origin-resource-policy", "cross-origin");
+            // CORS-allow the bundle. CORP alone satisfies COEP for a NO-CORS load
+            // (the `<script>`/`<link>` tags), but `@font-face` woff2 referenced from
+            // `katex.min.css` are fetched in **CORS mode** by the browser, and under
+            // the shell's `COEP: require-corp` a CORS-mode subresource ALSO needs an
+            // `Access-Control-Allow-Origin` or it fails (`net::ERR_FAILED`) — which
+            // broke every KaTeX glyph font. The bundle is PUBLIC, SRI-pinned, secret-
+            // free third-party code, so `*` exposes nothing — UNLIKE the capability
+            // `/cap` assets, which MUST stay CORS-less so cross-origin canvas-taint
+            // keeps their bytes opaque to script (that header is deliberately NOT
+            // added in `asset_origin.rs`).
+            insert_header(headers, "access-control-allow-origin", "*");
             insert_header(headers, "cache-control", IMMUTABLE_CACHE_CONTROL);
             // Expose the pinned SRI so the shell can set integrity="…".
             if let Ok(v) = warp::http::HeaderValue::from_str(&asset.sri()) {
@@ -814,6 +825,13 @@ mod tests {
             resp.headers().get("cross-origin-resource-policy").unwrap(),
             "cross-origin"
         );
+        // CORS-allow: needed so CORS-mode font (@font-face woff2) fetches succeed
+        // under the shell's COEP require-corp. The bundle is public/SRI-pinned, so
+        // `*` exposes nothing (cap assets stay CORS-less — asserted in asset_origin).
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "*"
+        );
         assert_eq!(
             resp.headers().get("cache-control").unwrap(),
             IMMUTABLE_CACHE_CONTROL
@@ -831,6 +849,7 @@ mod tests {
         let headers = resp.headers_mut();
         insert_header(headers, "content-type", asset.content_type);
         insert_header(headers, "cross-origin-resource-policy", "cross-origin");
+        insert_header(headers, "access-control-allow-origin", "*");
         insert_header(headers, "cache-control", IMMUTABLE_CACHE_CONTROL);
         if let Ok(v) = warp::http::HeaderValue::from_str(&asset.sri()) {
             headers.insert("x-sri", v);

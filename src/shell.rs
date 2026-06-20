@@ -81,9 +81,23 @@ pub const RENDER_WATCHDOG_MS: u32 = 5000;
 /// - `script-src 'nonce-…' {static}` — only the shell's own nonce'd inline bus JS
 ///   and the origin-pinned bundle from the static origin; **no `'self'`** for
 ///   arbitrary same-origin scripts, **no** CDN.
-/// - `style-src 'nonce-…' {static}` — the shell's nonce'd inline styles + bundle CSS.
+/// - `style-src 'unsafe-inline' {static}` — inline styles + bundle CSS. We use
+///   **`'unsafe-inline'` with NO nonce on style** (deliberately, unlike `script`),
+///   because a `srcdoc` iframe **inherits the embedder's CSP** and the untrusted
+///   renderer body (KaTeX output, mermaid per-node fills, `<math-renderer style=…>`)
+///   carries inline `style="…"` *attributes* that nonces cannot cover — AND per
+///   the CSP spec a nonce in `style-src` makes `'unsafe-inline'` **ignored even
+///   for those attributes** (a style nonce would self-defeat and block them). So
+///   style is allowed inline; **`script` stays strictly nonce-pinned** (no
+///   `'unsafe-inline'` there — that is the load-bearing XSS boundary). This is the
+///   ONE deliberate relaxation vs. the original (style only, never script);
+///   security re-review item. The trusted shell page emits only one inline
+///   `<style>` (its own chrome) and zero untrusted style; the permissiveness
+///   exists so the inherited policy lets the sandboxed renderer's markup style.
 /// - `font-src {static}` / `img-src {static}` — fonts and chrome images come from
-///   the bundle origin.
+///   the bundle origin. Inherited by the srcdoc: KaTeX fonts (`{static}/bundle/
+///   fonts/…`) and the renderer's per-doc capability images (`{static}/cap/…`,
+///   same static origin) load through this inherited allowance.
 /// - `connect-src 'self'` — fetch/XHR/WebSocket limited to **same-origin only**:
 ///   the content API and the live-reload/collab WS. The shell does the
 ///   authenticated fetching; nothing leaves loopback.
@@ -98,7 +112,7 @@ pub fn shell_csp(static_origin: &str, nonce: &str) -> String {
         "default-src 'none'; \
          frame-ancestors 'none'; \
          script-src 'nonce-{n}' {s}; \
-         style-src 'nonce-{n}' {s}; \
+         style-src 'unsafe-inline' {s}; \
          font-src {s}; \
          img-src {s}; \
          connect-src 'self'; \
@@ -167,7 +181,10 @@ pub fn renderer_csp(static_origin: &str, asset_origin: &str, nonce: &str) -> Str
 /// `save`/`navigate`/`error`/`rendered` back to the daemon. Path authority stays
 /// in the parent — the iframe only *reports* intent (see the module-level schema).
 pub fn render_shell_page(static_origin: &str, nonce: &str) -> String {
-    let s = escape_attr(static_origin);
+    // `static_origin` is still part of the public signature (the shell's CSP is
+    // built from it by the caller) but the shell page itself no longer embeds a
+    // cross-origin <link>: its chrome CSS is inline + nonce'd (see <style> below).
+    let _ = static_origin;
     let n = escape_attr(nonce);
     let watchdog = RENDER_WATCHDOG_MS;
     format!(
@@ -177,11 +194,19 @@ pub fn render_shell_page(static_origin: &str, nonce: &str) -> String {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>md-preview</title>
-<link rel="stylesheet" href="{s}/shell.css" nonce="{n}">
+<style>
+/* Trusted-shell chrome only (NO document styling — that lives in the sandboxed
+   renderer). Inline: the shell CSP allows `style-src 'unsafe-inline'` (style, not
+   script), so we need no cross-origin shell stylesheet (there is no such bundle
+   asset, and a cross-origin link would need CORP handling for nothing). */
+html, body {{ margin: 0; height: 100%; background: #ffffff; }}
+@media (prefers-color-scheme: dark) {{ html, body {{ background: #0d1117; }} }}
+#render-host, #render-frame {{ display: block; border: 0; width: 100%; height: 100vh; }}
+</style>
 </head>
 <body>
 <!-- The untrusted renderer iframe is created/destroyed per navigation by the
-     bootstrap (a fresh srcdoc + fresh nonce each time). It always carries
+     bootstrap (a fresh srcdoc per navigation). It always carries
      sandbox="allow-scripts" ONLY (deliberately not granting the same-origin flag
      => null/opaque origin, no cookie/token). -->
 <div id="render-host"></div>
@@ -195,6 +220,10 @@ pub fn render_shell_page(static_origin: &str, nonce: &str) -> String {
   "use strict";
   const RENDER_WATCHDOG_MS = {watchdog};
   const IFRAME_SANDBOX = "{sandbox}";
+  // This page's CSP nonce. A srcdoc iframe INHERITS this page's CSP, so the
+  // srcdoc's inline bootstrap <script>/<style> must carry THIS nonce to pass the
+  // inherited policy; we thread it to /srcdoc (?n=) on every mount.
+  const SHELL_NONCE = "{n}";
   const host = document.getElementById("render-host");
 
   // Per-mount state. Each navigation destroys the iframe and rebuilds all of it,
@@ -239,10 +268,14 @@ pub fn render_shell_page(static_origin: &str, nonce: &str) -> String {
     return res.text();
   }}
 
-  // Fetch a FRESH /srcdoc (fresh nonce, fresh renderer CSP) for each mount, so
-  // every navigation gets a brand-new null-origin sandbox with no shared state.
+  // Fetch a FRESH /srcdoc for each mount, so every navigation gets a brand-new
+  // null-origin sandbox with no shared state. We pass this page's nonce so the
+  // srcdoc's inline bootstrap carries the nonce the INHERITED shell CSP allows
+  // (the srcdoc inherits + enforces this page's CSP atop its own <meta> CSP).
   async function fetchSrcdoc() {{
-    const res = await fetch("./srcdoc", {{ credentials: "same-origin" }});
+    const res = await fetch("./srcdoc?n=" + encodeURIComponent(SHELL_NONCE), {{
+      credentials: "same-origin",
+    }});
     if (!res.ok) throw new Error("srcdoc fetch failed: " + res.status);
     return res.text();
   }}
@@ -274,15 +307,26 @@ pub fn render_shell_page(static_origin: &str, nonce: &str) -> String {
     channel.port1.onmessage = (ev) => handleRendererMessage(ev.data);
     channel.port1.start && channel.port1.start();
 
+    // A MessagePort can be transferred EXACTLY ONCE — a second transfer throws
+    // "Port already neutered". The iframe `load` event can fire more than once, so
+    // guard the transfer with a per-mount latch so port2 is handed over once and
+    // only once. CRUCIAL ordering: set `srcdoc` BEFORE appending to the DOM, so the
+    // ONLY load this frame ever fires is the srcdoc document itself — appending an
+    // iframe with no `src`/`srcdoc` first would fire a load for the throwaway
+    // `about:blank`, and the once-latch would then burn the transfer on that
+    // (wrong) document, leaving the real srcdoc bootstrap waiting for a port that
+    // never arrives. With srcdoc set first, `load` == the renderer is ready.
+    let portSent = false;
     frame.addEventListener("load", () => {{
       // Hand the iframe its private port (transfer port2). The srcdoc keeps it
-      // and replies only over it. armWatchdog before the first body relay.
-      if (!frame || !channel) return;
+      // and replies only over it.
+      if (!frame || !channel || portSent) return;
+      portSent = true;
       frame.contentWindow.postMessage({{ type: "__port" }}, "*", [channel.port2]);
     }});
 
-    host.appendChild(frame);
     frame.srcdoc = srcdoc;
+    host.appendChild(frame);
 
     // Fetch the rendered body and relay it once we have a frame + port. We post
     // on the next tick after load via the bus; the iframe buffers until ready by
@@ -360,11 +404,23 @@ pub fn render_shell_page(static_origin: &str, nonce: &str) -> String {
     }}
   }}
 
-  // Resolve a renderer-reported link target against the CURRENT document path so
-  // the server receives an absolute candidate to re-confine. Already-absolute
-  // targets pass through; relative ones are joined to the current doc's dir.
-  // (The server is still the sole authority — this is just to form the query.)
+  // Resolve a renderer-reported link target into the absolute candidate PATH the
+  // server should re-confine. The server is still the SOLE authority — this only
+  // forms the `path=` query; it never grants the iframe path authority.
+  //
+  // In-root `.md` links are rewritten server-side to `/view?path=<abs>` SHELL
+  // links (see rewrite_doc_caps), so the renderer reports that whole string. We
+  // UNWRAP `/view?path=<p>` back to its `<p>` (decoded) — otherwise we'd send the
+  // server `/navigate?path=/view?path=…`, which can't confine and bounces every
+  // cross-link to /outside. Already-absolute targets pass through; relative ones
+  // are joined to the current doc's dir.
   function resolveTarget(target) {{
+    // Unwrap a server-rewritten shell link `/view?path=<p>` (possibly with a
+    // #fragment) to the bare confined path it points at.
+    const m = /^\/view\?path=([^&#]*)/.exec(target);
+    if (m) {{
+      try {{ return decodeURIComponent(m[1]); }} catch (e) {{ return m[1]; }}
+    }}
     if (target.startsWith("/")) return target;
     const dir = currentPath ? currentPath.replace(/\/[^/]*$/, "") : "";
     return dir + "/" + target;
@@ -436,10 +492,18 @@ pub fn render_shell_page(static_origin: &str, nonce: &str) -> String {
 
 /// Build the **sandboxed renderer document** (the iframe `srcdoc`).
 ///
-/// `static_origin`/`asset_origin` are forwarded to [`renderer_csp`]. A **fresh
-/// nonce is minted per call** ([`gen_nonce`]) for the inline bootstrap script, and
-/// the matching CSP is embedded as a `<meta http-equiv>` so the policy travels with
-/// the srcdoc (a srcdoc document has no response headers of its own).
+/// `static_origin`/`asset_origin` are forwarded to [`renderer_csp`]. `nonce` is
+/// the **shell page's nonce**, passed in (NOT minted here): a `srcdoc` iframe
+/// **inherits the embedder shell's CSP** and enforces it on top of its own
+/// `<meta>` CSP, so the srcdoc's inline `<script>`/`<style>` MUST carry the exact
+/// nonce the inherited shell policy (`'nonce-…'`) allows, or they are blocked and
+/// the renderer never boots. The shell mints the nonce once per page load and
+/// threads it to `/srcdoc` (`?n=`), so every per-navigation srcdoc this shell
+/// mounts shares that one nonce. The same nonce is embedded in the srcdoc's own
+/// `<meta>` CSP (via [`renderer_csp`]) so both stacked policies permit the inline
+/// bootstrap. The renderer is still a fresh null-origin iframe per navigation
+/// (fresh MessageChannel, no shared JS state); only the inline-auth nonce — whose
+/// sole job is to vouch for the *trusted* bootstrap markup — is shared.
 ///
 /// The bootstrap is intentionally tiny: it first receives its **private
 /// `MessageChannel` port** from the parent (a one-shot `{type:"__port"}` window
@@ -449,44 +513,125 @@ pub fn render_shell_page(static_origin: &str, nonce: &str) -> String {
 /// injects the body, and posts `{type:"rendered"}` (or `{type:"error", message}`)
 /// back **over the port**. Save / navigate intents are reported up the port — the
 /// renderer never resolves a path or touches the network (`connect-src 'none'`).
-pub fn render_srcdoc(static_origin: &str, asset_origin: &str) -> String {
-    let nonce = gen_nonce();
-    let csp = escape_attr(&renderer_csp(static_origin, asset_origin, &nonce));
+pub fn render_srcdoc(static_origin: &str, asset_origin: &str, nonce: &str) -> String {
+    let csp = escape_attr(&renderer_csp(static_origin, asset_origin, nonce));
     let s = escape_attr(static_origin);
-    let n = escape_attr(&nonce);
+    let n = escape_attr(nonce);
+    // The document chrome + syntax-highlight CSS (the `.markdown-body`, copy-button
+    // and syntect `.hl-` rules that `render_page` bakes into a standalone doc),
+    // inlined into a plain `<style>` (NO nonce). Both the inherited shell CSP and
+    // the renderer's own <meta> CSP use `style-src 'unsafe-inline' {static}` with
+    // no style nonce, so this `<style>` element AND the rendered body's inline
+    // style ATTRIBUTES (KaTeX spacing, mermaid per-node fill/stroke) are allowed.
+    // (A style nonce would self-defeat: CSP ignores 'unsafe-inline' when a nonce is
+    // present, blocking the attributes.) The KaTeX + github-markdown stylesheets
+    // come cross-origin from the bundle origin (CORP under the embedder's COEP).
+    let doc_css = document_css();
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="{csp}">
-<link rel="stylesheet" href="{s}/bundle.css" nonce="{n}">
+<link rel="stylesheet" href="{s}/bundle/github-markdown.css">
+<link rel="stylesheet" href="{s}/bundle/katex.min.css">
+<style>{doc_css}</style>
 </head>
 <body>
-<div id="doc"></div>
+<!-- `.markdown-body` is the github-markdown-css scope (same wrapper class
+     `render_page` uses around the body). The parent swaps this node's innerHTML
+     per render; the bootstrap re-runs mermaid/KaTeX against the swapped nodes. -->
+<div id="doc" class="markdown-body"></div>
+<!-- Origin-pinned render libs, loaded cross-origin from the BUNDLE origin only
+     (governed by `script-src 'nonce-…' {{static}}`; never `connect-src`, which
+     stays 'none'). These are the UMD single-file builds => `window.mermaid` /
+     `window.katex`. Loaded NO-CORS: the bundle's `Cross-Origin-Resource-Policy:
+     cross-origin` satisfies the embedder COEP, and since the bundle sends no
+     `Access-Control-Allow-Origin` a CORS load would fail. They self-register the
+     globals the bootstrap below drives. -->
+<script nonce="{n}" src="{s}/bundle/mermaid.min.js"></script>
+<script nonce="{n}" src="{s}/bundle/katex.min.js"></script>
 <script nonce="{n}">
 // Sandboxed renderer bootstrap (null origin, connect-src 'none' => zero egress).
 // Receives body HTML from the parent over postMessage; never fetches or resolves
-// paths itself (the parent is the sole path authority).
+// paths itself (the parent is the sole path authority). The only network it does
+// is the `<script>`/`<link>` bundle loads above, governed by script-src/style-src
+// (the bundle origin) — connect-src stays 'none', so no fetch/XHR/socket is ever
+// possible from here.
 (() => {{
   "use strict";
   // The dedicated MessageChannel port to the parent. Until it arrives there is no
   // bus at all (and never any network). Reply ONLY over this port — never
   // event.origin ("null" for an opaque sandbox) and never a broadcast postMessage.
   let port = null;
+  const docEl = document.getElementById("doc");
 
   function toParent(msg) {{ if (port) port.postMessage(msg); }}
 
-  // Render a body fragment handed down over the port and ack it.
+  // --- client-side render of the swapped body (mermaid + KaTeX, from the bundle).
+  // Both libs are loaded as classic UMD scripts above; on first render they may
+  // not have parsed yet, so the body is injected + ack'd immediately (text shows
+  // and the parent watchdog is cancelled) and the heavy render runs whenever the
+  // libs are ready AND re-runs on every subsequent body swap.
+
+  // Mermaid: initialise once (theme follows the system), then run against any
+  // not-yet-processed `<pre class="mermaid">` nodes in the freshly swapped body.
+  let mermaidReady = false;
+  function ensureMermaid() {{
+    if (mermaidReady || typeof window.mermaid === "undefined") return mermaidReady;
+    try {{
+      const dark = window.matchMedia
+        && window.matchMedia("(prefers-color-scheme: dark)").matches;
+      window.mermaid.initialize({{ startOnLoad: false, theme: dark ? "dark" : "default" }});
+      mermaidReady = true;
+    }} catch (e) {{ /* leave not-ready; a later render retries */ }}
+    return mermaidReady;
+  }}
+  function runMermaid() {{
+    if (!ensureMermaid()) return;
+    const nodes = docEl.querySelectorAll("pre.mermaid:not([data-processed])");
+    if (nodes.length) {{
+      try {{ window.mermaid.run({{ nodes }}); }} catch (e) {{ /* malformed graph */ }}
+    }}
+  }}
+
+  // KaTeX: typeset each `<math-renderer>` (the custom element `render_markdown`
+  // emits) in place, display vs inline per its `js-display-math` class.
+  function runKaTeX() {{
+    if (typeof window.katex === "undefined") return;
+    const nodes = docEl.querySelectorAll("math-renderer:not([data-typeset])");
+    nodes.forEach((el) => {{
+      const tex = el.textContent.trim();
+      const display = el.classList.contains("js-display-math");
+      try {{
+        window.katex.render(tex, el, {{ displayMode: display, throwOnError: false }});
+        el.setAttribute("data-typeset", "");
+      }} catch (e) {{ /* leave the raw TeX visible */ }}
+    }});
+  }}
+
+  function renderRich() {{ runMermaid(); runKaTeX(); }}
+
+  // Render a body fragment handed down over the port: swap it in, ack at once
+  // (cancels the parent watchdog), then run the rich render. If the libs are not
+  // parsed yet, their `load` handlers below re-run renderRich once they are.
   function render(msg) {{
     if (!msg || msg.type !== "render" || typeof msg.html !== "string") return;
     try {{
-      document.getElementById("doc").innerHTML = msg.html;
+      docEl.innerHTML = msg.html;
       toParent({{ type: "rendered" }});         // ack -> cancels parent watchdog
+      renderRich();
     }} catch (e) {{
       toParent({{ type: "error", message: String(e && e.message || e) }});
     }}
   }}
+
+  // If a lib finishes loading AFTER the first body swap, render the now-present
+  // body. (Scripts may still be parsing when the first {{render}} arrives.)
+  function onLibLoad() {{ renderRich(); }}
+  document.querySelectorAll('script[src]').forEach((sc) => {{
+    sc.addEventListener("load", onLibLoad);
+  }});
 
   // ONE-SHOT port handshake. The only window-level message we honour is the
   // parent handing us our private port; we bind the bus to it and stop listening
@@ -504,8 +649,20 @@ pub fn render_srcdoc(static_origin: &str, asset_origin: &str) -> String {
   }});
 
   // Link clicks are reported up the port; the parent re-confines the target and
-  // remounts a fresh iframe. The renderer never navigates itself.
+  // remounts a fresh iframe. The renderer never navigates itself. The copy-button
+  // click is handled locally (clipboard write of the sibling code), never up the
+  // port — it is a same-frame UI action, not a navigation.
   document.addEventListener("click", (ev) => {{
+    const btn = ev.target.closest && ev.target.closest(".copy-btn");
+    if (btn) {{
+      const code = btn.parentElement && btn.parentElement.querySelector("pre code");
+      try {{
+        navigator.clipboard && navigator.clipboard.writeText(code ? code.textContent : "");
+        btn.classList.add("copied");
+        setTimeout(() => btn.classList.remove("copied"), 2000);
+      }} catch (e) {{ /* clipboard unavailable in a null-origin frame: ignore */ }}
+      return;
+    }}
     const a = ev.target.closest && ev.target.closest("a[href]");
     if (!a) return;
     ev.preventDefault();
@@ -516,6 +673,30 @@ pub fn render_srcdoc(static_origin: &str, asset_origin: &str) -> String {
 </body>
 </html>"#
     )
+}
+
+/// The document chrome + syntax-highlight CSS the sandboxed renderer inlines:
+/// the `.markdown-body` layout, the copy-button styling, and the syntect `.hl-`
+/// highlight rules (light/dark) — exactly the `<style>` block
+/// [`md_render::render_page`] bakes into a standalone document. We slice it out of
+/// a one-time `render_page("")` render (cached in a [`OnceLock`]) so the renderer
+/// stays byte-identical to the canonical standalone styling without duplicating
+/// the syntect theme generation here. It carries **no** CDN/`<link>` refs (those
+/// live outside the `<style>` block); the cross-origin stylesheets (KaTeX +
+/// github-markdown) are loaded from the bundle origin instead.
+fn document_css() -> &'static str {
+    use std::sync::OnceLock;
+    static CSS: OnceLock<String> = OnceLock::new();
+    CSS.get_or_init(|| {
+        let page = crate::render_page("");
+        // The single `<style>…</style>` block in `render_page`'s output holds the
+        // chrome + syntax CSS. Slice it; if the upstream layout ever changes the
+        // empty fallback degrades gracefully to "unstyled but functional".
+        match (page.find("<style>"), page.find("</style>")) {
+            (Some(a), Some(b)) if b > a => page[a + "<style>".len()..b].to_string(),
+            _ => String::new(),
+        }
+    })
 }
 
 /// Escape a string for safe interpolation into an HTML **attribute** value (the
@@ -609,10 +790,27 @@ mod tests {
         assert!(csp.contains("script-src 'nonce-abc123'"));
         assert!(csp.contains(STATIC));
         assert!(!csp.contains("script-src 'self'"));
+        // SCRIPT must NEVER carry 'unsafe-inline' (scripts stay strictly nonce-pinned;
+        // that is the load-bearing XSS boundary).
         assert!(
-            !csp.contains("'unsafe-inline'"),
-            "shell never uses unsafe-inline"
+            !csp.contains("script-src 'nonce-abc123' http://127.0.0.1:7001 'unsafe-inline'"),
+            "script-src must never allow unsafe-inline"
         );
+        // STYLE uses 'unsafe-inline' with NO nonce — REQUIRED so the inherited shell
+        // CSP lets the sandboxed renderer's body STYLE ATTRIBUTES (KaTeX spacing,
+        // mermaid per-node fills, <math-renderer style=>) apply. A style nonce would
+        // self-defeat: CSP ignores 'unsafe-inline' when a nonce is present, blocking
+        // those attributes. Deliberate, documented (style only, never script).
+        assert!(
+            csp.contains("style-src 'unsafe-inline' http://127.0.0.1:7001"),
+            "style-src must be 'unsafe-inline' {{static}} with no style nonce: {csp}"
+        );
+        assert!(
+            !csp.contains("style-src 'nonce-"),
+            "style-src must carry NO nonce (it would disable 'unsafe-inline')"
+        );
+        // The single 'unsafe-inline' is ONLY in style-src — never where script runs.
+        assert_eq!(csp.matches("'unsafe-inline'").count(), 1);
     }
 
     #[test]
@@ -659,6 +857,23 @@ mod tests {
         assert!(page.contains("channel.port1.onmessage"));
         // The private port (port2) is transferred to the iframe on load.
         assert!(page.contains("[channel.port2]"));
+        // The shell chrome CSS is INLINE (style-src 'unsafe-inline'; no cross-origin
+        // shell.css, which the daemon never served — old broken <link> 404'd+COEP-blocked).
+        assert!(page.contains("<style>"));
+        assert!(!page.contains("shell.css"));
+        // The port is transferred EXACTLY ONCE per mount (the load event can fire
+        // more than once with srcdoc → "Port already neutered"); guard with a latch.
+        assert!(page.contains("portSent"));
+        // CRUCIAL ordering: `srcdoc` is set BEFORE the frame is appended, so the
+        // only `load` the frame fires is the real srcdoc document — not a throwaway
+        // about:blank that would burn the once-latch on the wrong document and leave
+        // the renderer's bootstrap waiting for a port that never arrives.
+        let srcdoc_at = page.find("frame.srcdoc = srcdoc").expect("sets srcdoc");
+        let append_at = page.find("host.appendChild(frame)").expect("appends frame");
+        assert!(
+            srcdoc_at < append_at,
+            "frame.srcdoc must be set BEFORE host.appendChild (single, correct load)"
+        );
         // The shell must never GATE inbound iframe messages on the origin (it is
         // the string "null" for an opaque sandbox). The bus validation is the port
         // identity above; assert no origin-comparison anti-pattern is present.
@@ -676,14 +891,22 @@ mod tests {
         // Authenticated same-origin content fetch (cookie carried -> SameSite=Strict).
         assert!(page.contains(r#"fetch("./content?path="#));
         assert!(page.contains(r#"credentials: "same-origin""#));
-        // A FRESH /srcdoc is fetched per mount (fresh nonce per navigation).
-        assert!(page.contains(r#"fetch("./srcdoc""#));
+        // A FRESH /srcdoc is fetched per mount, carrying THIS page's nonce so the
+        // srcdoc's inline bootstrap passes the inherited shell CSP.
+        assert!(page.contains(r#"fetch("./srcdoc?n=""#));
+        assert!(page.contains("SHELL_NONCE"));
         // navigate() is server-authoritative: it hits /navigate, never resolves
         // the path in the iframe.
         assert!(page.contains(r#"fetch("./navigate?path="#));
         // 204 from /navigate => in-root: remount; otherwise the /outside sentinel.
         assert!(page.contains("204"));
         assert!(page.contains("/outside"));
+        // A server-rewritten in-root `.md` link is `/view?path=<abs>`; resolveTarget
+        // must UNWRAP that to the bare path before forming the /navigate query (else
+        // every cross-link double-wraps to /navigate?path=/view?path=… and bounces
+        // to /outside). Assert the unwrap is present.
+        assert!(page.contains(r#"/^\/view\?path="#));
+        assert!(page.contains("decodeURIComponent"));
         // saveCurrent() relays to the same-origin /save endpoint, scoped to the
         // CURRENTLY tracked path (the iframe can never name another doc).
         assert!(page.contains(r#"fetch("./save?path="#));
@@ -717,7 +940,7 @@ mod tests {
 
     #[test]
     fn srcdoc_binds_bus_to_transferred_port_not_window() {
-        let doc = render_srcdoc(STATIC, ASSET);
+        let doc = render_srcdoc(STATIC, ASSET, "n0nce");
         // The renderer trusts ONLY the one-shot port handshake from the parent and
         // then talks over the transferred port — never a broadcast postMessage.
         assert!(doc.contains(r#"msg.type !== "__port""#));
@@ -773,8 +996,8 @@ mod tests {
     }
 
     #[test]
-    fn srcdoc_embeds_renderer_csp_and_fresh_nonce() {
-        let doc = render_srcdoc(STATIC, ASSET);
+    fn srcdoc_embeds_renderer_csp_and_the_shell_nonce() {
+        let doc = render_srcdoc(STATIC, ASSET, "shellNonce123");
         assert!(doc.starts_with("<!DOCTYPE html>"));
         // CSP travels in the srcdoc via meta http-equiv (no response headers).
         assert!(doc.contains(r#"<meta http-equiv="Content-Security-Policy""#));
@@ -782,14 +1005,89 @@ mod tests {
         // Renderer reports navigation up rather than navigating itself.
         assert!(doc.contains(r#"type: "navigate""#));
         assert!(doc.contains(r#"type: "rendered""#));
+        // The srcdoc carries the SHELL's nonce (passed in, NOT minted here) on its
+        // inline <script> AND in its own <meta> CSP `script-src` — so the inline
+        // bootstrap passes BOTH the inherited shell CSP and its own policy. (Style
+        // is 'unsafe-inline' with NO nonce — see srcdoc_runs_mermaid_and_katex.)
+        assert!(doc.contains(r#"<script nonce="shellNonce123">"#));
+        assert!(doc.contains("<style>"), "the inline <style> carries no nonce");
+        // The <meta> CSP is attribute-escaped, so the quotes render as &#x27;.
+        assert!(
+            doc.contains("&#x27;nonce-shellNonce123&#x27;")
+                || doc.contains("'nonce-shellNonce123'")
+        );
     }
 
     #[test]
-    fn srcdoc_mints_a_distinct_nonce_each_call() {
-        // Fresh nonce per call: the two documents must not share a nonce.
-        let a = render_srcdoc(STATIC, ASSET);
-        let b = render_srcdoc(STATIC, ASSET);
+    fn srcdoc_loads_bundle_assets_from_the_real_served_paths() {
+        let doc = render_srcdoc(STATIC, ASSET, "n0nce");
+        // The OLD broken markup linked `…/bundle.css` (a 404, no such route). The
+        // corrected srcdoc links the REAL bundle paths served at `/bundle/<id>`.
+        assert!(
+            !doc.contains("/bundle.css\""),
+            "must not link the non-existent /bundle.css"
+        );
+        assert!(doc.contains(&format!(r#"href="{STATIC}/bundle/github-markdown.css""#)));
+        assert!(doc.contains(&format!(r#"href="{STATIC}/bundle/katex.min.css""#)));
+        // The render libs load from the bundle origin (UMD single-file builds).
+        assert!(doc.contains(&format!(r#"src="{STATIC}/bundle/mermaid.min.js""#)));
+        assert!(doc.contains(&format!(r#"src="{STATIC}/bundle/katex.min.js""#)));
+        // No `crossorigin` on the bundle subresources: a no-cors load is satisfied
+        // by the bundle's CORP under COEP; the bundle sends no ACAO, so a CORS
+        // (crossorigin) load would FAIL. Keep them no-cors.
+        assert!(
+            !doc.contains("crossorigin"),
+            "bundle subresources load no-cors (CORP), never crossorigin/CORS"
+        );
+    }
+
+    #[test]
+    fn srcdoc_runs_mermaid_and_katex_after_each_body_swap() {
+        let doc = render_srcdoc(STATIC, ASSET, "n0nce");
+        // After innerHTML swap the bootstrap drives the render libs.
+        assert!(doc.contains("mermaid.run"), "must invoke mermaid.run");
+        assert!(doc.contains("katex.render"), "must invoke katex.render");
+        // Re-runs on every swap (renderRich is called from render()).
+        assert!(doc.contains("renderRich"));
+        // Targets the markup the renderer emits: pre.mermaid + <math-renderer>.
+        assert!(doc.contains("pre.mermaid"));
+        assert!(doc.contains("math-renderer"));
+        // The document is scoped with the github-markdown `.markdown-body` class.
+        assert!(doc.contains(r#"id="doc" class="markdown-body""#));
+        // The chrome + syntect highlight CSS is inlined in a plain <style> (no
+        // nonce: style-src is 'unsafe-inline' so the body's inline style ATTRIBUTES
+        // — mermaid fills, KaTeX spacing — also apply; a style nonce would block them).
+        assert!(doc.contains("<style>"));
+        assert!(!doc.contains("<style nonce"), "style carries no nonce");
+        assert!(
+            doc.contains(".hl-") || doc.contains("copy-btn"),
+            "inlined document CSS (syntax/chrome) must be present"
+        );
+        // Inlining the CSS does NOT loosen the renderer CSP: still zero-egress.
+        assert!(doc.contains("connect-src 'none'"));
+    }
+
+    #[test]
+    fn document_css_extracts_chrome_and_syntax_css() {
+        let css = document_css();
+        assert!(!css.is_empty(), "document CSS must be extracted from render_page");
+        // It carries the chrome + syntax rules but NO CDN <link>/import refs.
+        assert!(css.contains("markdown-body") || css.contains("copy-btn"));
+        assert!(!css.contains("cdn"), "inlined CSS must carry no CDN refs");
+    }
+
+    #[test]
+    fn srcdoc_uses_the_passed_in_shell_nonce_verbatim() {
+        // The srcdoc no longer mints its own nonce: it must use the SHELL nonce the
+        // caller passes (so it satisfies the inherited shell CSP). Same nonce in =>
+        // identical docs; different nonces => different docs (and each appears).
+        let a = render_srcdoc(STATIC, ASSET, "AAAA1111");
+        let a2 = render_srcdoc(STATIC, ASSET, "AAAA1111");
+        let b = render_srcdoc(STATIC, ASSET, "BBBB2222");
+        assert_eq!(a, a2, "deterministic in the nonce — no internal minting");
         assert_ne!(a, b);
+        assert!(a.contains("AAAA1111") && !a.contains("BBBB2222"));
+        assert!(b.contains("BBBB2222") && !b.contains("AAAA1111"));
     }
 
     #[test]
