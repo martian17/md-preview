@@ -55,7 +55,7 @@ yrs-v2-collab = ["doc-core/yrs-v2-collab"]
 # Pure Markdown renderer, now its own canonical public repo. Re-exported
 # from `lib.rs`; carries no web/async/CRDT deps (pulldown-cmark + syntect live
 # there now), so `--no-default-features` still drops the whole daemon stack.
-md-render = { git = "https://github.com/hibiki-automatic/md-render", rev = "c65471509e0f3ca9fa73fb98385a56df974b8358" }
+md-render = { git = "https://github.com/hibiki-automatic/md-render", rev = "b924996d0235c24d38df61f18565f9ef4e8850e0" }
 # Web-free document/CRDT kernel (ADR-0008 Phase 1): the CRDT doc model, diff,
 # session + UB validator, the pure collab wire codec, and the `FilePeer` bridge.
 # Carries yrs/similar/notify but ZERO web/async deps, so `--no-default-features`

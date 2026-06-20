@@ -857,7 +857,7 @@ dependencies = [
 [[package]]
 name = "md-render"
 version = "0.1.0"
-source = "git+https://github.com/hibiki-automatic/md-render?rev=c65471509e0f3ca9fa73fb98385a56df974b8358#c65471509e0f3ca9fa73fb98385a56df974b8358"
+source = "git+https://github.com/hibiki-automatic/md-render?rev=b924996d0235c24d38df61f18565f9ef4e8850e0#b924996d0235c24d38df61f18565f9ef4e8850e0"
 dependencies = [
  "pulldown-cmark",
  "syntect",

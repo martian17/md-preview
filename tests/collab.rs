@@ -52,7 +52,7 @@ fn free_port() -> u16 {
 async fn spawn_daemon(file: PathBuf, addr: SocketAddr) {
     tokio::spawn(async move {
         // `serve` runs until the process ends; the test task is detached.
-        let _ = md_preview::server::serve(&file, addr).await;
+        let _ = md_preview::server::serve(&file, addr, true).await;
     });
 
     // Wait for liveness via /healthz so the WS connect below doesn't race the bind.

@@ -19,6 +19,7 @@ fn main() {
     let mut no_open = std::env::var_os("MD_PREVIEW_NO_OPEN").is_some();
     let mut warm_cache = false;
     let mut daemon_flag = false;
+    let mut edit_mode = false;
 
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
@@ -29,10 +30,11 @@ fn main() {
             // is first run.  The election still applies — if another instance is
             // already running this becomes a no-op client and exits cleanly.
             "--daemon" => daemon_flag = true,
+            "--edit" => edit_mode = true,
             "-h" | "--help" => {
-                eprintln!("Usage: md-preview <file.md> [--no-open]");
+                eprintln!("Usage: md-preview <file.md> [--no-open] [--edit]");
                 eprintln!("       md-preview --warm-cache");
-                eprintln!("       md-preview --daemon");
+                eprintln!("       md-preview --daemon [--edit]");
                 eprintln!();
                 eprintln!("md-preview <file.md> opens a live preview in your browser. The");
                 eprintln!("first invocation auto-spawns a detached background daemon, then");
@@ -43,6 +45,10 @@ fn main() {
                 eprintln!("  --warm-cache  pre-fetch + verify all pinned bundle assets, exit.");
                 eprintln!("  --daemon      run the daemon in the foreground (for the systemd");
                 eprintln!("                user unit). Exits cleanly if one is already running.");
+                eprintln!("  --edit        enable the collaborative editor routes (/edit and");
+                eprintln!("                /collab). Without --edit the daemon starts in");
+                eprintln!("                read-only mode (the view-switcher preview pane");
+                eprintln!("                works, but the editor is disabled).");
                 eprintln!();
                 eprintln!("Environment:");
                 eprintln!("  BROWSER   opener command (instead of the system default). Setting");
@@ -95,7 +101,11 @@ fn main() {
     if daemon_flag && file.is_none() {
         match md_preview::control::bind_or_detect() {
             Ok(md_preview::control::Election::Client(_handle)) => {
-                // Another daemon instance is already running — nothing to do.
+                // Another daemon instance is already running.
+                if edit_mode {
+                    eprintln!("A read-only daemon is already running. Stop it first (kill the md-preview --daemon process) and re-run with --edit to enable editable mode.");
+                    std::process::exit(1);
+                }
                 return;
             }
             Ok(md_preview::control::Election::Daemon(ctrl_listener)) => {
@@ -107,7 +117,7 @@ fn main() {
                     }
                 };
                 let code = rt.block_on(async move {
-                    match md_preview::server::serve_daemon_only(ctrl_listener).await {
+                    match md_preview::server::serve_daemon_only(ctrl_listener, edit_mode).await {
                         Ok(()) => ExitCode::SUCCESS,
                         Err(e) => {
                             eprintln!("Server error: {e}");
@@ -159,7 +169,7 @@ fn main() {
         root,
     };
 
-    let handle = match connect_or_spawn_daemon() {
+    let handle = match connect_or_spawn_daemon(edit_mode) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("Could not reach or start the md-preview daemon: {e}");
@@ -204,7 +214,7 @@ fn main() {
 /// has exactly one winner; the loser's `--daemon` becomes a no-op client and
 /// exits, and both `<file>` callers just connect to the survivor.
 #[cfg(feature = "daemon")]
-fn connect_or_spawn_daemon() -> std::io::Result<md_preview::control::ClientHandle> {
+fn connect_or_spawn_daemon(edit_mode: bool) -> std::io::Result<md_preview::control::ClientHandle> {
     use std::time::{Duration, Instant};
 
     // Fast path: a daemon is already up.
@@ -215,7 +225,7 @@ fn connect_or_spawn_daemon() -> std::io::Result<md_preview::control::ClientHandl
     }
 
     // No daemon yet — spawn one, detached.
-    spawn_detached_daemon()?;
+    spawn_detached_daemon(edit_mode)?;
 
     // Poll until the freshly-spawned daemon is accepting connections. A spawn
     // race or a stale-socket reclaim may add a beat, so we give it ~5s.
@@ -244,7 +254,7 @@ fn connect_or_spawn_daemon() -> std::io::Result<md_preview::control::ClientHandl
 /// state/cache dir (falling back to `/dev/null`) so it never ties up the
 /// terminal. We do not wait on the child — it lives independently.
 #[cfg(feature = "daemon")]
-fn spawn_detached_daemon() -> std::io::Result<()> {
+fn spawn_detached_daemon(edit_mode: bool) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -265,6 +275,9 @@ fn spawn_detached_daemon() -> std::io::Result<()> {
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);
+    if edit_mode {
+        cmd.arg("--edit");
+    }
 
     // SAFETY: `setsid()` is async-signal-safe and takes no arguments. We call it
     // in the forked child before exec to start a new session/process group; it

@@ -481,6 +481,7 @@ fn network_guard(ctx: &ReqContext) -> Option<warp::reply::Response> {
 /// origin so both origins share one capability store).
 fn routes(
     state: impl Into<Arc<AppState>>,
+    edit_mode: bool,
 ) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     let state = state.into();
 
@@ -584,14 +585,21 @@ fn routes(
 
     // GET /edit?path=<abs> -> full multi-user collaborative editor page. Confined
     // + FLOORED (audit MED-3): a non-world-readable file requires auth even just
-    // to load the editor shell.
+    // to load the editor shell. Gated by edit_mode: returns 403 in read-only mode.
     let edit_state = state.clone();
     let edit = warp::path("edit")
         .and(warp::path::end())
         .and(warp::get())
         .and(with_context(state.clone()))
         .and(warp::query::<PathQuery>())
-        .map(move |ctx: ReqContext, q: PathQuery| edit_page(&edit_state, &ctx, &q.path));
+        .map(move |ctx: ReqContext, q: PathQuery| {
+            use warp::http::StatusCode;
+            use warp::reply::Reply;
+            if !edit_mode {
+                return warp::reply::with_status("forbidden", StatusCode::FORBIDDEN).into_response();
+            }
+            edit_page(&edit_state, &ctx, &q.path)
+        });
 
     // GET /raw?path=<abs> -> the confined file's raw Markdown source (floored).
     let raw_state = state.clone();
@@ -634,6 +642,7 @@ fn routes(
 
     // GET /collab?path=<abs> -> binary y-websocket. FLOORED (audit HIGH-1)
     // exactly like /ws: the floor gate runs before the upgrade.
+    // Gated by edit_mode: returns 403 in read-only mode.
     let collab_state = state.clone();
     let collab_ws_route = warp::path("collab")
         .and(warp::path::end())
@@ -641,6 +650,11 @@ fn routes(
         .and(warp::query::<PathQuery>())
         .and(warp::ws())
         .map(move |ctx: ReqContext, q: PathQuery, ws: warp::ws::Ws| {
+            use warp::http::StatusCode;
+            use warp::reply::Reply;
+            if !edit_mode {
+                return warp::reply::with_status("forbidden", StatusCode::FORBIDDEN).into_response();
+            }
             collab_route(&collab_state, &ctx, q.path, ws)
         });
 
@@ -2018,7 +2032,7 @@ fn spawn_static_origin(shell_addr: SocketAddr, state: Arc<AppState>) {
 /// absolute path, the `path=` query). Entries are created lazily on first touch.
 ///
 /// Returns once the server stops. The caller owns the tokio runtime.
-pub async fn serve(file: &Path, addr: SocketAddr) -> std::io::Result<()> {
+pub async fn serve(file: &Path, addr: SocketAddr, edit_mode: bool) -> std::io::Result<()> {
     let abs = file.canonicalize()?;
 
     // Build the multi-root registry rooted at the user's $HOME (the recursion
@@ -2041,7 +2055,7 @@ pub async fn serve(file: &Path, addr: SocketAddr) -> std::io::Result<()> {
     // returned as an io::Result rather than causing a panic.  The bound address
     // is fixed (addr was already chosen by the caller), so we ignore the
     // returned SocketAddr.
-    let (_bound_addr, fut) = warp::serve(routes(state.clone()))
+    let (_bound_addr, fut) = warp::serve(routes(state.clone(), edit_mode))
         .try_bind_ephemeral(addr)
         .map_err(|e| {
             // Walk the error source chain to recover the io::Error kind
@@ -2084,6 +2098,7 @@ pub async fn serve(file: &Path, addr: SocketAddr) -> std::io::Result<()> {
 pub async fn serve_with_control(
     file: &Path,
     ctrl: std::os::unix::net::UnixListener,
+    edit_mode: bool,
 ) -> std::io::Result<()> {
     let abs = file.canonicalize()?;
 
@@ -2105,9 +2120,9 @@ pub async fn serve_with_control(
     let preferred: SocketAddr = ([127, 0, 0, 1], 7878).into();
     let ephemeral: SocketAddr = ([127, 0, 0, 1], 0).into();
 
-    let (bound_addr, fut) = warp::serve(routes(state.clone()))
+    let (bound_addr, fut) = warp::serve(routes(state.clone(), edit_mode))
         .try_bind_ephemeral(preferred)
-        .or_else(|_| warp::serve(routes(state.clone())).try_bind_ephemeral(ephemeral))
+        .or_else(|_| warp::serve(routes(state.clone(), edit_mode)).try_bind_ephemeral(ephemeral))
         .map_err(|e| {
             let kind = {
                 let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
@@ -2167,6 +2182,7 @@ pub async fn serve_with_control(
 /// any) so previously open tabs continue to work across restarts.
 pub async fn serve_daemon_only(
     ctrl: std::os::unix::net::UnixListener,
+    edit_mode: bool,
 ) -> std::io::Result<()> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -2181,9 +2197,9 @@ pub async fn serve_daemon_only(
     let preferred: SocketAddr = ([127, 0, 0, 1], 7878).into();
     let ephemeral: SocketAddr = ([127, 0, 0, 1], 0).into();
 
-    let (bound_addr, fut) = warp::serve(routes(state.clone()))
+    let (bound_addr, fut) = warp::serve(routes(state.clone(), edit_mode))
         .try_bind_ephemeral(preferred)
-        .or_else(|_| warp::serve(routes(state.clone())).try_bind_ephemeral(ephemeral))
+        .or_else(|_| warp::serve(routes(state.clone(), edit_mode)).try_bind_ephemeral(ephemeral))
         .map_err(|e| {
             let kind = {
                 let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
@@ -2830,7 +2846,7 @@ mod tests {
         // contained 403 sentinel page with no path echo.
         let dir = temp_dir("outside");
         let state = Arc::new(state_for(&dir));
-        let routes = routes(state);
+        let routes = routes(state, true);
         let resp = warp::test::request()
             .method("GET")
             .path("/outside")
@@ -3087,12 +3103,12 @@ mod tests {
 
         let state1 = state_for(&dir);
         let loopback: std::net::SocketAddr = ([127, 0, 0, 1], 0).into();
-        let (bound_addr, _fut1) = warp::serve(routes(state1))
+        let (bound_addr, _fut1) = warp::serve(routes(state1, true))
             .try_bind_ephemeral(loopback)
             .expect("first bind must succeed");
 
         let state2 = state_for(&dir);
-        let result = warp::serve(routes(state2))
+        let result = warp::serve(routes(state2, true))
             .try_bind_ephemeral(bound_addr)
             .map_err(|e| {
                 let kind = {

@@ -12,6 +12,7 @@ Features:
 - **Live reload** — saving the file (from any editor) re-renders the preview over a WebSocket, no manual refresh
 - **Built-in editor** — switch between *preview*, *split* (editor + preview), and *editor* views from an in-page toolbar; edits save straight back to the file
 - **Cross-file links & local images** — relative `.md` links open in the same live preview, and local images/assets render without a CDN
+- **Dual-mode daemon** — run in read-only mode (default) or enable the full editor with `--edit`; one mode per daemon lifetime, chosen at startup
 
 ## Usage
 
@@ -34,6 +35,7 @@ md-preview --daemon
 - `--no-open` — register the file and print the URL without opening a browser (also `MD_PREVIEW_NO_OPEN=1`).
 - `--warm-cache` — pre-fetch and verify all pinned bundle assets into the local cache, then exit. Run once after install if you want offline-first operation from the first preview.
 - `--daemon` — start the daemon in server mode (no document); used by the systemd user unit. If a daemon is already running this exits cleanly.
+- `--edit` — enable the collaborative editor routes (`/edit` and `/collab`). Without `--edit` the daemon starts in read-only mode (the view-switcher preview pane works, but the editor is disabled). If a read-only daemon is already running and `--edit` is requested, stop it first and re-run with `--edit`. Part of the mycelium ecosystem (ADR-0012 dual-mode single binary).
 - `BROWSER` — if set, used as the opener command instead of the system default. Setting `BROWSER=true` (or `BROWSER=/bin/true`) intentionally suppresses opening any browser — the daemon is still spawned and the preview is served, nothing is launched. Useful in CI/headless runs.
 
 ## How to run
