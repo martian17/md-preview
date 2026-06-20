@@ -241,6 +241,7 @@ dependencies = [
 [[package]]
 name = "doc-core"
 version = "0.1.0"
+source = "git+https://github.com/hibiki-automatic/doc-core?rev=1501e20e0903c9d8d88fe375902e3adccafacc63#1501e20e0903c9d8d88fe375902e3adccafacc63"
 dependencies = [
  "base64 0.22.1",
  "notify",
@@ -337,6 +338,7 @@ dependencies = [
 [[package]]
 name = "fs-confine"
 version = "0.1.0"
+source = "git+https://github.com/hibiki-automatic/fs-confine?rev=01eaa35bff8cb5f6fe999622595a02f8611947c6#01eaa35bff8cb5f6fe999622595a02f8611947c6"
 dependencies = [
  "libc",
 ]
@@ -855,6 +857,7 @@ dependencies = [
 [[package]]
 name = "md-render"
 version = "0.1.0"
+source = "git+https://github.com/hibiki-automatic/md-render?rev=c65471509e0f3ca9fa73fb98385a56df974b8358#c65471509e0f3ca9fa73fb98385a56df974b8358"
 dependencies = [
  "pulldown-cmark",
  "syntect",
