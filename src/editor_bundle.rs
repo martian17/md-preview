@@ -6,12 +6,13 @@
 //! is for supply-chain-pinned CDN assets that must stay out of git).
 //!
 //! ## Route
-//! `GET /editor-bundle/<filename>` — serves one of the five allowed files:
+//! `GET /editor-bundle/<filename>` — serves one of the six allowed files:
+//!   - `yjs.es.js`              — shared yjs instance (self-contained; the importmap anchor)
 //!   - `mycelium-editor.es.js`  — the thin ESM facade
-//!   - `index-CUCuSPF_.js`      — the main CodeMirror + yjs chunk (748 KB)
-//!   - `index-CX3OD3Gj.js`      — a secondary yCollab chunk (166 KB)
+//!   - `index-xTTurzIe.js`     — the main CodeMirror chunk (748 KB; no yjs inlined)
+//!   - `index-Xv-DOIsY.js`     — the yCollab/y-codemirror.next chunk (imports yjs via importmap)
 //!   - `preview-runtime.es.js`  — `enableMathCopyAsTex` export (1.3 KB)
-//!   - `crdt.es.js`             — offline CRDT companion (yjs + y-protocols + lib0)
+//!   - `crdt.es.js`             — offline CRDT companion (y-protocols + lib0; externalizes yjs)
 //!
 //! ## Security
 //! - **Strict allowlist**: only the five filenames above are served; any other
@@ -30,25 +31,34 @@
 //!   (Vite chunk hashes, e.g. `index-CUCuSPF_.js`), so `immutable` caching is
 //!   safe. On a binary upgrade, new hash → new URL → fresh fetch.
 
-/// The five allowed editor-bundle filenames and their embedded bytes.
+/// The six allowed editor-bundle filenames and their embedded bytes.
 /// `ALLOWLIST[i].0` is the exact filename the route must match; `.1` is the
 /// content (embedded at compile time via `include_bytes!`). Any request for
 /// a filename not in this table returns **404**.
 ///
 /// The filenames contain their Vite content-hash, so content cannot change
 /// under the same URL — the `immutable` cache directive is safe here.
+///
+/// `yjs.es.js` is the shared yjs instance anchor — the importmap maps the bare
+/// `"yjs"` specifier here so every `import * as Y from 'yjs'` resolves to the
+/// SAME module instance across all chunks, enabling instanceof checks in
+/// y-codemirror.next to pass correctly (true char-level CRDT, not LWW).
 static ALLOWLIST: &[(&str, &[u8])] = &[
+    (
+        "yjs.es.js",
+        include_bytes!("editor_bundle/yjs.es.js"),
+    ),
     (
         "mycelium-editor.es.js",
         include_bytes!("editor_bundle/mycelium-editor.es.js"),
     ),
     (
-        "index-CUCuSPF_.js",
-        include_bytes!("editor_bundle/index-CUCuSPF_.js"),
+        "index-xTTurzIe.js",
+        include_bytes!("editor_bundle/index-xTTurzIe.js"),
     ),
     (
-        "index-CX3OD3Gj.js",
-        include_bytes!("editor_bundle/index-CX3OD3Gj.js"),
+        "index-Xv-DOIsY.js",
+        include_bytes!("editor_bundle/index-Xv-DOIsY.js"),
     ),
     (
         "preview-runtime.es.js",
@@ -117,8 +127,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allowlist_has_exactly_five_entries() {
-        assert_eq!(ALLOWLIST.len(), 5);
+    fn allowlist_has_exactly_six_entries() {
+        assert_eq!(ALLOWLIST.len(), 6);
     }
 
     #[test]
@@ -143,7 +153,27 @@ mod tests {
         let bytes = lookup("mycelium-editor.es.js").unwrap();
         let text = std::str::from_utf8(bytes).expect("valid utf-8");
         // The facade imports from the sibling chunk.
-        assert!(text.contains("index-CUCuSPF_.js"), "facade must import main chunk");
+        assert!(text.contains("index-xTTurzIe.js"), "facade must import main chunk");
+    }
+
+    #[test]
+    fn yjs_bundle_is_present_and_nonempty() {
+        let bytes = lookup("yjs.es.js").unwrap();
+        assert!(!bytes.is_empty(), "yjs.es.js must be non-empty");
+        let text = std::str::from_utf8(bytes).expect("valid utf-8");
+        // The shared yjs bundle must export the core Y.Doc/Y.Text constructors.
+        assert!(text.contains("Doc") || text.contains("Y.Doc") || text.contains("YDoc"),
+            "yjs.es.js must contain Doc class");
+    }
+
+    #[test]
+    fn ycollab_chunk_imports_yjs_as_external() {
+        let bytes = lookup("index-Xv-DOIsY.js").unwrap();
+        let text = std::str::from_utf8(bytes).expect("valid utf-8");
+        // The yCollab chunk must import yjs as an external bare specifier.
+        // This is what the importmap resolves to the shared yjs instance.
+        assert!(text.contains("from \"yjs\"") || text.contains("from 'yjs'"),
+            "index-Xv-DOIsY.js must import yjs as external specifier");
     }
 
     #[test]

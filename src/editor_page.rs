@@ -14,41 +14,34 @@
 //!   editor scroll position to the preview pane in split view.
 //! - **Math-copy-as-TeX** — `enableMathCopyAsTex` is called on the preview div
 //!   after each preview refresh so copying KaTeX renders yields TeX source.
-//! - **CRDT** — The existing y-websocket wire protocol is kept. The offline
-//!   `crdt.es.js` companion bundle provides Y.Doc, Y.Text, y-protocols, and
-//!   lib0 encoding from the same node_modules tree as mycelium-editor, enabling
-//!   fully offline collaborative editing over `/collab?path=`.
+//! - **CRDT** — True char-level Y.Text CRDT via y-codemirror.next. The offline
+//!   `yjs.es.js` is the shared yjs instance anchor (served from `/editor-bundle/`).
+//!   An importmap maps the bare `"yjs"` specifier to this file so every chunk
+//!   resolves to the SAME module instance — `instanceof Y.Text` checks in
+//!   `y-codemirror.next` pass correctly. `crdt.es.js` provides y-protocols + lib0
+//!   for the `/collab` WebSocket wire protocol. `createMyceliumEditor` is called
+//!   with `yText:` (not `value:`) for native char-level binding.
 //!
-//! ## CRDT module-identity note (important for maintainers)
-//! mycelium-editor bundles yjs+y-codemirror.next internally. Ideally we would
-//! pass a Y.Text from `crdt.es.js`'s Y.Doc to `createMyceliumEditor`
-//! (`options.yText`) for fine-grained CRDT binding. However, because Vite
-//! bundles ALL deps into each output file (external: []), the yjs class in
-//! `crdt.es.js` and the yjs class inside `index-CUCuSPF_.js` are TWO separate
-//! runtime copies — `instanceof Y.Doc` checks in y-codemirror.next would fail
-//! across them. We therefore bind CRDT at the document level: the CollabProvider
-//! manages its own Y.Doc (from crdt.es.js), syncs with the `/collab` server,
-//! and calls `editor.setValue(yText.toString())` on remote updates while
-//! listening to `onChange` for local changes. This is equivalent in behavior to
-//! the previous esm.sh-based page (same last-write-wins document model) and
-//! preserves all the existing `/collab` server-side CRDT logic.
-//!
-//! To upgrade to fine-grained Y.Text binding in the future:
-//! 1. Add `externals: ['yjs']` to mycelium-editor's vite.config.ts and rebuild
-//!    (mycelium-editor would then import yjs at runtime from the importee's
-//!    context, sharing one instance).
-//! 2. Remove `crdt.es.js` and load yjs once from a shared module.
-//! (Logged in MORNING-NOTES.)
+//! ## CRDT module-identity (why importmap is required)
+//! mycelium-editor externalizes `'yjs'` (bare specifier) in its Vite build, and
+//! `crdt.es.js` does likewise. At runtime the importmap resolves both to the SAME
+//! URL (`/editor-bundle/yjs.es.js`), which the browser caches once. All instanceof
+//! checks across `index-Xv-DOIsY.js` (yCollab chunk) and `crdt.es.js` therefore
+//! see the same Y class — no dual-copy problem. This is what enables true
+//! char-level CRDT (not the previous last-write-wins document bridging).
 //!
 //! ## Security
 //! - The editor page has NO explicit CSP header set (same as before — the prior
 //!   `render_editor_page` from md-render also returned plain HTML with no CSP).
 //!   The edit route is daemon-gated (`edit_mode: true`) and localhost-only.
+//! - The importmap uses a nonce (same nonce as the module script) for forward-
+//!   compatibility with a future CSP hardening pass. The importmap maps only the
+//!   bare `"yjs"` specifier to a same-origin `/editor-bundle/yjs.es.js` path — no
+//!   external URLs, no CDN.
 //! - All JS is loaded from `type="module"` scripts pointing to `/editor-bundle/`
-//!   (same origin, no CDN). No importmap, no esm.sh.
-//! - The preview pane renders fetched HTML into `innerHTML` in the same document
-//!   (NOT sandboxed) — this is the EXISTING behavior, unchanged. The `/content`
-//!   endpoint that serves it is auth-floored and confinement-gated.
+//!   (same origin, no CDN). No esm.sh.
+//! - The preview pane uses a sandboxed srcdoc iframe (allow-scripts only, opaque
+//!   origin, connect-src 'none') — no COOP/COEP on the edit page itself.
 //! - No COOP/COEP headers are added (the edit page is not the render-isolation
 //!   shell). Changing that would require migrating preview to a sandboxed iframe,
 //!   which is a larger future refactor.
@@ -223,9 +216,14 @@ body {{
     </div>
 </div>
 
+<script type="importmap" nonce="{nonce}">
+{{"imports":{{"yjs":"/editor-bundle/yjs.es.js"}}}}
+</script>
 <script type="module" nonce="{nonce}">
 // Offline mycelium-editor page — NO CDN, NO external JS.
 // All JS loads from /editor-bundle/ (same-origin, binary-embedded).
+// The importmap above resolves bare 'yjs' to /editor-bundle/yjs.es.js
+// so mycelium-editor.es.js and crdt.es.js share ONE yjs instance (char-level CRDT).
 import {{
     createMyceliumEditor,
     myceliumCss,
@@ -233,8 +231,10 @@ import {{
     syncEditorPreviewScroll,
 }} from '/editor-bundle/mycelium-editor.es.js';
 
+// Y here comes from the importmap-resolved shared yjs (same instance as the editor).
+import * as Y from 'yjs';
+
 import {{
-    Y,
     syncProtocol,
     awarenessProtocol,
     encoding,
@@ -260,17 +260,14 @@ const path = {path_json};
     }}
 }})();
 
-// ── CRDT: ephemeral Y.Doc + custom CollabProvider ──────────────────────
-// The CollabProvider speaks the y-websocket wire protocol (MSG_SYNC=0,
-// MSG_AWARENESS=1), identical to the server's `collab_pump.rs` codec.
-// Y.Text "content" is the shared authoritative text; editor.getValue /
-// editor.setValue bridge it to the CodeMirror instance.
+// ── CRDT: shared Y.Doc + CollabProvider + native Y.Text binding ──────────
+// The importmap above pins 'yjs' to /editor-bundle/yjs.es.js so both
+// crdt.es.js and mycelium-editor's yCollab chunk share ONE Y class instance.
+// instanceof Y.Text checks in y-codemirror.next therefore pass, enabling
+// true char-level CRDT (not last-write-wins document bridging).
 //
-// Module-identity note: yjs is bundled inside both crdt.es.js AND the
-// mycelium-editor chunk (index-CUCuSPF_.js). These are two separate runtime
-// copies, so we CANNOT pass a Y.Text from crdt.es.js to createMyceliumEditor
-// (instanceof checks in y-codemirror.next would fail). We therefore sync at
-// the document level via onChange / setValue. See editor_page.rs module doc.
+// The CollabProvider speaks the y-websocket wire protocol (MSG_SYNC=0,
+// MSG_AWARENESS=1), identical to the server's collab_pump.rs codec.
 
 const CONTRACT_TEXT_NAME = 'content';
 const MSG_SYNC = 0;
@@ -388,39 +385,16 @@ class CollabProvider {{
     }}
 }}
 
-// ── Mount mycelium-editor ────────────────────────────────────────────────
+// ── Mount mycelium-editor in CRDT mode ──────────────────────────────────
+// yText: binds y-codemirror.next directly — char-level CRDT, not LWW.
+// The yCollab extension (loaded dynamically from index-Xv-DOIsY.js) receives
+// the SAME Y.Text instance from the shared yjs (via importmap), so instanceof
+// checks pass and concurrent edits merge character-by-character.
 const editorPane = document.getElementById('editor-pane');
-let applyingRemote = false; // guard: skip onChange when setValue is ours
 
 const editor = createMyceliumEditor(editorPane, {{
-    value: ytext.toString(), // initial (empty until sync completes)
+    yText: ytext,    // true char-level CRDT binding via y-codemirror.next
     readOnly: false,
-    onChange: (newValue) => {{
-        // Push local keystrokes into the Y.Text so the CollabProvider picks
-        // them up via doc.on('update') and forwards to the server.
-        if (applyingRemote) return;
-        const current = ytext.toString();
-        if (newValue === current) return;
-        // Apply as a single Y.Text delta (insert/delete) so the CRDT
-        // integrates correctly even if a concurrent remote update arrives.
-        ydoc.transact(() => {{
-            ytext.delete(0, current.length);
-            ytext.insert(0, newValue);
-        }}, editor); // origin = editor so doc.on('update') skips the echo
-    }},
-}});
-
-// ── Sync Y.Text remote updates → editor ──────────────────────────────────
-ytext.observe((event, transaction) => {{
-    if (transaction.origin === editor) return; // our own keystrokes
-    const newValue = ytext.toString();
-    if (newValue === editor.getValue()) return;
-    applyingRemote = true;
-    try {{
-        editor.setValue(newValue);
-    }} finally {{
-        applyingRemote = false;
-    }}
 }});
 
 // ── CollabProvider wiring ────────────────────────────────────────────────
@@ -610,12 +584,39 @@ mod tests {
     }
 
     #[test]
-    fn no_esm_sh_importmap_anywhere() {
+    fn no_esm_sh_no_cdn() {
         let p = page();
-        // The entire point of this refactor: no CDN importmap.
+        // No CDN importmap — esm.sh is gone.
         assert!(!p.contains("esm.sh"), "must NOT reference esm.sh");
-        assert!(!p.contains("type=\"importmap\""), "must NOT use importmap");
-        assert!(!p.contains("importmap"), "must NOT use importmap at all");
+        // No external CDN sources.
+        assert!(!p.contains("cdn.jsdelivr"), "must NOT reference jsdelivr");
+        assert!(!p.contains("unpkg.com"), "must NOT reference unpkg");
+    }
+
+    #[test]
+    fn importmap_maps_yjs_to_same_origin_bundle() {
+        let p = page();
+        // A same-origin importmap IS present (maps bare 'yjs' to /editor-bundle/yjs.es.js).
+        assert!(p.contains("type=\"importmap\""), "must have importmap for yjs");
+        assert!(p.contains("/editor-bundle/yjs.es.js"),
+            "importmap must point yjs to /editor-bundle/yjs.es.js");
+        // The importmap must be nonce'd (forward-compatible with CSP).
+        assert!(p.contains("nonce="), "importmap must carry a nonce attr");
+        // No external URLs in the importmap.
+        assert!(!p.contains("https://"), "importmap must NOT reference external URLs");
+    }
+
+    #[test]
+    fn editor_uses_ytext_crdt_mode() {
+        let p = page();
+        // Editor is mounted with yText: (char-level CRDT), not value: (LWW).
+        assert!(p.contains("yText: ytext"), "must pass yText to createMyceliumEditor");
+        // Must NOT fall back to onChange/setValue LWW bridge.
+        assert!(!p.contains("onChange:"), "must NOT use onChange LWW bridge");
+        assert!(!p.contains("editor.setValue("), "must NOT use setValue LWW bridge");
+        // Y is imported directly from importmap-resolved yjs.
+        assert!(p.contains("import * as Y from 'yjs'"),
+            "must import Y from importmap-resolved yjs");
     }
 
     #[test]
@@ -626,6 +627,8 @@ mod tests {
             "must import mycelium-editor from /editor-bundle/");
         assert!(p.contains("/editor-bundle/crdt.es.js"),
             "must import CRDT companion from /editor-bundle/");
+        assert!(p.contains("/editor-bundle/yjs.es.js"),
+            "must reference shared yjs from /editor-bundle/");
         // No external URL patterns.
         assert!(!p.contains("cdn.jsdelivr"), "must NOT reference jsdelivr CDN");
     }

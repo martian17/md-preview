@@ -185,11 +185,17 @@ async function main() {
 
     if (status === 200) {
       const html = await page.content();
-      // Check: no importmap, no esm.sh
-      if (!html.includes('importmap') && !html.includes('esm.sh')) {
-        pass('Edit page HTML contains no importmap / esm.sh CDN reference');
+      // Check: no esm.sh CDN reference; importmap IS present (same-origin yjs only)
+      if (!html.includes('esm.sh')) {
+        pass('Edit page HTML contains no esm.sh CDN reference');
       } else {
-        fail('Edit page HTML still contains importmap or esm.sh reference!');
+        fail('Edit page HTML still contains esm.sh CDN reference!');
+      }
+      // Importmap is expected (maps yjs to /editor-bundle/yjs.es.js — same-origin)
+      if (html.includes('type="importmap"') && html.includes('/editor-bundle/yjs.es.js')) {
+        pass('Edit page has same-origin importmap for shared yjs (char-level CRDT)');
+      } else {
+        fail('Edit page missing importmap or yjs.es.js reference!');
       }
       // Check: editor-bundle imports
       if (html.includes('/editor-bundle/mycelium-editor.es.js')) {
