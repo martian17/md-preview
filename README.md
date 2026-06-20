@@ -1,3 +1,5 @@
+[![CI](https://github.com/martian17/md-preview/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/martian17/md-preview/actions/workflows/ci.yml)
+
 # md-preview
 
 A dead simple Markdown preview command-line tool. Renders a `.md` file to GitHub-flavored HTML and serves a **live preview** in your browser — the page re-renders instantly whenever the file changes on disk (or in the built-in editor). The server keeps running until you stop it (Ctrl-C).
