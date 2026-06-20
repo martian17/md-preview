@@ -385,6 +385,12 @@ struct ReqContext {
     origin: Option<String>,
     /// The `Sec-Fetch-Site` header value (cross-site guard input).
     sec_fetch_site: Option<String>,
+    /// The `Sec-Fetch-Mode` header value. With [`Self::sec_fetch_dest`] this lets
+    /// the guard exempt top-level document navigations (the bootstrap PRG landing
+    /// on `GET /view` arrives `mode=navigate, dest=document`, cross-site).
+    sec_fetch_mode: Option<String>,
+    /// The `Sec-Fetch-Dest` header value (top-level-navigation carve-out input).
+    sec_fetch_dest: Option<String>,
     /// Whether the request carried a valid (renewed) session cookie — the
     /// permission-floor capability. `true` unlocks the user's non-world-readable
     /// docs; `false` limits the request to world-readable files.
@@ -401,11 +407,15 @@ fn with_context(
     warp::header::optional::<String>("host")
         .and(warp::header::optional::<String>("origin"))
         .and(warp::header::optional::<String>("sec-fetch-site"))
+        .and(warp::header::optional::<String>("sec-fetch-mode"))
+        .and(warp::header::optional::<String>("sec-fetch-dest"))
         .and(warp::header::optional::<String>("cookie"))
         .map(
             move |host: Option<String>,
                   origin: Option<String>,
                   sec_fetch_site: Option<String>,
+                  sec_fetch_mode: Option<String>,
+                  sec_fetch_dest: Option<String>,
                   cookie: Option<String>| {
                 // Session extraction: parse the cookie, validate + renew. The
                 // Mutex is taken synchronously and dropped before this map
@@ -426,6 +436,8 @@ fn with_context(
                     host,
                     origin,
                     sec_fetch_site,
+                    sec_fetch_mode,
+                    sec_fetch_dest,
                     authenticated,
                 }
             },
@@ -446,9 +458,14 @@ fn network_guard(ctx: &ReqContext) -> Option<warp::reply::Response> {
             warp::reply::with_status("forbidden", StatusCode::FORBIDDEN).into_response(),
         );
     }
-    // origin_guard: cross-origin / cross-site is rejected.
-    if auth::origin_allowed(ctx.origin.as_deref(), ctx.sec_fetch_site.as_deref())
-        == auth::OriginCheck::Deny
+    // origin_guard: cross-origin / cross-site is rejected, EXCEPT a top-level
+    // document navigation (the bootstrap PRG landing on `GET /view`).
+    if auth::origin_allowed(
+        ctx.origin.as_deref(),
+        ctx.sec_fetch_site.as_deref(),
+        ctx.sec_fetch_mode.as_deref(),
+        ctx.sec_fetch_dest.as_deref(),
+    ) == auth::OriginCheck::Deny
     {
         return Some(
             warp::reply::with_status("forbidden", StatusCode::FORBIDDEN).into_response(),
@@ -497,9 +514,11 @@ fn routes(
             .into_response()
         });
 
-    // POST /claim (body = the bootstrap nonce) -> consume the nonce, issue a
-    // session, Set-Cookie. Origin-EXEMPT per design §2 (the bootstrap file:// page
-    // POSTs with `Origin: null`), but still host-guarded. See `claim`.
+    // POST /claim (urlencoded form: nonce + next) -> consume the nonce, issue a
+    // session, Set-Cookie, and 302 → `next` (PRG). A FORM POST is a navigation,
+    // not a fetch, so the `file://` bootstrap page (Origin: null) reaches it
+    // without CORS. Origin-EXEMPT per design §2 (nonce-gated), but still
+    // host-guarded. See `claim`.
     let claim_state = state.clone();
     let claim = warp::path("claim")
         .and(warp::path::end())
@@ -921,16 +940,26 @@ fn edit_page(state: &AppState, ctx: &ReqContext, requested: &str) -> warp::reply
 // /claim — consume a bootstrap nonce → issue a session (design §2, step 4)
 // ---------------------------------------------------------------------------
 
-/// `POST /claim` (body = the bootstrap nonce): consume the single-use nonce via
-/// the [`NonceStore`], issue a fresh session, and reply `204` with a
-/// `Set-Cookie` carrying the session token (`HttpOnly; SameSite=Strict; Path=/`,
-/// `secure=false` for loopback).
+/// `POST /claim` (urlencoded form `nonce=…&next=…`): consume the single-use
+/// nonce via the [`NonceStore`], issue a fresh session, `Set-Cookie` the session
+/// token (`HttpOnly; SameSite=Strict; Path=/`, `secure=false` for loopback), and
+/// reply `302 Location: <next>` — Post/Redirect/Get, so the browser lands on a
+/// clean, reload-safe `GET /view`.
 ///
-/// **Origin-EXEMPT by design:** the bootstrap `file://` page POSTs with
-/// `Origin: null`, so we do NOT run the origin guard here (it is the one route
-/// that legitimately crosses origins). We DO still enforce the `Host` allowlist
+/// The bootstrap page submits this as a **form POST** (a navigation, not a
+/// `fetch`) precisely so a `file://` page (`Origin: null`) can reach the loopback
+/// daemon without CORS — a cross-origin `fetch` from `file://` is blocked.
+///
+/// **Origin-EXEMPT by design:** the request arrives with `Origin: null` (or
+/// none), so we do NOT run the origin guard here (it is the one route that
+/// legitimately crosses origins). We DO still enforce the `Host` allowlist
 /// (DNS-rebinding defense). The nonce is short-TTL + single-use + high-entropy,
 /// so an attacker who cannot read the `0600` bootstrap file cannot forge it.
+///
+/// **Open-redirect guard:** `next` is only honored if it is a local same-origin
+/// path (starts with a single `/`, not `//…`, no scheme/host/backslash). An
+/// unsafe or absent `next` falls back to `/` — `next` is never reflected as a
+/// `Location` without passing [`safe_next_path`].
 fn claim(state: &AppState, host: Option<&str>, body: &[u8]) -> warp::reply::Response {
     use warp::http::StatusCode;
     use warp::reply::Reply;
@@ -940,10 +969,12 @@ fn claim(state: &AppState, host: Option<&str>, body: &[u8]) -> warp::reply::Resp
         return warp::reply::with_status("forbidden", StatusCode::FORBIDDEN).into_response();
     }
 
-    let nonce = match std::str::from_utf8(body) {
-        Ok(n) => n.trim(),
-        Err(_) => return warp::reply::with_status("", StatusCode::BAD_REQUEST).into_response(),
-    };
+    // Parse the urlencoded form body. We accept a single `nonce` field plus an
+    // optional `next`. (A bare-nonce body with no `=` is also tolerated for
+    // robustness, but the bootstrap always sends the form.)
+    let (nonce, next_raw) = parse_claim_form(body);
+    let nonce = nonce.unwrap_or_default();
+    let nonce = nonce.trim();
 
     // Consume (burn) the nonce in constant time. The Mutex is taken + released
     // synchronously (no await held).
@@ -972,14 +1003,115 @@ fn claim(state: &AppState, host: Option<&str>, body: &[u8]) -> warp::reply::Resp
         }
     };
 
+    // Open-redirect guard: only a local same-origin path is allowed; anything
+    // else falls back to a safe default.
+    let location = next_raw
+        .as_deref()
+        .and_then(safe_next_path)
+        .unwrap_or_else(|| "/".to_string());
+
     let max_age = auth::SESSION_TTL.as_secs();
     let cookie = auth::build_set_cookie(&token, state.auth.secure_cookies, Some(max_age));
-    warp::reply::with_header(
-        warp::reply::with_status("", StatusCode::NO_CONTENT),
+    let resp = warp::reply::with_header(
+        warp::reply::with_status("", StatusCode::FOUND),
         "set-cookie",
         cookie,
-    )
-    .into_response()
+    );
+    warp::reply::with_header(resp, "location", location).into_response()
+}
+
+/// Parse an `application/x-www-form-urlencoded` `/claim` body into
+/// `(nonce, next)`. Percent-decodes values and converts `+` to space. A body
+/// with no `=` is treated as a bare nonce (legacy/robustness). Unknown fields
+/// are ignored.
+fn parse_claim_form(body: &[u8]) -> (Option<String>, Option<String>) {
+    let s = match std::str::from_utf8(body) {
+        Ok(s) => s,
+        Err(_) => return (None, None),
+    };
+    // No `=` and no `&` → the whole body is a bare nonce.
+    if !s.contains('=') {
+        let t = s.trim();
+        return (
+            if t.is_empty() { None } else { Some(t.to_string()) },
+            None,
+        );
+    }
+    let mut nonce = None;
+    let mut next = None;
+    for pair in s.split('&') {
+        let (k, v) = match pair.split_once('=') {
+            Some(kv) => kv,
+            None => (pair, ""),
+        };
+        match k {
+            "nonce" => nonce = Some(form_urldecode(v)),
+            "next" => next = Some(form_urldecode(v)),
+            _ => {}
+        }
+    }
+    (nonce, next)
+}
+
+/// Decode one `application/x-www-form-urlencoded` component: `+` → space, and
+/// `%XX` → byte. Invalid UTF-8 in the result is replaced lossily; malformed `%`
+/// escapes are passed through literally (best-effort).
+fn form_urldecode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                match (hi, lo) {
+                    (Some(h), Some(l)) => {
+                        out.push((h * 16 + l) as u8);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Open-redirect guard for the `/claim` `next` parameter.
+///
+/// Returns `Some(path)` only when `next` is a **local same-origin path** safe to
+/// use verbatim as a `Location`: it must start with exactly one `/`, NOT be a
+/// scheme-relative `//host` URL, contain no scheme (`http:`, `javascript:`, …),
+/// no backslash (`/\evil` is a known browser-normalization bypass), and no
+/// control characters (CR/LF header-injection). Anything else → `None` (the
+/// caller falls back to a safe default), so an attacker-supplied `next` can never
+/// redirect off-origin.
+fn safe_next_path(next: &str) -> Option<String> {
+    // Must be a path-absolute reference: single leading slash, not `//`.
+    if !next.starts_with('/') || next.starts_with("//") {
+        return None;
+    }
+    // Reject backslashes (browsers treat `\` like `/`, so `/\evil.com` → host),
+    // control chars (header injection), and any `:` before the first `/` (a
+    // scheme like `/foo` can't have one, but be defensive about `/a:b`-style
+    // confusion is unnecessary — a leading `/` already forbids a scheme; we only
+    // need to bar control chars and backslashes).
+    if next.bytes().any(|b| b == b'\\' || b.is_ascii_control()) {
+        return None;
+    }
+    Some(next.to_string())
 }
 
 /// Mint a fresh bootstrap nonce (the daemon's control-plane side of §2 step 1).
@@ -2192,6 +2324,8 @@ mod tests {
             host: Some("127.0.0.1:7878".to_string()),
             origin: None,
             sec_fetch_site: Some("same-origin".to_string()),
+            sec_fetch_mode: None,
+            sec_fetch_dest: None,
             authenticated,
         }
     }
@@ -2403,6 +2537,34 @@ mod tests {
     }
 
     #[test]
+    fn network_guard_allows_top_level_navigation_landing() {
+        // The real bootstrap PRG landing on GET /view: cross-site + Origin: null
+        // but a top-level document navigation. The guard must NOT 403 it (this
+        // was the bug — the chair's Chrome 403'd here).
+        let mut nav = ctx(true);
+        nav.origin = Some("null".to_string());
+        nav.sec_fetch_site = Some("cross-site".to_string());
+        nav.sec_fetch_mode = Some("navigate".to_string());
+        nav.sec_fetch_dest = Some("document".to_string());
+        assert!(
+            network_guard(&nav).is_none(),
+            "top-level document navigation (PRG landing) must be allowed"
+        );
+
+        // But a cross-site CORS subresource fetch with the same null origin is
+        // still rejected — the carve-out is navigation-only.
+        let mut cors = ctx(true);
+        cors.origin = Some("null".to_string());
+        cors.sec_fetch_site = Some("cross-site".to_string());
+        cors.sec_fetch_mode = Some("cors".to_string());
+        cors.sec_fetch_dest = Some("empty".to_string());
+        assert!(
+            network_guard(&cors).is_some(),
+            "cross-site cors fetch must stay rejected"
+        );
+    }
+
+    #[test]
     fn read_routes_reject_cross_origin_before_floor() {
         let dir = temp_dir("xorigin");
         let pub_abs = write_mode(&dir, "p.md", "x", 0o644);
@@ -2419,20 +2581,33 @@ mod tests {
 
     // --- /claim: nonce -> session -> Set-Cookie ----------------------------
 
+    /// Build a urlencoded `/claim` form body.
+    fn claim_form(nonce: &str, next: &str) -> Vec<u8> {
+        // The values in our tests need no escaping beyond `/` which is form-safe.
+        format!("nonce={nonce}&next={next}").into_bytes()
+    }
+
     #[test]
-    fn claim_consumes_nonce_and_issues_session_cookie() {
+    fn claim_consumes_nonce_and_redirects_with_cookie() {
         let dir = temp_dir("claim");
         let state = state_for(&dir);
         // Arm a nonce (the control-plane side).
         let nonce = mint_claim_nonce(&state).expect("mint nonce");
+        let next = "/view?path=/tmp/x.md";
 
-        // A wrong nonce is rejected.
-        let bad = claim(&state, Some("127.0.0.1:7878"), b"not-the-nonce");
+        // A wrong nonce is rejected (403, no cookie).
+        let bad = claim(&state, Some("127.0.0.1:7878"), &claim_form("not-the-nonce", next));
         assert_eq!(bad.status(), warp::http::StatusCode::FORBIDDEN);
+        assert!(bad.headers().get("set-cookie").is_none());
 
-        // The right nonce yields a 204 + Set-Cookie carrying a session.
-        let ok = claim(&state, Some("127.0.0.1:7878"), nonce.as_bytes());
-        assert_eq!(ok.status(), warp::http::StatusCode::NO_CONTENT);
+        // The right nonce yields a 302 → next + Set-Cookie carrying a session.
+        let ok = claim(&state, Some("127.0.0.1:7878"), &claim_form(&nonce, next));
+        assert_eq!(ok.status(), warp::http::StatusCode::FOUND);
+        assert_eq!(
+            ok.headers().get("location").unwrap().to_str().unwrap(),
+            next,
+            "302 Location must echo the safe `next`"
+        );
         let set_cookie = ok
             .headers()
             .get("set-cookie")
@@ -2458,14 +2633,50 @@ mod tests {
             .unwrap()
             .validate_and_renew(&token));
 
-        // Single-use: replaying the burned nonce fails.
-        let replay = claim(&state, Some("127.0.0.1:7878"), nonce.as_bytes());
+        // Single-use: replaying the burned nonce fails (403, no cookie).
+        let replay = claim(&state, Some("127.0.0.1:7878"), &claim_form(&nonce, next));
         assert_eq!(replay.status(), warp::http::StatusCode::FORBIDDEN);
+        assert!(replay.headers().get("set-cookie").is_none());
 
         // /claim is host-guarded even though origin-exempt.
-        let bad_host = claim(&state, Some("evil.com"), nonce.as_bytes());
+        let bad_host = claim(&state, Some("evil.com"), &claim_form(&nonce, next));
         assert_eq!(bad_host.status(), warp::http::StatusCode::FORBIDDEN);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claim_open_redirect_guard_rejects_offorigin_next() {
+        let dir = temp_dir("claim-redirect");
+        let state = state_for(&dir);
+
+        // Each unsafe `next` must NOT be reflected; Location falls back to "/".
+        for bad in [
+            "//evil.com",
+            "https://evil",
+            "http://evil.com/x",
+            "/\\evil",            // backslash bypass
+            "javascript:alert(1)",
+            "evil",               // no leading slash
+            "/x\r\nSet-Cookie: y=z", // CRLF header injection
+        ] {
+            let nonce = mint_claim_nonce(&state).expect("mint");
+            let resp = claim(&state, Some("127.0.0.1:7878"), &claim_form(&nonce, bad));
+            assert_eq!(resp.status(), warp::http::StatusCode::FOUND);
+            let loc = resp.headers().get("location").unwrap().to_str().unwrap();
+            assert_eq!(loc, "/", "unsafe next `{bad}` must fall back to `/`, got `{loc}`");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn safe_next_path_unit() {
+        assert_eq!(safe_next_path("/view?path=/a"), Some("/view?path=/a".to_string()));
+        assert_eq!(safe_next_path("/"), Some("/".to_string()));
+        assert_eq!(safe_next_path("//evil.com"), None);
+        assert_eq!(safe_next_path("https://evil"), None);
+        assert_eq!(safe_next_path("/\\evil"), None);
+        assert_eq!(safe_next_path("evil"), None);
+        assert_eq!(safe_next_path("/x\r\ny"), None);
     }
 
     #[test]
@@ -2482,7 +2693,12 @@ mod tests {
 
         // Claim a session.
         let nonce = mint_claim_nonce(&state).unwrap();
-        let resp = claim(&state, Some("127.0.0.1:7878"), nonce.as_bytes());
+        let resp = claim(
+            &state,
+            Some("127.0.0.1:7878"),
+            &claim_form(&nonce, "/view?path=/x.md"),
+        );
+        assert_eq!(resp.status(), warp::http::StatusCode::FOUND);
         let sc = resp.headers().get("set-cookie").unwrap().to_str().unwrap();
         let token =
             auth::parse_session_cookie(sc.split(';').next().unwrap()).unwrap();

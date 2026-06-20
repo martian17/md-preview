@@ -308,40 +308,23 @@ fn daemon_log_target() -> Option<std::fs::File> {
 
 /// Write a `0600` bootstrap HTML file and open the browser at it.
 ///
-/// The bootstrap page auto-POSTs the nonce to `/claim` (never in argv or URL),
-/// receives a session cookie, then redirects to the real `/view?path=...` URL.
-/// Per ADR-0006: the nonce lives in a `0600` file inside the `0700` runtime dir;
-/// only the `file://` path (never the nonce) enters the browser's argv.
+/// The bootstrap page auto-SUBMITS a `POST` **form** to `/claim` (a navigation,
+/// not a `fetch` — so it is NOT subject to CORS, which blocks a `file://` page
+/// from cross-origin `fetch`ing the loopback daemon). `/claim` consumes the
+/// nonce, `Set-Cookie`s a session, and replies `302 Location: <next>` (PRG), so
+/// the browser lands on a clean, reload-safe authenticated `GET /view`.
+///
+/// Per ADR-0006: the nonce lives ONLY in the form body of the `0600` file inside
+/// the `0700` runtime dir — never in argv, never in a URL. Only the `file://`
+/// path (never the nonce) enters the browser's argv. `next` is the
+/// `/view?path=…` *path* (not secret) and is open-redirect-guarded server-side.
 #[cfg(feature = "daemon")]
 fn open_via_bootstrap(target_url: &str, nonce: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    // Build /claim URL from the target URL's origin.
-    let claim_url = {
-        let rest = target_url
-            .strip_prefix("http://")
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad scheme"))?;
-        let host_end = rest.find('/').unwrap_or(rest.len());
-        format!("http://{}/claim", &rest[..host_end])
-    };
-
-    // Auto-submitting script: POST nonce → get cookie → redirect to view.
-    let html = format!(
-        concat!(
-            "<!doctype html><html><head><meta charset=\"utf-8\">",
-            "<script>(function(){{",
-            "var n={nonce_json};var t={target_json};var c={claim_json};",
-            "fetch(c,{{method:'POST',headers:{{'Content-Type':'text/plain'}},body:n}})",
-            ".then(function(r){{window.location.replace(t);}},",
-            "function(e){{document.body.textContent='Error: '+e;}});",
-            "}})();</script>",
-            "</head><body>Authenticating\u{2026}</body></html>"
-        ),
-        nonce_json = json_lit(nonce),
-        target_json = json_lit(target_url),
-        claim_json = json_lit(&claim_url),
-    );
+    let html = bootstrap_html(target_url, nonce)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad scheme"))?;
 
     // Place bootstrap file inside the already-0700 control dir.
     let dir = md_preview::control::socket_path()
@@ -378,23 +361,62 @@ fn open_via_bootstrap(target_url: &str, nonce: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Produce a JSON string literal (with surrounding quotes) safe to embed in a
-/// `<script>`. Escapes `<`, `>`, `&`, `"`, `\`, and control chars.
+/// Build the `0600` bootstrap HTML: an auto-submitting **POST form** to `/claim`
+/// carrying the nonce + `next` in hidden fields. Returns `None` if `target_url`
+/// is not an `http://` URL.
+///
+/// This is a navigation (form submit), not a `fetch`, so a `file://` page
+/// (`Origin: null`) reaches the loopback daemon without tripping CORS. The nonce
+/// rides ONLY in the form body (never in argv/URL); `next` is the local
+/// `/view?path=…` path (open-redirect-guarded server-side). Values are
+/// HTML-attribute-escaped via [`attr_lit`].
 #[cfg(feature = "daemon")]
-fn json_lit(s: &str) -> String {
+fn bootstrap_html(target_url: &str, nonce: &str) -> Option<String> {
+    // Split the target URL into its origin (for the form `action`) and the
+    // local path+query (the `next` to redirect to after the claim).
+    let rest = target_url.strip_prefix("http://")?;
+    let host_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..host_end];
+    let path = &rest[host_end..]; // includes the leading '/', e.g. "/view?path=…"
+    let next_path = if path.is_empty() { "/" } else { path };
+    let claim_url = format!("http://{authority}/claim");
+
+    Some(format!(
+        concat!(
+            "<!doctype html><html><head><meta charset=\"utf-8\">",
+            "<meta name=\"referrer\" content=\"no-referrer\">",
+            "</head><body onload=\"document.forms[0].submit()\">",
+            "<form method=\"POST\" action={action} referrerpolicy=\"no-referrer\">",
+            "<input type=\"hidden\" name=\"nonce\" value={nonce}>",
+            "<input type=\"hidden\" name=\"next\" value={next}>",
+            "<noscript><button type=\"submit\">Authenticate\u{2026}</button></noscript>",
+            "</form>",
+            "Authenticating\u{2026}",
+            "</body></html>"
+        ),
+        action = attr_lit(&claim_url),
+        nonce = attr_lit(nonce),
+        next = attr_lit(next_path),
+    ))
+}
+
+/// Produce a double-quoted HTML **attribute** literal (with surrounding quotes)
+/// safe to embed as an attribute value. Escapes the five characters that could
+/// break out of (or confuse) a double-quoted attribute context: `"`, `<`, `>`,
+/// `&`, and `'` (and control chars defensively). The result is wrapped in `"…"`,
+/// so it is dropped straight into `name=<attr_lit(v)>` in the template.
+#[cfg(feature = "daemon")]
+fn attr_lit(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
         match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '<' => out.push_str("\\u003c"),
-            '>' => out.push_str("\\u003e"),
-            '&' => out.push_str("\\u0026"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            '"' => out.push_str("&quot;"),
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\'' => out.push_str("&#x27;"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("&#x{:x};", c as u32)),
             c => out.push(c),
         }
     }
@@ -420,5 +442,81 @@ fn main() {
             eprintln!("Failed to read {}: {e}", file.display());
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(all(test, feature = "daemon"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_html_is_a_post_form_with_nonce_in_body() {
+        let html = bootstrap_html(
+            "http://127.0.0.1:7878/view?path=/home/u/doc.md",
+            "NONCE-abc_123",
+        )
+        .expect("http url");
+
+        // It is a POST form to /claim — NOT a fetch (the CORS-broken path).
+        assert!(html.contains("method=\"POST\""), "must be a form POST: {html}");
+        assert!(
+            html.contains("action=\"http://127.0.0.1:7878/claim\""),
+            "form action must target /claim on the daemon origin: {html}"
+        );
+        assert!(!html.contains("fetch("), "must NOT use fetch(): {html}");
+        assert!(
+            html.contains("document.forms[0].submit()"),
+            "must auto-submit: {html}"
+        );
+
+        // The nonce rides in the form BODY (a hidden input), not a URL/argv.
+        assert!(
+            html.contains("name=\"nonce\" value=\"NONCE-abc_123\""),
+            "nonce must be a hidden form field: {html}"
+        );
+        // `next` is the local /view path, not the full URL.
+        assert!(
+            html.contains("name=\"next\" value=\"/view?path=/home/u/doc.md\""),
+            "next must be the local /view path: {html}"
+        );
+        // no-referrer keeps the file:// path out of the Referer header.
+        assert!(html.contains("content=\"no-referrer\""));
+    }
+
+    #[test]
+    fn bootstrap_html_escapes_attribute_values() {
+        // A nonce/path containing attribute-breaking characters must be escaped.
+        let html = bootstrap_html(
+            "http://127.0.0.1:7878/view?path=/a\"b<c>&d",
+            "x\"y<z>&w'",
+        )
+        .expect("http url");
+        // The raw breakout characters must not appear unescaped inside values.
+        assert!(html.contains("&quot;"), "double-quote escaped: {html}");
+        assert!(html.contains("&lt;") && html.contains("&gt;"), "angles escaped");
+        assert!(html.contains("&amp;"), "ampersand escaped");
+        assert!(html.contains("&#x27;"), "single-quote escaped");
+    }
+
+    #[test]
+    fn bootstrap_html_rejects_non_http() {
+        assert!(bootstrap_html("https://127.0.0.1/view", "n").is_none());
+        assert!(bootstrap_html("ftp://x", "n").is_none());
+    }
+
+    #[test]
+    fn bootstrap_html_root_when_no_path() {
+        let html = bootstrap_html("http://127.0.0.1:7878", "n").expect("http");
+        assert!(
+            html.contains("name=\"next\" value=\"/\""),
+            "bare origin → next defaults to /: {html}"
+        );
+    }
+
+    #[test]
+    fn attr_lit_wraps_and_escapes() {
+        assert_eq!(attr_lit("plain"), "\"plain\"");
+        assert_eq!(attr_lit("a\"b"), "\"a&quot;b\"");
+        assert_eq!(attr_lit("a&b"), "\"a&amp;b\"");
     }
 }

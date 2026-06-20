@@ -531,10 +531,21 @@ pub enum OriginCheck {
 
 /// `Origin` + `Sec-Fetch-*` checks (§2 "always-on network defenses").
 ///
-/// `origin` / `sec_fetch_site` are the corresponding header values, if present.
+/// `origin` / `sec_fetch_site` are the corresponding header values, if present;
+/// `sec_fetch_mode` / `sec_fetch_dest` carry the request's fetch *mode* and
+/// *destination* (for the top-level-navigation carve-out below).
 /// Policy:
-/// - A present `Sec-Fetch-Site` must be `same-origin` or `none`; `same-site` /
-///   `cross-site` → **Deny**.
+/// - **Top-level document navigation carve-out:** a request with
+///   `Sec-Fetch-Mode: navigate` **and** `Sec-Fetch-Dest: document` is a
+///   user-initiated *page* navigation (clicking a link, a form-POST landing, the
+///   bootstrap PRG redirect). These are not CSRF/data-exfiltration vectors — the
+///   browser is just rendering a top-level page — so they are **allowed** even
+///   when `Sec-Fetch-Site: cross-site` / `Origin: null`. This is exactly the
+///   `file://` bootstrap → `/claim`(302) → `GET /view` landing: Chrome marks that
+///   navigation `cross-site` because the chain began at `file://`. Subresource /
+///   CORS fetches (`mode: cors`/`no-cors`/etc.) get NO such exemption.
+/// - Otherwise a present `Sec-Fetch-Site` must be `same-origin` or `none`;
+///   `same-site` / `cross-site` → **Deny**.
 /// - A present `Origin` must be an allowed loopback origin (`http://127.0.0.1`
 ///   / `http://localhost`, optional port), else **Deny**.
 /// - A missing `Origin` is **allowed** (Origin-less GETs and `Origin: null`
@@ -547,7 +558,17 @@ pub enum OriginCheck {
 /// scheme is matched explicitly so a future `https`/WAN exposure is a
 /// deliberate edit, not an accident.
 #[must_use]
-pub fn origin_allowed(origin: Option<&str>, sec_fetch_site: Option<&str>) -> OriginCheck {
+pub fn origin_allowed(
+    origin: Option<&str>,
+    sec_fetch_site: Option<&str>,
+    sec_fetch_mode: Option<&str>,
+    sec_fetch_dest: Option<&str>,
+) -> OriginCheck {
+    // Top-level document navigation: allowed regardless of cross-site / null
+    // origin. A navigate+document request cannot be used as a CSRF data fetch.
+    if sec_fetch_mode == Some("navigate") && sec_fetch_dest == Some("document") {
+        return OriginCheck::Allow;
+    }
     if let Some(site) = sec_fetch_site {
         match site {
             "same-origin" | "none" => {}
@@ -956,18 +977,18 @@ mod tests {
 
     #[test]
     fn origin_check_same_origin_and_missing() {
-        assert_eq!(origin_allowed(None, None), OriginCheck::Allow);
+        assert_eq!(origin_allowed(None, None, None, None), OriginCheck::Allow);
         assert_eq!(
-            origin_allowed(Some("http://127.0.0.1:8080"), Some("same-origin")),
+            origin_allowed(Some("http://127.0.0.1:8080"), Some("same-origin"), None, None),
             OriginCheck::Allow
         );
         assert_eq!(
-            origin_allowed(Some("http://localhost:3000"), None),
+            origin_allowed(Some("http://localhost:3000"), None, None, None),
             OriginCheck::Allow
         );
         // null origin (bootstrap POST) allowed
         assert_eq!(
-            origin_allowed(Some("null"), Some("none")),
+            origin_allowed(Some("null"), Some("none"), None, None),
             OriginCheck::Allow
         );
     }
@@ -975,24 +996,60 @@ mod tests {
     #[test]
     fn origin_check_rejects_cross_origin() {
         assert_eq!(
-            origin_allowed(Some("http://evil.com"), None),
+            origin_allowed(Some("http://evil.com"), None, None, None),
             OriginCheck::Deny
         );
         assert_eq!(
-            origin_allowed(Some("https://127.0.0.1:8080"), None),
+            origin_allowed(Some("https://127.0.0.1:8080"), None, None, None),
             OriginCheck::Deny,
             "https scheme must be a deliberate edit, not auto-allowed"
         );
         // cross-site Sec-Fetch-Site rejected even with a good origin
         assert_eq!(
-            origin_allowed(Some("http://127.0.0.1:8080"), Some("cross-site")),
+            origin_allowed(Some("http://127.0.0.1:8080"), Some("cross-site"), None, None),
             OriginCheck::Deny
         );
-        assert_eq!(origin_allowed(None, Some("same-site")), OriginCheck::Deny);
+        assert_eq!(
+            origin_allowed(None, Some("same-site"), None, None),
+            OriginCheck::Deny
+        );
         // origin with a path is not a bare origin
         assert_eq!(
-            origin_allowed(Some("http://127.0.0.1:8080/evil"), None),
+            origin_allowed(Some("http://127.0.0.1:8080/evil"), None, None, None),
             OriginCheck::Deny
+        );
+        // cross-site is NOT exempt for a non-navigation (e.g. a cors subresource)
+        assert_eq!(
+            origin_allowed(Some("null"), Some("cross-site"), Some("cors"), Some("empty")),
+            OriginCheck::Deny,
+            "cross-site cors fetch must stay denied — only top-level navigations are exempt"
+        );
+        // navigate but NOT a document destination (e.g. iframe nav) → not exempt
+        assert_eq!(
+            origin_allowed(Some("null"), Some("cross-site"), Some("navigate"), Some("iframe")),
+            OriginCheck::Deny
+        );
+    }
+
+    #[test]
+    fn origin_check_allows_top_level_document_navigation() {
+        // The real bootstrap PRG landing: file:// → /claim(302) → GET /view.
+        // Chrome marks it cross-site + null origin, but it is a top-level
+        // document navigation, so it must be allowed.
+        assert_eq!(
+            origin_allowed(
+                Some("null"),
+                Some("cross-site"),
+                Some("navigate"),
+                Some("document")
+            ),
+            OriginCheck::Allow,
+            "top-level document navigation must be allowed even cross-site/null-origin"
+        );
+        // also for an absent origin
+        assert_eq!(
+            origin_allowed(None, Some("cross-site"), Some("navigate"), Some("document")),
+            OriginCheck::Allow
         );
     }
 
