@@ -658,6 +658,12 @@ fn routes(
             collab_route(&collab_state, &ctx, q.path, ws)
         });
 
+    // GET /editor-bundle/<filename> -> first-party offline mycelium-editor dist
+    // files, embedded in the binary. Same-origin, no CORS, strict allowlist.
+    // Served on the MAIN origin (not the secondary bundle/static origin) because
+    // the editor module scripts import them as same-origin `/editor-bundle/…` URLs.
+    let editor_bundle_route = crate::editor_bundle::editor_bundle_routes();
+
     health
         .or(outside)
         .or(claim)
@@ -670,6 +676,7 @@ fn routes(
         .or(save)
         .or(ws)
         .or(collab_ws_route)
+        .or(editor_bundle_route)
 }
 
 /// The `?path=<abs>` query the content routes accept. The value is an absolute
@@ -947,7 +954,10 @@ fn edit_page(state: &AppState, ctx: &ReqContext, requested: &str) -> warp::reply
         Err(deny) => return deny.into_response(),
     };
     let doc_id = path_id(&canon);
-    warp::reply::html(crate::render_editor_page(&doc_id)).into_response()
+    // Use the new offline editor page (mycelium-editor bundle, no CDN/importmap).
+    // The old `crate::render_editor_page` from md-render is no longer called for
+    // the daemon route; it remains re-exported for other callers/tests.
+    warp::reply::html(crate::editor_page::render(&doc_id)).into_response()
 }
 
 // ---------------------------------------------------------------------------

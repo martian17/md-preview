@@ -61,3 +61,10 @@ pub mod shell;
 pub mod bundle;
 #[cfg(feature = "daemon")]
 pub mod asset_origin;
+/// First-party editor bundle: mycelium-editor dist files embedded in the
+/// binary and served offline from `/editor-bundle/`.
+#[cfg(feature = "daemon")]
+pub mod editor_bundle;
+/// New editor page (uses mycelium-editor offline; replaces the old CDN page).
+#[cfg(feature = "daemon")]
+pub mod editor_page;
