@@ -2,7 +2,7 @@ var Kt = Object.defineProperty;
 var Zt = (e, t, n) => t in e ? Kt(e, t, { enumerable: !0, configurable: !0, writable: !0, value: n }) : e[t] = n;
 var M = (e, t, n) => Zt(e, typeof t != "symbol" ? t + "" : t, n);
 import * as u from "yjs";
-import { E as yt, V as rt, F as Et, A as wt, a as it, R as Qt, D as x, W as te } from "./index-xTTurzIe.js";
+import { E as yt, V as rt, F as Et, A as wt, a as it, R as Qt, D as x, W as te } from "./index-DM7jNAaR.js";
 class at {
   /**
    * @param {Y.RelativePosition} yanchor
@@ -1231,4 +1231,4 @@ export {
   I as ySyncFacet,
   bn as yUndoManagerKeymap
 };
-//# sourceMappingURL=index-Xv-DOIsY.js.map
+//# sourceMappingURL=index-DrfXmxbD.js.map

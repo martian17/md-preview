@@ -26,7 +26,7 @@
 //! mycelium-editor externalizes `'yjs'` (bare specifier) in its Vite build, and
 //! `crdt.es.js` does likewise. At runtime the importmap resolves both to the SAME
 //! URL (`/editor-bundle/yjs.es.js`), which the browser caches once. All instanceof
-//! checks across `index-Xv-DOIsY.js` (yCollab chunk) and `crdt.es.js` therefore
+//! checks across `index-DrfXmxbD.js` (yCollab chunk) and `crdt.es.js` therefore
 //! see the same Y class — no dual-copy problem. This is what enables true
 //! char-level CRDT (not the previous last-write-wins document bridging).
 //!
@@ -387,13 +387,14 @@ class CollabProvider {{
 
 // ── Mount mycelium-editor in CRDT mode ──────────────────────────────────
 // yText: binds y-codemirror.next directly — char-level CRDT, not LWW.
-// The yCollab extension (loaded dynamically from index-Xv-DOIsY.js) receives
+// The yCollab extension (loaded dynamically from index-DrfXmxbD.js) receives
 // the SAME Y.Text instance from the shared yjs (via importmap), so instanceof
 // checks pass and concurrent edits merge character-by-character.
 const editorPane = document.getElementById('editor-pane');
 
 const editor = createMyceliumEditor(editorPane, {{
     yText: ytext,    // true char-level CRDT binding via y-codemirror.next
+    awareness,       // pass awareness so y-codemirror.next renders remote carets
     readOnly: false,
 }});
 
@@ -658,6 +659,14 @@ mod tests {
     fn collab_provider_targets_collab_endpoint() {
         let p = page();
         assert!(p.contains("/collab?path="), "must connect to /collab?path=");
+    }
+
+    #[test]
+    fn awareness_passed_to_create_mycelium_editor() {
+        let p = page();
+        // awareness must be forwarded to createMyceliumEditor for remote cursor rendering
+        assert!(p.contains("awareness,") || p.contains("awareness: awareness"),
+            "must pass awareness to createMyceliumEditor");
     }
 
     #[test]

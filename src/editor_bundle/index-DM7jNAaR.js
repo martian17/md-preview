@@ -19301,7 +19301,7 @@ function yS(r, e, t) {
     const a = e.yText;
     (async () => {
       try {
-        const { yCollab: h } = await import("./index-Xv-DOIsY.js"), c = h(a, null);
+        const { yCollab: h } = await import("./index-DrfXmxbD.js"), c = h(a, e.awareness ?? null);
         o.dispatch({ effects: D.appendConfig.of(c) });
       } catch (h) {
         console.warn("y-codemirror.next not available:", h);
@@ -19420,4 +19420,4 @@ export {
   ZS as m,
   CS as s
 };
-//# sourceMappingURL=index-xTTurzIe.js.map
+//# sourceMappingURL=index-DM7jNAaR.js.map
