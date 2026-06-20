@@ -581,7 +581,7 @@ pub fn render_srcdoc(static_origin: &str, asset_origin: &str, nonce: &str) -> St
     if (!ann || !ann.textContent) return null;
     const tex = ann.textContent.trim();
     return (el.closest(".katex-display") !== null || el.getAttribute("data-display") === "true")
-      ? `$${{tex}}$$` : `${{tex}}$`;
+      ? ("$$" + tex + "$$") : ("$" + tex + "$");
   }}
   function enableMathCopyAsTex(el) {{
     const handler = (ev) => {{
