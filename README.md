@@ -36,6 +36,43 @@ md-preview --daemon
 - `--daemon` — start the daemon in server mode (no document); used by the systemd user unit. If a daemon is already running this exits cleanly.
 - `BROWSER` — if set, used as the opener command instead of the system default (e.g. `BROWSER=/bin/true` opens nothing). Useful in CI/headless runs.
 
+## How to run
+
+The normal flow is a single command — point `md-preview` at a file and it does the rest:
+
+```bash
+md-preview path/to/file.md
+```
+
+The first such invocation elects itself the **daemon** and stays running; every later `md-preview <file>` is a **thin client** that reuses that one daemon (no second process, no "Address already in use"). The daemon keeps running until you stop it (Ctrl-C on the daemon, or the systemd user unit — installed separately by the operator).
+
+**Warm the bundle cache (optional, recommended once after install):**
+
+```bash
+md-preview --warm-cache
+```
+
+Pre-fetches and SHA-384-verifies the pinned Mermaid, KaTeX, KaTeX fonts, and `github-markdown-css` assets into `~/.cache/md-preview/` (respects `$XDG_CACHE_HOME`). After this, previews render fully offline. Without it the daemon fetches+verifies each asset lazily on first use.
+
+**Multiple project roots, one daemon:**
+
+```bash
+md-preview ~/projectA/docs/intro.md   # registers projectA's root, opens it
+md-preview ~/projectB/README.md       # same daemon now also serves projectB
+```
+
+The daemon holds a **multi-root registry**. Each `md-preview <file>` registers the file's project root (detected by walking ancestors for `.git`/`Cargo.toml`/etc., stopping before `$HOME`); any file under any registered root is then previewable. Roots persist across restarts with a 30-day sliding TTL.
+
+**Port model — loopback only, two ports:**
+
+- The daemon binds **`127.0.0.1` only** (never a routable address). It is never reachable off-host.
+- **Shell origin** — the trusted SPA (`/view`, `/content`, `/ws`, `/claim`, …): port **`7878`** by default, falling back to an OS-assigned ephemeral port if `7878` is busy.
+- **Secondary static origin** — bundle assets + short-TTL `/cap/<token>` capability URLs for document images, served cross-origin to the sandboxed render iframe: the shell port **+ 1** (`7879` by default), with the same ephemeral fallback.
+
+A strict `Host` allowlist (`127.0.0.1:<port>` / `localhost:<port>` only) guards both origins against DNS-rebinding; the CLI↔daemon control channel is a `0600` Unix socket under `$XDG_RUNTIME_DIR/md-preview/` (peer-uid checked), so no token ever touches argv or a URL.
+
+**Headless / CI:** add `--no-open` (or set `MD_PREVIEW_NO_OPEN=1`, or `BROWSER=/bin/true`) to register the file and print the preview URL without launching a browser.
+
 ## Installation
 
 ### Prerequisites
