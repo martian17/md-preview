@@ -101,6 +101,10 @@ pub fn render(rel_path: &str) -> String {
     // header so the nonce is advisory). We HTML-escape it for safe attr embedding.
     let _nonce = gen_nonce();
     let nonce = escape_html(&_nonce);
+    // JSON-escaped form of the nonce for embedding as a JS string literal in the
+    // module script (so the editor page can pass ?n=<nonce> to /srcdoc when
+    // mounting the sandboxed preview iframe, matching the shell pattern).
+    let nonce_json = json_string(&_nonce);
 
     format!(
         r#"<!DOCTYPE html>
@@ -165,13 +169,12 @@ body {{
     padding: 0; /* mycelium-editor fills its parent */
 }}
 #preview-pane {{
-    flex: 1; overflow: auto; padding: 16px; border-left: 1px solid rgba(128,128,128,.3);
+    flex: 1; overflow: hidden; padding: 0; border-left: 1px solid rgba(128,128,128,.3);
 }}
+/* preview iframe fills the pane; the srcdoc renderer owns its own scrolling */
+#preview-frame {{ display: block; border: 0; width: 100%; height: 100%; }}
 /* editor-pane must fill its container so CodeMirror stretches to full height */
 #editor-pane .cm-editor {{ flex: 1; height: 100%; }}
-.markdown-body {{
-    box-sizing: border-box; min-width: 200px; max-width: 860px; margin: 0 auto;
-}}
 /* View modes controlled by data-view on #panes */
 #panes[data-view="edit"] #preview-pane {{ display: none; }}
 #panes[data-view="preview"] #editor-pane {{ display: none; }}
@@ -209,7 +212,13 @@ body {{
     <div id="panes" data-view="split">
         <div id="editor-pane"></div>
         <div id="preview-pane">
-            <div id="preview-doc" class="markdown-body"></div>
+            <!-- The preview iframe is created/destroyed by refreshPreview() using the
+                 same sandboxed srcdoc render model as the read-only /view route.
+                 sandbox="allow-scripts" only (no allow-same-origin => null/opaque origin,
+                 connect-src 'none' in its own CSP => zero network egress).
+                 NOTE: the editor page has no COOP/COEP so the iframe is not process-
+                 isolated (Spectre backstop absent). Acceptable: loopback-only, edit-mode-
+                 gated. Isolation is still better than the former same-origin innerHTML. -->
         </div>
     </div>
 </div>
@@ -222,7 +231,6 @@ import {{
     myceliumCss,
     myceliumDarkCss,
     syncEditorPreviewScroll,
-    enableMathCopyAsTex,
 }} from '/editor-bundle/mycelium-editor.es.js';
 
 import {{
@@ -452,25 +460,64 @@ const btns = {{
 }};
 let scrollUnsub = null; // cleanup for syncEditorPreviewScroll
 
-const previewDocEl = document.getElementById('preview-doc');
-const previewPane  = document.getElementById('preview-pane');
+const previewPane = document.getElementById('preview-pane');
+
+// The editor page's CSP nonce (server-injected). Passed to /srcdoc so the
+// srcdoc's inline bootstrap carries the nonce its own <meta> CSP allows.
+// The editor page has no strict CSP header, so this is advisory; it is still
+// needed because /srcdoc embeds the nonce in its own renderer <meta> CSP.
+const EDITOR_NONCE = {nonce_json};
+
+// Per-mount preview state. Torn down and rebuilt on each refreshPreview() call
+// (same disposable-iframe pattern as the shell's mount()). The MessageChannel
+// port is the sole auth token between this page and its preview iframe.
+let previewFrame = null;
+let previewChannel = null;
+
+function teardownPreviewFrame() {{
+    if (previewChannel) {{ try {{ previewChannel.port1.close(); }} catch (e) {{}} previewChannel = null; }}
+    if (previewFrame && previewFrame.parentNode) previewFrame.parentNode.removeChild(previewFrame);
+    previewFrame = null;
+}}
 
 let previewFetching = false;
 async function refreshPreview() {{
     if (previewFetching) return;
     previewFetching = true;
     try {{
-        const resp = await fetch(
-            '/content?path=' + encodeURIComponent(path),
-            {{ credentials: 'same-origin' }},
-        );
-        if (resp.ok) {{
-            previewDocEl.innerHTML = await resp.text();
-            // Math-copy-as-TeX: let the user copy KaTeX output as TeX source.
-            enableMathCopyAsTex(previewDocEl);
-        }}
+        // Fetch the sandboxed renderer document and the rendered content in parallel.
+        const [srcdocResp, contentResp] = await Promise.all([
+            fetch('/srcdoc?n=' + encodeURIComponent(EDITOR_NONCE), {{ credentials: 'same-origin' }}),
+            fetch('/content?path=' + encodeURIComponent(path), {{ credentials: 'same-origin' }}),
+        ]);
+        if (!srcdocResp.ok || !contentResp.ok) return;
+        const [srcdoc, html] = await Promise.all([srcdocResp.text(), contentResp.text()]);
+
+        // Destroy the prior iframe + channel, then build a fresh sandboxed one.
+        teardownPreviewFrame();
+        previewChannel = new MessageChannel();
+        const frame = document.createElement('iframe');
+        frame.setAttribute('sandbox', 'allow-scripts');
+        frame.setAttribute('referrerpolicy', 'no-referrer');
+        frame.setAttribute('title', 'rendered preview');
+        frame.id = 'preview-frame';
+
+        // Transfer port2 to the iframe on load (once only — guard with latch).
+        let portSent = false;
+        frame.addEventListener('load', () => {{
+            if (!frame || !previewChannel || portSent) return;
+            portSent = true;
+            frame.contentWindow.postMessage({{ type: '__port' }}, '*', [previewChannel.port2]);
+            // Once the port is handed over, post the body HTML.
+            previewChannel.port1.postMessage({{ type: 'render', html }});
+        }});
+
+        // Set srcdoc BEFORE appending so the only load event is the real document.
+        frame.srcdoc = srcdoc;
+        previewFrame = frame;
+        previewPane.appendChild(frame);
     }} catch (e) {{
-        console.error('[editor-page] preview fetch error:', e);
+        console.error('[editor-page] preview refresh error:', e);
     }} finally {{
         previewFetching = false;
     }}
@@ -528,6 +575,7 @@ window.addEventListener('beforeunload', () => {{
     }}
     provider.destroy();
     if (scrollUnsub) {{ scrollUnsub(); scrollUnsub = null; }}
+    teardownPreviewFrame();
     editor.destroy();
 }});
 </script>
@@ -536,6 +584,7 @@ window.addEventListener('beforeunload', () => {{
         display_path = display_path,
         path_json = path_json,
         nonce = nonce,
+        nonce_json = nonce_json,
     )
 }
 
@@ -624,14 +673,23 @@ mod tests {
     fn preview_pane_is_present() {
         let p = page();
         assert!(p.contains("id=\"preview-pane\""), "must have preview pane");
-        assert!(p.contains("id=\"preview-doc\""), "must have preview doc div");
+        // The preview pane now embeds a sandboxed srcdoc iframe (not a plain div).
+        assert!(p.contains("id=\"preview-frame\"") || p.contains("preview-frame"),
+            "must reference the preview-frame iframe");
     }
 
     #[test]
-    fn enable_math_copy_is_called_on_preview() {
+    fn preview_pane_uses_sandboxed_iframe() {
         let p = page();
-        assert!(p.contains("enableMathCopyAsTex(previewDocEl)"),
-            "must call enableMathCopyAsTex on the preview div");
+        // The preview is now a sandboxed srcdoc iframe (same model as /view).
+        assert!(p.contains("sandbox"), "preview iframe must carry sandbox attribute");
+        assert!(p.contains("allow-scripts"), "sandbox must include allow-scripts");
+        assert!(p.contains("preview-frame"), "must have preview-frame element");
+        // The srcdoc is fetched from /srcdoc (same isolation model as the shell).
+        assert!(p.contains("/srcdoc"), "must fetch /srcdoc for the preview iframe");
+        // Math-copy is now handled inside the srcdoc bootstrap (not in this page).
+        assert!(!p.contains("enableMathCopyAsTex"),
+            "enableMathCopyAsTex must NOT be imported/called in the editor page (it lives in the srcdoc)");
     }
 
     #[test]

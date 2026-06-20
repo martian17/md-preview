@@ -560,6 +560,53 @@ pub fn render_srcdoc(static_origin: &str, asset_origin: &str, nonce: &str) -> St
 // possible from here.
 (() => {{
   "use strict";
+
+  // Math-copy-as-TeX: intercept copy events on `el` so that selecting a rendered
+  // KaTeX formula and pressing Ctrl-C/Cmd-C yields the original TeX source
+  // (`$…$` or `$$…$$`) rather than the visual Unicode approximation.
+  // Works inside a `sandbox="allow-scripts"` iframe: `clipboardData.setData` on
+  // the copy event is permitted by user-gesture without `clipboard-write`
+  // permission (the spec allows it in the copy event handler).
+  // Returns a cleanup function; call it before re-installing on each body swap.
+  function findKatexEl(node, root) {{
+    let t = node;
+    for (; t && t !== root; ) {{
+      if (t.nodeType === Node.ELEMENT_NODE && t.classList.contains("katex")) return t;
+      t = t.parentNode;
+    }}
+    return null;
+  }}
+  function extractTex(el) {{
+    const ann = el.querySelector('annotation[encoding="application/x-tex"]');
+    if (!ann || !ann.textContent) return null;
+    const tex = ann.textContent.trim();
+    return (el.closest(".katex-display") !== null || el.getAttribute("data-display") === "true")
+      ? `$${{tex}}$$` : `${{tex}}$`;
+  }}
+  function enableMathCopyAsTex(el) {{
+    const handler = (ev) => {{
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || !ev.clipboardData) return;
+      const range = sel.getRangeAt(0);
+      const frag = range.cloneContents();
+      let katexEls = Array.from(frag.querySelectorAll(".katex"));
+      if (katexEls.length === 0) {{
+        const found = findKatexEl(range.startContainer, el);
+        if (!found) return;
+        katexEls = [found];
+      }}
+      const parts = katexEls.map(extractTex).filter((t) => t !== null);
+      if (parts.length === 0) return;
+      ev.preventDefault();
+      ev.clipboardData.setData("text/plain", parts.join(" "));
+    }};
+    el.addEventListener("copy", handler);
+    return () => el.removeEventListener("copy", handler);
+  }}
+
+  // Per-render cleanup for the math-copy listener (prevents listener stacking).
+  let mathCopyCleanup = null;
+
   // The dedicated MessageChannel port to the parent. Until it arrives there is no
   // bus at all (and never any network). Reply ONLY over this port — never
   // event.origin ("null" for an opaque sandbox) and never a broadcast postMessage.
@@ -621,6 +668,9 @@ pub fn render_srcdoc(static_origin: &str, asset_origin: &str, nonce: &str) -> St
       docEl.innerHTML = msg.html;
       toParent({{ type: "rendered" }});         // ack -> cancels parent watchdog
       renderRich();
+      // Re-install math-copy on each body swap (KaTeX spans are fresh DOM nodes).
+      if (mathCopyCleanup) {{ mathCopyCleanup(); mathCopyCleanup = null; }}
+      mathCopyCleanup = enableMathCopyAsTex(docEl);
     }} catch (e) {{
       toParent({{ type: "error", message: String(e && e.message || e) }});
     }}
