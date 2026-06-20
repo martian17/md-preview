@@ -33,6 +33,20 @@ fn main() {
                 eprintln!("Usage: md-preview <file.md> [--no-open]");
                 eprintln!("       md-preview --warm-cache");
                 eprintln!("       md-preview --daemon");
+                eprintln!();
+                eprintln!("md-preview <file.md> opens a live preview in your browser. The");
+                eprintln!("first invocation auto-spawns a detached background daemon, then");
+                eprintln!("returns immediately; later invocations reuse that daemon.");
+                eprintln!();
+                eprintln!("  --no-open     register the file and print the URL; do not open a");
+                eprintln!("                browser (also via MD_PREVIEW_NO_OPEN=1).");
+                eprintln!("  --warm-cache  pre-fetch + verify all pinned bundle assets, exit.");
+                eprintln!("  --daemon      run the daemon in the foreground (for the systemd");
+                eprintln!("                user unit). Exits cleanly if one is already running.");
+                eprintln!();
+                eprintln!("Environment:");
+                eprintln!("  BROWSER   opener command (instead of the system default). Setting");
+                eprintln!("            BROWSER=true (or /bin/true) intentionally opens nothing.");
                 return;
             }
             other if file.is_none() && !other.starts_with('-') => {
@@ -135,67 +149,161 @@ fn main() {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/".to_string());
 
-    // Single-instance election: first invocation becomes the daemon; all later
-    // invocations are thin clients that delegate over the unix control socket.
-    match md_preview::control::bind_or_detect() {
-        Ok(md_preview::control::Election::Client(handle)) => {
-            let req = md_preview::control::Request::Open {
-                path: abs.to_string_lossy().into_owned(),
-                root,
-            };
-            match handle.send_request_blocking(&req) {
-                Ok(md_preview::control::Response::Opened { url, nonce }) => {
-                    if no_open {
-                        println!("Preview ready (headless): {url}");
-                    } else if let Err(e) = open_via_bootstrap(&url, &nonce) {
-                        eprintln!("Could not open browser: {e}");
-                        eprintln!("Open this URL in your browser: {url}");
-                    }
-                }
-                Ok(md_preview::control::Response::Error { message }) => {
-                    eprintln!("Daemon error: {message}");
-                    std::process::exit(1);
-                }
-                Ok(other) => {
-                    eprintln!("Unexpected daemon response: {other:?}");
-                    std::process::exit(1);
-                }
-                Err(e) => {
-                    eprintln!("Control channel error: {e}");
-                    std::process::exit(1);
-                }
+    // Auto-spawn is the default: the `<file>` path is ALWAYS a thin client. It
+    // never becomes the long-lived foreground daemon itself — it either connects
+    // to a running daemon, or spawns a DETACHED `md-preview --daemon` background
+    // process and then connects to that. Either way this process returns promptly
+    // and the terminal is freed.
+    let req = md_preview::control::Request::Open {
+        path: abs.to_string_lossy().into_owned(),
+        root,
+    };
+
+    let handle = match connect_or_spawn_daemon() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Could not reach or start the md-preview daemon: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match handle.send_request_blocking(&req) {
+        Ok(md_preview::control::Response::Opened { url, nonce }) => {
+            if no_open {
+                println!("Preview ready (headless): {url}");
+            } else if let Err(e) = open_via_bootstrap(&url, &nonce) {
+                eprintln!("Could not open browser: {e}");
+                eprintln!("Open this URL in your browser: {url}");
             }
         }
-        Ok(md_preview::control::Election::Daemon(ctrl_listener)) => {
-            // We are the daemon: spin up the server with the control accept loop.
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    eprintln!("Failed to start runtime: {e}");
-                    std::process::exit(1);
-                }
-            };
-
-            let code = rt.block_on(async move {
-                match md_preview::server::serve_with_control(&file, ctrl_listener).await {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) => {
-                        eprintln!("Server error: {e}");
-                        ExitCode::FAILURE
-                    }
-                }
-            });
-
-            std::process::exit(match code {
-                c if c == ExitCode::SUCCESS => 0,
-                _ => 1,
-            });
+        Ok(md_preview::control::Response::Error { message }) => {
+            eprintln!("Daemon error: {message}");
+            std::process::exit(1);
+        }
+        Ok(other) => {
+            eprintln!("Unexpected daemon response: {other:?}");
+            std::process::exit(1);
         }
         Err(e) => {
-            eprintln!("Control socket error: {e}");
+            eprintln!("Control channel error: {e}");
             std::process::exit(1);
         }
     }
+}
+
+/// Connect to a running daemon, or spawn a detached one and connect to it.
+///
+/// 1. If a daemon is already listening on the control socket, return a client
+///    handle to it immediately.
+/// 2. Otherwise spawn `md-preview --daemon` as a **detached background process**
+///    (new session via `setsid`, stdio redirected away from the terminal) and
+///    poll the control socket until it is connectable (bounded ~5s timeout).
+///
+/// The spawned daemon's own [`md_preview::control::bind_or_detect`] performs the
+/// single-instance election — so a spawn race (two `md-preview <file>` at once)
+/// has exactly one winner; the loser's `--daemon` becomes a no-op client and
+/// exits, and both `<file>` callers just connect to the survivor.
+#[cfg(feature = "daemon")]
+fn connect_or_spawn_daemon() -> std::io::Result<md_preview::control::ClientHandle> {
+    use std::time::{Duration, Instant};
+
+    // Fast path: a daemon is already up.
+    match md_preview::control::connect_client() {
+        Ok(Some(handle)) => return Ok(handle),
+        Ok(None) => {}
+        Err(e) => return Err(std::io::Error::other(e.to_string())),
+    }
+
+    // No daemon yet — spawn one, detached.
+    spawn_detached_daemon()?;
+
+    // Poll until the freshly-spawned daemon is accepting connections. A spawn
+    // race or a stale-socket reclaim may add a beat, so we give it ~5s.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match md_preview::control::connect_client() {
+            Ok(Some(handle)) => return Ok(handle),
+            Ok(None) => {}
+            Err(e) => return Err(std::io::Error::other(e.to_string())),
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for the spawned md-preview daemon to start listening",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Spawn `md-preview --daemon` as a fully detached background process.
+///
+/// Detach mechanism (POSIX): `pre_exec(setsid)` puts the child in a new session
+/// and process group so it survives the launching shell (no controlling TTY, not
+/// in our process group), and stdio is redirected to a daemon log file under the
+/// state/cache dir (falling back to `/dev/null`) so it never ties up the
+/// terminal. We do not wait on the child — it lives independently.
+#[cfg(feature = "daemon")]
+fn spawn_detached_daemon() -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe()?;
+
+    // Where to send the daemon's stdout/stderr. Prefer a log file under the
+    // cache dir so a crash leaves a breadcrumb; fall back to /dev/null.
+    let (out, err): (Stdio, Stdio) = match daemon_log_target() {
+        Some(file) => match file.try_clone() {
+            Ok(clone) => (Stdio::from(file), Stdio::from(clone)),
+            Err(_) => (Stdio::null(), Stdio::null()),
+        },
+        None => (Stdio::null(), Stdio::null()),
+    };
+
+    let mut cmd = Command::new(exe);
+    cmd.arg("--daemon")
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err);
+
+    // SAFETY: `setsid()` is async-signal-safe and takes no arguments. We call it
+    // in the forked child before exec to start a new session/process group; it
+    // touches no memory we own and only fails (harmlessly) if we are already a
+    // session leader, which the parent shell process is not.
+    unsafe {
+        cmd.pre_exec(|| {
+            // Detach from the controlling terminal / our process group.
+            if libc::setsid() == -1 {
+                // Already a group leader is fine; only surface real failures.
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EPERM) {
+                    return Err(e);
+                }
+            }
+            Ok(())
+        });
+    }
+
+    // Spawn and immediately drop the child handle — we do not wait on it.
+    let _child = cmd.spawn()?;
+    Ok(())
+}
+
+/// Open (creating if needed) the daemon log file under the cache/state dir.
+///
+/// Returns `None` (caller falls back to `/dev/null`) if no cache dir can be
+/// determined or the file cannot be opened — never fatal.
+#[cfg(feature = "daemon")]
+fn daemon_log_target() -> Option<std::fs::File> {
+    let dir = md_preview::bundle::default_cache_dir()?;
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("daemon.log"))
+        .ok()
 }
 
 /// Write a `0600` bootstrap HTML file and open the browser at it.

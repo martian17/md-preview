@@ -34,7 +34,7 @@ md-preview --daemon
 - `--no-open` — register the file and print the URL without opening a browser (also `MD_PREVIEW_NO_OPEN=1`).
 - `--warm-cache` — pre-fetch and verify all pinned bundle assets into the local cache, then exit. Run once after install if you want offline-first operation from the first preview.
 - `--daemon` — start the daemon in server mode (no document); used by the systemd user unit. If a daemon is already running this exits cleanly.
-- `BROWSER` — if set, used as the opener command instead of the system default (e.g. `BROWSER=/bin/true` opens nothing). Useful in CI/headless runs.
+- `BROWSER` — if set, used as the opener command instead of the system default. Setting `BROWSER=true` (or `BROWSER=/bin/true`) intentionally suppresses opening any browser — the daemon is still spawned and the preview is served, nothing is launched. Useful in CI/headless runs.
 
 ## How to run
 
@@ -44,7 +44,7 @@ The normal flow is a single command — point `md-preview` at a file and it does
 md-preview path/to/file.md
 ```
 
-The first such invocation elects itself the **daemon** and stays running; every later `md-preview <file>` is a **thin client** that reuses that one daemon (no second process, no "Address already in use"). The daemon keeps running until you stop it (Ctrl-C on the daemon, or the systemd user unit — installed separately by the operator).
+Each `md-preview <file>` is a **thin client**. If a daemon is already running it connects to it and opens the preview. If none is running, it **auto-spawns a detached `md-preview --daemon` background process** (new session via `setsid`, stdio redirected to `~/.cache/md-preview/daemon.log`), waits for it to start listening, then opens the preview — so the command **returns immediately and the daemon keeps running in the background** (it never ties up your terminal). Later `md-preview <file>` invocations reuse that same daemon (no second process, no "Address already in use"). If two run at once, only one daemon wins the election; the other's spawned `--daemon` exits as a no-op and both clients connect. The daemon keeps running until you stop it (kill the background `md-preview --daemon`, or the systemd user unit — installed separately by the operator).
 
 **Warm the bundle cache (optional, recommended once after install):**
 

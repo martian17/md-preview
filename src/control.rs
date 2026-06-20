@@ -357,6 +357,29 @@ pub fn bind_or_detect() -> Result<Election, ControlError> {
     elect(&path)
 }
 
+/// Detect a live daemon **without ever binding** the socket.
+///
+/// This is the thin-client entry point used by the `md-preview <file>` launch
+/// path (which must *never* itself become the long-lived daemon). It probes the
+/// control socket and:
+/// - returns `Ok(Some(handle))` when a live daemon is listening (the caller can
+///   immediately send an `Open`),
+/// - returns `Ok(None)` when there is no daemon yet (no socket, or only a stale
+///   one) so the caller can spawn a detached `--daemon` and poll back here,
+/// - propagates other I/O errors.
+///
+/// Unlike [`bind_or_detect`], this never unlinks a stale socket and never binds:
+/// reclaiming a stale socket is the spawned daemon's job (its own
+/// `bind_or_detect` does it), so the launch path stays side-effect free.
+pub fn connect_client() -> Result<Option<ClientHandle>, ControlError> {
+    let path = socket_path()?;
+    match probe_live(&path) {
+        Ok(true) => Ok(Some(ClientHandle { path })),
+        Ok(false) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// [`bind_or_detect`] against an explicit path (testable seam).
 fn elect(path: &Path) -> Result<Election, ControlError> {
     match UnixListener::bind(path) {
