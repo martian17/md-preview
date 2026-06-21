@@ -45,6 +45,13 @@ use serde::{Deserialize, Serialize};
 // Protocol
 // ---------------------------------------------------------------------------
 
+/// The build version embedded at compile time: `CARGO_PKG_VERSION`.
+/// Exposed so both the daemon (in its `Pong`) and the client (for comparison)
+/// can reference the same constant without duplicating the `env!` call.
+pub fn build_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 /// A control-plane request from the CLI to the daemon.
 ///
 /// Internally tagged on `"type"`; unknown fields are tolerated for
@@ -64,6 +71,11 @@ pub enum Request {
     /// Liveness probe — used by [`bind_or_detect`] to confirm a peer that owns
     /// the socket is actually a live daemon.
     Ping,
+    /// Ask the daemon to exit cleanly. Used by the thin client when it detects
+    /// a version mismatch or a mode conflict (read-only vs. `--edit`), so it
+    /// can respawn a fresh daemon at the correct version/mode. The daemon
+    /// responds with [`Response::Pong`] (the current version) then exits.
+    Shutdown,
 }
 
 /// A control-plane response from the daemon to the CLI.
@@ -81,8 +93,22 @@ pub enum Response {
         /// The single-use, short-TTL claim nonce.
         nonce: String,
     },
-    /// Reply to [`Request::Ping`].
-    Pong,
+    /// Reply to [`Request::Ping`] or [`Request::Shutdown`].
+    ///
+    /// Carries the daemon's build version and edit-mode flag so the client can
+    /// detect a stale daemon (version mismatch) or a mode conflict (read-only
+    /// vs. `--edit`) and respawn. Old daemons return `{"type":"Pong"}` with no
+    /// extra fields; `#[serde(default)]` makes them deserialize as empty strings
+    /// / false — the client treats a missing version as a mismatch.
+    Pong {
+        /// Daemon's `CARGO_PKG_VERSION` at compile time.
+        #[serde(default)]
+        version: String,
+        /// Whether the daemon was started with `--edit` (collaborative editor
+        /// routes enabled).
+        #[serde(default)]
+        edit_mode: bool,
+    },
     /// The request could not be served; `message` is a human-readable reason.
     Error {
         /// Human-readable failure reason.
@@ -530,7 +556,10 @@ mod tests {
                 url: "file:///x.html".into(),
                 nonce: "abc".into(),
             },
-            Response::Pong,
+            Response::Pong {
+                version: "0.1.0".into(),
+                edit_mode: true,
+            },
             Response::Error {
                 message: "boom".into(),
             },
@@ -539,6 +568,30 @@ mod tests {
             let back: Response = serde_json::from_str(&line).unwrap();
             assert_eq!(resp, back);
         }
+    }
+
+    #[test]
+    fn pong_default_fields_deserialize_from_bare_pong() {
+        // Old daemons emit {"type":"Pong"} with no extra fields.
+        // New clients must tolerate this (treat missing version as "").
+        let bare = r#"{"type":"Pong"}"#;
+        let resp: Response = serde_json::from_str(bare).unwrap();
+        assert_eq!(
+            resp,
+            Response::Pong {
+                version: String::new(),
+                edit_mode: false,
+            }
+        );
+    }
+
+    #[test]
+    fn shutdown_request_round_trips() {
+        let req = Request::Shutdown;
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains("\"type\":\"Shutdown\""));
+        let back: Request = serde_json::from_str(&line).unwrap();
+        assert_eq!(req, back);
     }
 
     #[test]
@@ -593,7 +646,10 @@ mod tests {
                 match conn {
                     Ok(stream) => {
                         let _ = serve_connection(stream, |req| match req {
-                            Request::Ping => Response::Pong,
+                            Request::Ping | Request::Shutdown => Response::Pong {
+                                version: build_version().to_string(),
+                                edit_mode: false,
+                            },
                             Request::Open { .. } => Response::Opened {
                                 url: "file:///served.html".into(),
                                 nonce: "n0".into(),
@@ -640,7 +696,7 @@ mod tests {
         );
 
         let pong = client.send_request_blocking(&Request::Ping).unwrap();
-        assert_eq!(pong, Response::Pong);
+        assert!(matches!(pong, Response::Pong { .. }));
 
         let _ = stop.send(());
         // Nudge the accept loop so it observes the stop signal, then join.

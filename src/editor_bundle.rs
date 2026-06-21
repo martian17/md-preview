@@ -101,7 +101,7 @@ pub fn editor_bundle_routes(
 }
 
 /// Serve a single editor bundle file (shared by the route and tests).
-fn serve_editor_file(filename: &str) -> warp::reply::Response {
+pub fn serve_editor_file(filename: &str) -> warp::reply::Response {
     use warp::http::StatusCode;
     use warp::reply::Reply;
 

@@ -444,6 +444,26 @@ fn with_context(
         )
 }
 
+/// Session-presence gate: every content route MUST carry a valid session cookie.
+/// Returns `Some(401 response)` when the request has no valid session, `None`
+/// when it may proceed. Called AFTER [`network_guard`] (so DNS-rebinding is
+/// already rejected before we reach this), before any file access.
+///
+/// World-readable files are still subject to this gate: the permission floor
+/// controls WHAT an authenticated user can read, not WHETHER a cookieless
+/// request is allowed at all. The threat model requires that only the browser
+/// that claimed the nonce (and holds the session cookie) can read anything.
+fn require_session(ctx: &ReqContext) -> Option<warp::reply::Response> {
+    use warp::http::StatusCode;
+    use warp::reply::Reply;
+    if !ctx.authenticated {
+        return Some(
+            warp::reply::with_status("unauthorized", StatusCode::UNAUTHORIZED).into_response(),
+        );
+    }
+    None
+}
+
 /// THE network-defense chokepoint: run the `Host` allowlist (DNS-rebinding) and
 /// `Origin`/`Sec-Fetch` (cross-origin) guards. Returns `Some(403 response)` when
 /// the request must be rejected, or `None` when it may proceed. Every content
@@ -514,6 +534,17 @@ fn routes(
             )
             .into_response()
         });
+
+    // NOTE: there is deliberately **no** HTTP route that hands out a claim nonce.
+    // The localhost-trust model (ADR-0006, design §2) requires that a nonce travel
+    // ONLY over the SO_PEERCRED-authenticated unix control socket (same-uid) and
+    // land in a `0600` bootstrap file — so a malicious LOCAL web page or a
+    // lower-privilege loopback process can never obtain one (the `Host` allowlist
+    // alone does NOT stop a local page that already talks to 127.0.0.1). Exposing a
+    // `GET /nonce` route would let any cookieless loopback client mint a nonce,
+    // `/claim` a session, and read every document — re-opening the very bypass the
+    // session gate closes. Nonces are minted by `handle_control_request` (the
+    // control plane) exclusively.
 
     // POST /claim (urlencoded form: nonce + next) -> consume the nonce, issue a
     // session, Set-Cookie, and 302 → `next` (PRG). A FORM POST is a navigation,
@@ -662,7 +693,22 @@ fn routes(
     // files, embedded in the binary. Same-origin, no CORS, strict allowlist.
     // Served on the MAIN origin (not the secondary bundle/static origin) because
     // the editor module scripts import them as same-origin `/editor-bundle/…` URLs.
-    let editor_bundle_route = crate::editor_bundle::editor_bundle_routes();
+    // Auth-gated: a valid session cookie is required (same requirement as every
+    // other content route). The bare `editor_bundle_routes()` in that module is
+    // kept for its own unit tests; here we assemble the auth-wrapped variant.
+    let editor_bundle_route = warp::path("editor-bundle")
+        .and(warp::get())
+        .and(with_context(state.clone()))
+        .and(warp::path::tail())
+        .map(|ctx: ReqContext, tail: warp::path::Tail| {
+            if let Some(resp) = network_guard(&ctx) {
+                return resp;
+            }
+            if let Some(resp) = require_session(&ctx) {
+                return resp;
+            }
+            crate::editor_bundle::serve_editor_file(tail.as_str())
+        });
 
     health
         .or(outside)
@@ -795,6 +841,9 @@ fn view_page(state: &AppState, ctx: &ReqContext) -> warp::reply::Response {
     if let Some(resp) = network_guard(ctx) {
         return resp;
     }
+    if let Some(resp) = require_session(ctx) {
+        return resp;
+    }
     // The shell needs the static origin for its own bundle (script/style/font);
     // if the static origin is not up yet, fall back to a self placeholder so the
     // CSP is still well-formed and the shell renders (bundle simply 404s).
@@ -828,6 +877,9 @@ fn srcdoc_page(
     use warp::reply::Reply;
 
     if let Some(resp) = network_guard(ctx) {
+        return resp;
+    }
+    if let Some(resp) = require_session(ctx) {
         return resp;
     }
     let static_origin = state
@@ -873,6 +925,9 @@ fn content_fragment(state: &AppState, ctx: &ReqContext, requested: &str) -> warp
     if let Some(resp) = network_guard(ctx) {
         return resp;
     }
+    if let Some(resp) = require_session(ctx) {
+        return resp;
+    }
     let path = Path::new(requested);
     // FLOOR chokepoint: confine (held fd) + floor on the fstat'd metadata. This
     // is the post-floor, mint-time-authorized context for cap_url (W6.2).
@@ -914,6 +969,9 @@ fn navigate_gate(state: &AppState, ctx: &ReqContext, requested: &str) -> warp::r
     if let Some(resp) = network_guard(ctx) {
         return resp;
     }
+    if let Some(resp) = require_session(ctx) {
+        return resp;
+    }
     // Classify against a plain (non-mutating) snapshot via the single `Confine`
     // fan-out — link probes never renew a root's sliding TTL, so this rides the
     // `impl Confine for Roots` (read-only) gate, not `AppState`'s renewing one.
@@ -946,6 +1004,9 @@ fn edit_page(state: &AppState, ctx: &ReqContext, requested: &str) -> warp::reply
     use warp::reply::Reply;
 
     if let Some(resp) = network_guard(ctx) {
+        return resp;
+    }
+    if let Some(resp) = require_session(ctx) {
         return resp;
     }
     let path = Path::new(requested);
@@ -1176,6 +1237,9 @@ fn serve_raw(state: &AppState, ctx: &ReqContext, requested: &str) -> warp::reply
     if let Some(resp) = network_guard(ctx) {
         return resp;
     }
+    if let Some(resp) = require_session(ctx) {
+        return resp;
+    }
     let mut confined = match serve_confined(state, ctx, Path::new(requested)) {
         Ok(c) => c,
         Err(deny) => return deny.into_response(),
@@ -1221,6 +1285,9 @@ fn save_doc(
     let status = |code| warp::reply::with_status("", code).into_response();
 
     if let Some(resp) = network_guard(ctx) {
+        return resp;
+    }
+    if let Some(resp) = require_session(ctx) {
         return resp;
     }
 
@@ -1442,6 +1509,9 @@ fn ws_route(
     if let Some(resp) = network_guard(ctx) {
         return resp;
     }
+    if let Some(resp) = require_session(ctx) {
+        return resp;
+    }
     // Floor chokepoint before the upgrade. Holds the fd only briefly.
     if let Err(deny) = serve_confined(state, ctx, Path::new(&requested)) {
         return deny.into_response();
@@ -1512,6 +1582,9 @@ fn collab_route(
 ) -> warp::reply::Response {
     use warp::reply::Reply;
     if let Some(resp) = network_guard(ctx) {
+        return resp;
+    }
+    if let Some(resp) = require_session(ctx) {
         return resp;
     }
     if let Err(deny) = serve_confined(state, ctx, Path::new(&requested)) {
@@ -2093,6 +2166,72 @@ pub async fn serve(file: &Path, addr: SocketAddr, edit_mode: bool) -> std::io::R
     Ok(())
 }
 
+/// An opaque handle returned by [`serve_for_test`] that can mint a bootstrap claim
+/// nonce against the *same* running daemon's [`AuthState`]. This is the in-process
+/// equivalent of the control plane's `Open` nonce mint, exposed ONLY for
+/// integration tests so they can drive the real `nonce → /claim → cookie` auth
+/// flow against a live HTTP daemon without an HTTP nonce endpoint (which would be a
+/// security hole — see the `routes` note on why there is no `GET /nonce`).
+///
+/// There is intentionally no network surface here: the only way to obtain a handle
+/// is to *be the process that started the daemon* (same uid, same address space),
+/// which is exactly the OS-level trust the unix control socket provides in
+/// production.
+#[doc(hidden)]
+pub struct TestNonceMinter {
+    state: Arc<AppState>,
+}
+
+#[doc(hidden)]
+impl TestNonceMinter {
+    /// Mint a fresh single-use bootstrap nonce against the daemon's live store, as
+    /// the control plane's `Open` does in production.
+    pub fn mint_nonce(&self) -> Result<String, getrandom::Error> {
+        mint_claim_nonce(&self.state)
+    }
+}
+
+/// Test-only variant of [`serve`]: binds + spawns the daemon on `addr` and returns
+/// a [`TestNonceMinter`] sharing the live [`AppState`], so an integration test can
+/// mint a real nonce, POST it to `/claim`, and obtain a session cookie — exercising
+/// the exact production auth path. Returns after the listener is bound (the server
+/// future is spawned onto the caller's tokio runtime). NOT a production entry point.
+#[doc(hidden)]
+pub fn serve_for_test(
+    file: &Path,
+    addr: SocketAddr,
+    edit_mode: bool,
+) -> std::io::Result<TestNonceMinter> {
+    let abs = file.canonicalize()?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let mut roots = Roots::new(home);
+    let _ = roots.register_for(&abs);
+    let state = Arc::new(AppState::new(roots));
+
+    let (_bound_addr, fut) = warp::serve(routes(state.clone(), edit_mode))
+        .try_bind_ephemeral(addr)
+        .map_err(|e| {
+            let kind = {
+                let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
+                let mut found = std::io::ErrorKind::Other;
+                while let Some(s) = src {
+                    if let Some(io) = s.downcast_ref::<std::io::Error>() {
+                        found = io.kind();
+                        break;
+                    }
+                    src = s.source();
+                }
+                found
+            };
+            std::io::Error::new(kind, e)
+        })?;
+    spawn_static_origin(addr, state.clone());
+    tokio::spawn(fut);
+    Ok(TestNonceMinter { state })
+}
+
 /// Build the [`AppState`] from the first opened `file`, binding the HTTP server
 /// with an ephemeral-fallback port strategy (try 7878, fall back to OS-assigned)
 /// and running the control-plane accept loop alongside it.
@@ -2167,7 +2306,7 @@ pub async fn serve_with_control(
                             .name("md-preview-control-conn".into())
                             .spawn(move || {
                                 let _ = crate::control::serve_connection(stream, |req| {
-                                    handle_control_request(&state_conn, req, http_addr)
+                                    handle_control_request(&state_conn, req, http_addr, edit_mode)
                                 });
                             })
                             .ok();
@@ -2241,7 +2380,7 @@ pub async fn serve_daemon_only(
                             .name("md-preview-control-conn".into())
                             .spawn(move || {
                                 let _ = crate::control::serve_connection(stream, |req| {
-                                    handle_control_request(&state_conn, req, http_addr)
+                                    handle_control_request(&state_conn, req, http_addr, edit_mode)
                                 });
                             })
                             .ok();
@@ -2265,10 +2404,28 @@ fn handle_control_request(
     state: &AppState,
     req: crate::control::Request,
     http_addr: SocketAddr,
+    edit_mode: bool,
 ) -> crate::control::Response {
     use crate::control::{Request, Response};
     match req {
-        Request::Ping => Response::Pong,
+        Request::Ping => Response::Pong {
+            version: crate::control::build_version().to_string(),
+            edit_mode,
+        },
+        Request::Shutdown => {
+            // Return Pong so serve_connection can write it before the connection
+            // is dropped. After the handler returns, the accept loop's per-conn
+            // thread exits; we then call process::exit from a background thread
+            // to bring the daemon down cleanly, allowing the write to flush.
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::process::exit(0);
+            });
+            Response::Pong {
+                version: crate::control::build_version().to_string(),
+                edit_mode,
+            }
+        }
         Request::Open { path, root } => {
             // Register the root in the multi-root registry.
             let root_path = std::path::Path::new(&root);
@@ -2457,7 +2614,7 @@ mod tests {
         let dir = temp_dir("raw-ok");
         let abs = write_mode(&dir, "doc.md", "# Hello\n\nsrc", 0o644);
         let state = state_for(&dir);
-        let resp = serve_raw(&state, &ctx(false), &abs);
+        let resp = serve_raw(&state, &ctx(true), &abs);
         assert_eq!(resp.status(), warp::http::StatusCode::OK);
         let body = warp::hyper::body::to_bytes(resp.into_body()).await.unwrap();
         assert_eq!(&body[..], b"# Hello\n\nsrc");
@@ -2473,23 +2630,23 @@ mod tests {
         let state = state_for(&dir);
         let unauth = ctx(false);
 
-        // The byte-serving read routes all 403 on a private doc unauthenticated.
-        // (`/view` is now the floorless shell SPA — it serves no bytes; the floor
-        // moved to the SAME-ORIGIN `/content` API the shell fetches.)
+        // With require_session in place, unauthenticated requests hit 401 BEFORE
+        // the floor check. 401 is strictly stronger than 403 — it still correctly
+        // denies the unauthenticated client all content.
         assert_eq!(
             content_fragment(&state, &unauth, &priv_abs).status(),
-            warp::http::StatusCode::FORBIDDEN,
-            "/content must deny a private file unauthenticated (the floor)"
+            warp::http::StatusCode::UNAUTHORIZED,
+            "/content must deny an unauthenticated client (401 beats the old 403 floor)"
         );
         assert_eq!(
             serve_raw(&state, &unauth, &priv_abs).status(),
-            warp::http::StatusCode::FORBIDDEN,
-            "/raw must deny a private file unauthenticated"
+            warp::http::StatusCode::UNAUTHORIZED,
+            "/raw must deny an unauthenticated client"
         );
         assert_eq!(
             edit_page(&state, &unauth, &priv_abs).status(),
-            warp::http::StatusCode::FORBIDDEN,
-            "/edit must deny a private file unauthenticated (audit MED-3)"
+            warp::http::StatusCode::UNAUTHORIZED,
+            "/edit must deny an unauthenticated client (audit MED-3)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2711,10 +2868,10 @@ mod tests {
         let priv_abs = write_mode(&dir, "secret.md", "# private", 0o600);
         let state = state_for(&dir);
 
-        // Before claim: unauthenticated read is denied.
+        // Before claim: unauthenticated read is denied (401 — session required before floor).
         assert_eq!(
             serve_raw(&state, &ctx(false), &priv_abs).status(),
-            warp::http::StatusCode::FORBIDDEN
+            warp::http::StatusCode::UNAUTHORIZED
         );
 
         // Claim a session.
@@ -2753,7 +2910,7 @@ mod tests {
         let abs = write_mode(&dir, "doc.md", "old", 0o644);
         let state = state_for(&dir);
 
-        let resp = save_doc(&state, &ctx(false), &abs, b"# New");
+        let resp = save_doc(&state, &ctx(true), &abs, b"# New");
         assert_eq!(resp.status(), warp::http::StatusCode::NO_CONTENT);
         assert_eq!(std::fs::read_to_string(dir.join("doc.md")).unwrap(), "# New");
 
@@ -2772,10 +2929,11 @@ mod tests {
         let dir = temp_dir("save-floor");
         let priv_abs = write_mode(&dir, "secret.md", "keep", 0o600);
         let state = state_for(&dir);
-        // Unauthenticated cannot overwrite a non-world-readable existing file.
+        // Unauthenticated cannot overwrite a non-world-readable existing file — now
+        // denied with 401 (session required) before reaching the 403 floor check.
         assert_eq!(
             save_doc(&state, &ctx(false), &priv_abs, b"pwned").status(),
-            warp::http::StatusCode::FORBIDDEN
+            warp::http::StatusCode::UNAUTHORIZED
         );
         assert_eq!(std::fs::read_to_string(dir.join("secret.md")).unwrap(), "keep");
         // Authenticated may overwrite its own private file.
@@ -2791,7 +2949,7 @@ mod tests {
         let dir = temp_dir("save-new");
         let state = state_for(&dir);
         let fresh = dir.join("fresh.md").to_string_lossy().into_owned();
-        let resp = save_doc(&state, &ctx(false), &fresh, b"hi");
+        let resp = save_doc(&state, &ctx(true), &fresh, b"hi");
         assert_eq!(resp.status(), warp::http::StatusCode::NO_CONTENT);
         assert_eq!(std::fs::read_to_string(dir.join("fresh.md")).unwrap(), "hi");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2829,7 +2987,7 @@ mod tests {
         // The shell needs a static origin to point its bundle CSP at.
         state.set_static_base("http://127.0.0.1:8081".to_string());
 
-        let resp = view_page(&state, &ctx(false));
+        let resp = view_page(&state, &ctx(true));
         assert_eq!(resp.status(), warp::http::StatusCode::OK);
         // Cross-origin isolation pair (Site Isolation backstop).
         assert_eq!(header(&resp, "cross-origin-opener-policy"), "same-origin");
@@ -2884,13 +3042,13 @@ mod tests {
 
         // With the SHELL's nonce threaded in (?n=), the srcdoc echoes it verbatim
         // so its inline bootstrap passes the inherited shell CSP.
-        let with_nonce = body_of(srcdoc_page(&state, &ctx(false), Some("sharedN0nce"))).await;
+        let with_nonce = body_of(srcdoc_page(&state, &ctx(true), Some("sharedN0nce"))).await;
         assert!(with_nonce.contains(r#"<script nonce="sharedN0nce">"#));
         assert!(with_nonce.contains("&#x27;nonce-sharedN0nce&#x27;") || with_nonce.contains("'nonce-sharedN0nce'"));
 
         // Renderer CSP travels in the srcdoc meta and is zero-egress.
-        let a = body_of(srcdoc_page(&state, &ctx(false), None)).await;
-        let b = body_of(srcdoc_page(&state, &ctx(false), None)).await;
+        let a = body_of(srcdoc_page(&state, &ctx(true), None)).await;
+        let b = body_of(srcdoc_page(&state, &ctx(true), None)).await;
         assert!(a.contains(r#"<meta http-equiv="Content-Security-Policy""#));
         assert!(a.contains("connect-src &#x27;none&#x27;") || a.contains("connect-src 'none'"));
         // With NO shell nonce supplied (a direct /srcdoc hit), a fresh one is minted
@@ -2906,19 +3064,19 @@ mod tests {
         let pub_abs = write_mode(&dir, "public.md", "# hello world", 0o644);
         let state = state_for(&dir);
 
-        // Unauthenticated request for a non-world-readable doc -> 403 (floor).
+        // Unauthenticated request → 401 (session required before floor check).
         let denied = content_fragment(&state, &ctx(false), &priv_abs);
         assert_eq!(
             denied.status(),
-            warp::http::StatusCode::FORBIDDEN,
-            "content API must deny a private doc unauthenticated (the floor)"
+            warp::http::StatusCode::UNAUTHORIZED,
+            "content API must deny unauthenticated clients (session gate fires first)"
         );
         // Authenticated unlocks the private doc.
         let ok_auth = content_fragment(&state, &ctx(true), &priv_abs);
         assert_eq!(ok_auth.status(), warp::http::StatusCode::OK);
 
-        // World-readable served even unauthenticated, as the rendered BODY.
-        let ok_pub = content_fragment(&state, &ctx(false), &pub_abs);
+        // World-readable: must be authenticated too (session is now always required).
+        let ok_pub = content_fragment(&state, &ctx(true), &pub_abs);
         assert_eq!(ok_pub.status(), warp::http::StatusCode::OK);
         assert_eq!(
             header(&ok_pub, "content-type"),
@@ -2943,7 +3101,7 @@ mod tests {
         let state = state_for(&dir);
         state.set_static_base("http://127.0.0.1:8081".to_string());
 
-        let resp = content_fragment(&state, &ctx(false), &doc.to_string_lossy());
+        let resp = content_fragment(&state, &ctx(true), &doc.to_string_lossy());
         assert_eq!(resp.status(), warp::http::StatusCode::OK);
         let html = String::from_utf8(
             warp::hyper::body::to_bytes(resp.into_body()).await.unwrap().to_vec(),
@@ -2985,7 +3143,7 @@ mod tests {
         let state = state_for(&dir);
         state.set_static_base("http://127.0.0.1:8081".to_string());
 
-        let resp = content_fragment(&state, &ctx(false), &doc.to_string_lossy());
+        let resp = content_fragment(&state, &ctx(true), &doc.to_string_lossy());
         let html = String::from_utf8(
             warp::hyper::body::to_bytes(resp.into_body()).await.unwrap().to_vec(),
         )
@@ -3008,9 +3166,11 @@ mod tests {
         let state = state_for(&dir);
         state.set_static_base("http://127.0.0.1:8081".to_string());
 
+        // Session gate fires before the floor: 401, not 403. Either way, no cap
+        // is minted — the invariant (empty store) is what matters for security.
         let denied = content_fragment(&state, &ctx(false), &doc.to_string_lossy());
-        assert_eq!(denied.status(), warp::http::StatusCode::FORBIDDEN);
-        // No token was minted (cap_url unreachable from the floor-failed path).
+        assert_eq!(denied.status(), warp::http::StatusCode::UNAUTHORIZED);
+        // No token was minted (cap_url unreachable from the denied path).
         assert_eq!(state.caps.lock().unwrap().live_len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3023,18 +3183,18 @@ mod tests {
 
         // In-root target -> 204 (the parent may mount a fresh srcdoc for it).
         assert_eq!(
-            navigate_gate(&state, &ctx(false), &pub_abs).status(),
+            navigate_gate(&state, &ctx(true), &pub_abs).status(),
             warp::http::StatusCode::NO_CONTENT
         );
         // An out-of-root target -> 403 (the /outside marker; parent refuses).
         assert_eq!(
-            navigate_gate(&state, &ctx(false), "/etc/hosts").status(),
+            navigate_gate(&state, &ctx(true), "/etc/hosts").status(),
             warp::http::StatusCode::FORBIDDEN,
             "navigation to an out-of-root target is rejected by the parent"
         );
         // A relative (non-absolute) target is also refused.
         assert_eq!(
-            navigate_gate(&state, &ctx(false), "../escape.md").status(),
+            navigate_gate(&state, &ctx(true), "../escape.md").status(),
             warp::http::StatusCode::FORBIDDEN
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3428,5 +3588,189 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&canon);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    // --- negative session-auth regression tests (P0 fix HIGH-2) ------------
+    //
+    // For every content/asset route: no-cookie AND invalid-cookie → 401;
+    // valid-cookie → not 401. Handler-level tests: ctx(false) covers both
+    // the "no cookie" and "invalid cookie" cases since the handler only
+    // receives the already-resolved `authenticated: bool`.
+
+    #[test]
+    fn unauthenticated_view_is_rejected() {
+        let dir = temp_dir("neg-view");
+        let state = state_for(&dir);
+        state.set_static_base("http://127.0.0.1:8081".to_string());
+        let resp = view_page(&state, &ctx(false));
+        assert_eq!(resp.status(), warp::http::StatusCode::UNAUTHORIZED);
+        let resp_auth = view_page(&state, &ctx(true));
+        assert_eq!(resp_auth.status(), warp::http::StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unauthenticated_srcdoc_is_rejected() {
+        let dir = temp_dir("neg-srcdoc");
+        let state = state_for(&dir);
+        state.set_static_base("http://127.0.0.1:8081".to_string());
+        let resp = srcdoc_page(&state, &ctx(false), None);
+        assert_eq!(resp.status(), warp::http::StatusCode::UNAUTHORIZED);
+        let resp_auth = srcdoc_page(&state, &ctx(true), None);
+        assert_eq!(resp_auth.status(), warp::http::StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unauthenticated_content_is_rejected_regardless_of_file_permissions() {
+        let dir = temp_dir("neg-content");
+        // World-readable (0o644) used to bypass auth: must now require session.
+        let pub_abs = write_mode(&dir, "public.md", "# pub", 0o644);
+        let priv_abs = write_mode(&dir, "secret.md", "# priv", 0o600);
+        let state = state_for(&dir);
+        // No cookie → 401 for BOTH world-readable and private.
+        assert_eq!(
+            content_fragment(&state, &ctx(false), &pub_abs).status(),
+            warp::http::StatusCode::UNAUTHORIZED,
+            "world-readable content must still require a session (P0 bypass was here)"
+        );
+        assert_eq!(
+            content_fragment(&state, &ctx(false), &priv_abs).status(),
+            warp::http::StatusCode::UNAUTHORIZED,
+            "private content must require a session"
+        );
+        // Valid session → 200 / 200.
+        assert_eq!(content_fragment(&state, &ctx(true), &pub_abs).status(), warp::http::StatusCode::OK);
+        assert_eq!(content_fragment(&state, &ctx(true), &priv_abs).status(), warp::http::StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unauthenticated_raw_is_rejected_regardless_of_file_permissions() {
+        let dir = temp_dir("neg-raw");
+        let pub_abs = write_mode(&dir, "public.md", "# pub", 0o644);
+        let state = state_for(&dir);
+        assert_eq!(
+            serve_raw(&state, &ctx(false), &pub_abs).status(),
+            warp::http::StatusCode::UNAUTHORIZED,
+            "world-readable /raw must require a session (P0 bypass was here)"
+        );
+        assert_eq!(serve_raw(&state, &ctx(true), &pub_abs).status(), warp::http::StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unauthenticated_navigate_is_rejected() {
+        let dir = temp_dir("neg-navigate");
+        let pub_abs = write_mode(&dir, "doc.md", "# doc", 0o644);
+        let state = state_for(&dir);
+        assert_eq!(
+            navigate_gate(&state, &ctx(false), &pub_abs).status(),
+            warp::http::StatusCode::UNAUTHORIZED,
+            "/navigate must require a session"
+        );
+        assert_eq!(navigate_gate(&state, &ctx(true), &pub_abs).status(), warp::http::StatusCode::NO_CONTENT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unauthenticated_edit_page_is_rejected() {
+        let dir = temp_dir("neg-edit");
+        let pub_abs = write_mode(&dir, "doc.md", "# pub", 0o644);
+        let state = state_for(&dir);
+        assert_eq!(
+            edit_page(&state, &ctx(false), &pub_abs).status(),
+            warp::http::StatusCode::UNAUTHORIZED,
+            "/edit must require a session"
+        );
+        assert_eq!(edit_page(&state, &ctx(true), &pub_abs).status(), warp::http::StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unauthenticated_save_is_rejected() {
+        let dir = temp_dir("neg-save");
+        let pub_abs = write_mode(&dir, "doc.md", "old", 0o644);
+        let state = state_for(&dir);
+        assert_eq!(
+            save_doc(&state, &ctx(false), &pub_abs, b"pwned").status(),
+            warp::http::StatusCode::UNAUTHORIZED,
+            "write (save) must require a session even for world-readable files"
+        );
+        // File must not have been modified.
+        assert_eq!(std::fs::read_to_string(&pub_abs).unwrap(), "old");
+        // Authenticated write succeeds.
+        assert_eq!(save_doc(&state, &ctx(true), &pub_abs, b"new").status(), warp::http::StatusCode::NO_CONTENT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end through the real `routes()` filter: a request with NO Cookie and
+    /// a request with a GARBAGE Cookie must both be rejected (401) on every
+    /// content/asset route — including `/editor-bundle/*`, which previously had no
+    /// auth gate at all. This is the route-level counterpart to the handler tests:
+    /// it proves the gate is actually wired into the filter chain (host header is
+    /// supplied so the network guard passes and we isolate the session check).
+    #[tokio::test]
+    async fn routes_reject_no_cookie_and_invalid_cookie_on_every_content_route() {
+        let dir = temp_dir("neg-routes");
+        let pub_abs = write_mode(&dir, "public.md", "# pub", 0o644);
+        let enc = encode_query_value(&pub_abs);
+        let state = Arc::new(state_for(&dir));
+        state.set_static_base("http://127.0.0.1:8081".to_string());
+        let filter = routes(state, true);
+
+        // Every content/asset path. `/save` is POST; the rest are GET.
+        let get_paths = [
+            "/view".to_string(),
+            "/srcdoc".to_string(),
+            format!("/content?path={enc}"),
+            format!("/raw?path={enc}"),
+            format!("/navigate?path={enc}"),
+            format!("/edit?path={enc}"),
+            "/editor-bundle/mycelium-editor.es.js".to_string(),
+        ];
+
+        for path in &get_paths {
+            // No Cookie header at all.
+            let no_cookie = warp::test::request()
+                .method("GET")
+                .path(path)
+                .header("host", "127.0.0.1:7878")
+                .reply(&filter)
+                .await;
+            assert_eq!(
+                no_cookie.status(),
+                warp::http::StatusCode::UNAUTHORIZED,
+                "no-cookie request to {path} must be 401"
+            );
+
+            // A garbage / invalid session cookie.
+            let bad_cookie = warp::test::request()
+                .method("GET")
+                .path(path)
+                .header("host", "127.0.0.1:7878")
+                .header("cookie", "mdp_session=not-a-real-token")
+                .reply(&filter)
+                .await;
+            assert_eq!(
+                bad_cookie.status(),
+                warp::http::StatusCode::UNAUTHORIZED,
+                "invalid-cookie request to {path} must be 401"
+            );
+        }
+
+        // /save (POST) with an invalid cookie must also be 401 and not write.
+        let save_bad = warp::test::request()
+            .method("POST")
+            .path(&format!("/save?path={enc}"))
+            .header("host", "127.0.0.1:7878")
+            .header("cookie", "mdp_session=not-a-real-token")
+            .body("pwned")
+            .reply(&filter)
+            .await;
+        assert_eq!(save_bad.status(), warp::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(std::fs::read_to_string(&pub_abs).unwrap(), "# pub");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

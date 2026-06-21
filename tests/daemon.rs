@@ -67,7 +67,10 @@ fn process_reuse_same_daemon_same_port() {
                         let port = http_port;
                         std::thread::spawn(move || {
                             let _ = serve_connection(stream, |req| match req {
-                                Request::Ping => Response::Pong,
+                                Request::Ping | Request::Shutdown => Response::Pong {
+                                    version: md_preview::control::build_version().to_string(),
+                                    edit_mode: false,
+                                },
                                 Request::Open { path, root: _ } => {
                                     let n = nc.fetch_add(1, Ordering::SeqCst);
                                     let nonce = format!("nonce-{n}");

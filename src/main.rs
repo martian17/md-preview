@@ -100,11 +100,52 @@ fn main() {
     // --daemon without a file: start (or join) the always-on daemon, no document.
     if daemon_flag && file.is_none() {
         match md_preview::control::bind_or_detect() {
-            Ok(md_preview::control::Election::Client(_handle)) => {
-                // Another daemon instance is already running.
+            Ok(md_preview::control::Election::Client(handle)) => {
+                // Another daemon instance is already running. Check version and mode.
+                use md_preview::control::{Request, Response};
                 if edit_mode {
-                    eprintln!("A read-only daemon is already running. Stop it first (kill the md-preview --daemon process) and re-run with --edit to enable editable mode.");
-                    std::process::exit(1);
+                    // Check if the running daemon already has edit mode.
+                    match handle.send_request_blocking(&Request::Ping) {
+                        Ok(Response::Pong { edit_mode: true, .. }) => {
+                            // Already in edit mode — nothing to do.
+                        }
+                        Ok(Response::Pong { version: v, edit_mode: false }) => {
+                            eprintln!(
+                                "md-preview: a read-only daemon (v{v}) is already running.\n\
+                                 Sending shutdown and restarting in edit mode…"
+                            );
+                            let _ = handle.send_request_blocking(&Request::Shutdown);
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                            // Re-elect: after shutdown the socket is gone so we become daemon.
+                            let rt = match tokio::runtime::Runtime::new() {
+                                Ok(rt) => rt,
+                                Err(e) => { eprintln!("Failed to start runtime: {e}"); std::process::exit(1); }
+                            };
+                            match md_preview::control::bind_or_detect() {
+                                Ok(md_preview::control::Election::Daemon(ctrl)) => {
+                                    let code = rt.block_on(async move {
+                                        match md_preview::server::serve_daemon_only(ctrl, true).await {
+                                            Ok(()) => ExitCode::SUCCESS,
+                                            Err(e) => { eprintln!("Server error: {e}"); ExitCode::FAILURE }
+                                        }
+                                    });
+                                    std::process::exit(if code == ExitCode::SUCCESS { 0 } else { 1 });
+                                }
+                                Ok(md_preview::control::Election::Client(_)) => {
+                                    eprintln!("md-preview: another daemon started before us; cannot take over.");
+                                    std::process::exit(1);
+                                }
+                                Err(e) => { eprintln!("Control socket error: {e}"); std::process::exit(1); }
+                            }
+                        }
+                        _ => {
+                            eprintln!(
+                                "md-preview: a daemon is running but did not report its mode.\n\
+                                 Run: pkill -f 'md-preview --daemon' && md-preview --daemon --edit"
+                            );
+                            std::process::exit(1);
+                        }
+                    }
                 }
                 return;
             }
@@ -203,8 +244,11 @@ fn main() {
 
 /// Connect to a running daemon, or spawn a detached one and connect to it.
 ///
-/// 1. If a daemon is already listening on the control socket, return a client
-///    handle to it immediately.
+/// 1. If a daemon is already listening on the control socket, check that it
+///    runs the same build version AND the required edit mode. If either
+///    mismatches, send a `Shutdown` request and respawn, then wait for the new
+///    daemon. If the running daemon already satisfies both constraints, return
+///    the handle immediately.
 /// 2. Otherwise spawn `md-preview --daemon` as a **detached background process**
 ///    (new session via `setsid`, stdio redirected away from the terminal) and
 ///    poll the control socket until it is connectable (bounded ~5s timeout).
@@ -215,16 +259,56 @@ fn main() {
 /// exits, and both `<file>` callers just connect to the survivor.
 #[cfg(feature = "daemon")]
 fn connect_or_spawn_daemon(edit_mode: bool) -> std::io::Result<md_preview::control::ClientHandle> {
+    use md_preview::control::{Request, Response};
     use std::time::{Duration, Instant};
 
-    // Fast path: a daemon is already up.
-    match md_preview::control::connect_client() {
-        Ok(Some(handle)) => return Ok(handle),
-        Ok(None) => {}
-        Err(e) => return Err(std::io::Error::other(e.to_string())),
+    // Fast path: a daemon is already up — but validate version and mode first.
+    if let Ok(Some(handle)) = md_preview::control::connect_client() {
+        match handle.send_request_blocking(&Request::Ping) {
+            Ok(Response::Pong {
+                version: running_ver,
+                edit_mode: running_edit,
+            }) => {
+                let our_ver = md_preview::control::build_version();
+                let version_ok = running_ver == our_ver;
+                // edit_mode: if we need editor and it doesn't have it → restart.
+                // If the running daemon already has edit mode, that's fine even
+                // if we don't need it (the editor routes are just unused).
+                let mode_ok = !edit_mode || running_edit;
+
+                if version_ok && mode_ok {
+                    return Ok(handle);
+                }
+
+                if !version_ok {
+                    eprintln!(
+                        "md-preview: stale daemon detected (running v{running_ver}, \
+                         this binary is v{our_ver}). Restarting…"
+                    );
+                } else {
+                    eprintln!(
+                        "md-preview: running daemon is in read-only mode but --edit \
+                         was requested. Restarting in edit mode…"
+                    );
+                }
+                // Ask the stale/wrong-mode daemon to shut down, then respawn.
+                let _ = handle.send_request_blocking(&Request::Shutdown);
+                // Give the daemon a moment to exit and release the socket.
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            _ => {
+                // Old daemon (no version in Pong) or protocol error → treat as stale.
+                eprintln!(
+                    "md-preview: daemon did not report a version — \
+                     likely running old code. Restarting…"
+                );
+                // We can't send Shutdown reliably, so just wait for the socket to
+                // disappear after the new daemon's bind_or_detect reclaims it.
+            }
+        }
     }
 
-    // No daemon yet — spawn one, detached.
+    // No daemon, or we just shut down the old one — spawn a fresh one.
     spawn_detached_daemon(edit_mode)?;
 
     // Poll until the freshly-spawned daemon is accepting connections. A spawn

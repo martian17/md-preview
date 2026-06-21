@@ -24,6 +24,7 @@ use md_preview::doc::DocSession;
 use md_preview::server::collab;
 use md_preview::session::YrsSession;
 use tokio_tungstenite::tungstenite::Message as TMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 /// A unique temp dir containing `doc.md` with `contents`. Caller cleans up.
 fn temp_doc(tag: &str, contents: &str) -> PathBuf {
@@ -48,26 +49,29 @@ fn free_port() -> u16 {
 }
 
 /// Spawn the daemon serving `file`'s directory on `addr` as a background task,
-/// then poll `/healthz` until it answers (or time out). Returns once it is live.
-async fn spawn_daemon(file: PathBuf, addr: SocketAddr) {
-    tokio::spawn(async move {
-        // `serve` runs until the process ends; the test task is detached.
-        let _ = md_preview::server::serve(&file, addr, true).await;
-    });
+/// then poll until the listener accepts (or time out). Returns a
+/// [`TestNonceMinter`] sharing the live daemon's auth state so the auth flow can
+/// mint a real nonce in-process — there is no HTTP nonce endpoint by design (a
+/// `GET /nonce` would let any cookieless loopback client claim a session).
+async fn spawn_daemon(
+    file: PathBuf,
+    addr: SocketAddr,
+) -> md_preview::server::TestNonceMinter {
+    // `serve_for_test` binds the listener synchronously and spawns the server
+    // future onto this runtime, returning the nonce minter immediately.
+    let minter = md_preview::server::serve_for_test(&file, addr, true)
+        .expect("daemon should bind for the test");
 
-    // Wait for liveness via /healthz so the WS connect below doesn't race the bind.
-    let client_url = format!("http://{addr}/healthz");
+    // Wait for liveness so the WS connect below doesn't race the bind.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if std::time::Instant::now() > deadline {
             panic!("daemon did not become healthy within 5s");
         }
-        // A bare TCP connect is enough to know the listener is up.
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
             // Give warp a beat to be fully ready to upgrade.
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let _ = &client_url;
-            return;
+            return minter;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -88,19 +92,89 @@ fn encode_path(p: &std::path::Path) -> String {
     out
 }
 
+/// Perform the nonce → /claim → Set-Cookie auth flow against the daemon at
+/// `addr`. The nonce is minted in-process via the [`TestNonceMinter`] (the
+/// production trust path is the uid-authenticated control socket; there is no HTTP
+/// nonce endpoint). Returns the raw `Cookie: <value>` header string.
+///
+/// Uses raw tokio TCP so we don't need an extra HTTP client dep — the payload
+/// is trivially small.
+async fn claim_session(
+    addr: SocketAddr,
+    minter: &md_preview::server::TestNonceMinter,
+) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 1. Mint a one-time nonce in-process (same store the daemon validates).
+    let nonce = minter.mint_nonce().expect("mint a test nonce");
+
+    // 2. POST /claim with nonce= and next= form body.
+    let form = format!("nonce={}&next=%2Fview%3Fpath%3D%2Ffake", nonce);
+    let req = format!(
+        "POST /claim HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        form.len(),
+        form
+    );
+    let mut conn2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+    conn2.write_all(req.as_bytes()).await.unwrap();
+    let mut buf2 = Vec::new();
+    conn2.read_to_end(&mut buf2).await.unwrap();
+    let resp2 = String::from_utf8_lossy(&buf2);
+
+    // Extract Set-Cookie: <token>; Path=…  → keep only the first segment.
+    for line in resp2.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("set-cookie:") {
+            let val = line["set-cookie:".len()..].trim();
+            // Return just the cookie name=value (before the first ";").
+            let cookie = val.split(';').next().unwrap_or(val).trim().to_string();
+            return cookie;
+        }
+    }
+    panic!("no Set-Cookie header in /claim response:\n{resp2}");
+}
+
 /// Connect a binary WebSocket client to `/collab?path=<abs>` on `addr`. `file` is
-/// the canonical absolute document path. tungstenite sets `Host: <addr>`
-/// (loopback) automatically, satisfying the daemon's host guard.
+/// the canonical absolute document path. Obtains a session cookie first via the
+/// nonce→/claim flow so the auth gate is satisfied.
 async fn connect_collab(
     addr: SocketAddr,
     file: &std::path::Path,
+    minter: &md_preview::server::TestNonceMinter,
 ) -> tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
 > {
+    let cookie = claim_session(addr, minter).await;
     let url = format!("ws://{addr}/collab?path={}", encode_path(file));
-    let (ws, _resp) = tokio_tungstenite::connect_async(url)
+    let mut req = url.as_str().into_client_request().unwrap();
+    req.headers_mut().insert(
+        "cookie",
+        cookie.parse().unwrap(),
+    );
+    let (ws, _resp) = tokio_tungstenite::connect_async(req)
         .await
         .expect("collab websocket should connect");
+    ws
+}
+
+/// Connect a text WebSocket client to `/ws?path=<abs>` on `addr` (viewer channel).
+async fn connect_viewer(
+    addr: SocketAddr,
+    file: &std::path::Path,
+    minter: &md_preview::server::TestNonceMinter,
+) -> tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+> {
+    let cookie = claim_session(addr, minter).await;
+    let url = format!("ws://{addr}/ws?path={}", encode_path(file));
+    let mut req = url.as_str().into_client_request().unwrap();
+    req.headers_mut().insert(
+        "cookie",
+        cookie.parse().unwrap(),
+    );
+    let (ws, _resp) = tokio_tungstenite::connect_async(req)
+        .await
+        .expect("/ws viewer connects");
     ws
 }
 
@@ -130,9 +204,9 @@ async fn collab_handshake_seeds_a_fresh_client() {
     let root = file.parent().unwrap().to_path_buf();
     let port = free_port();
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    spawn_daemon(file.clone(), addr).await;
+    let minter = spawn_daemon(file.clone(), addr).await;
 
-    let mut ws = connect_collab(addr, &file).await;
+    let mut ws = connect_collab(addr, &file, &minter).await;
 
     // 1. Server's SyncStep1 arrives first (we don't need to act on it here).
     let _server_step1 = next_binary(&mut ws).await;
@@ -176,11 +250,11 @@ async fn collab_edit_writes_back_without_feedback_loop() {
     let root = file.parent().unwrap().to_path_buf();
     let port = free_port();
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    spawn_daemon(file.clone(), addr).await;
+    let minter = spawn_daemon(file.clone(), addr).await;
 
     // Build a local session converged with the server, then make an edit and
     // send it as an Update frame.
-    let mut ws = connect_collab(addr, &file).await;
+    let mut ws = connect_collab(addr, &file, &minter).await;
     let _server_step1 = next_binary(&mut ws).await;
 
     // Sync up: send our SyncStep1, absorb the SyncStep2.
@@ -244,13 +318,10 @@ async fn collab_edit_still_pushes_html_to_ws_viewer() {
     let root = file.parent().unwrap().to_path_buf();
     let port = free_port();
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    spawn_daemon(file.clone(), addr).await;
+    let minter = spawn_daemon(file.clone(), addr).await;
 
     // A one-way preview viewer on /ws (text frames of rendered HTML).
-    let ws_url = format!("ws://{addr}/ws?path={}", encode_path(&file));
-    let (mut viewer, _) = tokio_tungstenite::connect_async(ws_url)
-        .await
-        .expect("/ws viewer connects");
+    let mut viewer = connect_viewer(addr, &file, &minter).await;
     // First frame is the current body (sent immediately on connect).
     let _initial = tokio::time::timeout(Duration::from_secs(3), viewer.next())
         .await
@@ -259,7 +330,7 @@ async fn collab_edit_still_pushes_html_to_ws_viewer() {
         .expect("ok");
 
     // A collab editor converges, then inserts unique marker text.
-    let mut editor = connect_collab(addr, &file).await;
+    let mut editor = connect_collab(addr, &file, &minter).await;
     let _server_step1 = next_binary(&mut editor).await;
     let mut local = YrsSession::from_text("");
     let step1 = collab::encode_sync_step1(local.state_vector());
