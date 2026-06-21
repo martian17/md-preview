@@ -68,3 +68,25 @@ fn main() {}
     assert!(page.contains("mermaid@11/dist/mermaid.esm.min.mjs"));
     assert!(page.contains("mermaid.initialize"));
 }
+
+#[test]
+#[cfg(feature = "daemon")]
+fn srcdoc_math_copy_uses_collecttext_walk_not_join() {
+    // Regression: the old implementation did `katexEls.map(extractTex).join(" ")`
+    // which dropped all prose text. The correct implementation walks the selection
+    // fragment, emitting text nodes verbatim and substituting TeX for .katex elements.
+    use md_preview::shell::render_srcdoc;
+    let srcdoc = render_srcdoc("http://127.0.0.1:8080", "http://127.0.0.1:8080", "testnonce");
+    // The walk-based collectText function must be present
+    assert!(srcdoc.contains("collectText"), "srcdoc must use collectText walk");
+    // The old prose-dropping join pattern must NOT be present
+    assert!(
+        !srcdoc.contains("parts.join"),
+        "srcdoc must NOT use prose-dropping parts.join"
+    );
+    // Must handle the anchorInKatex partial-selection path
+    assert!(
+        srcdoc.contains("anchorInKatex"),
+        "srcdoc must handle partial-formula selection"
+    );
+}

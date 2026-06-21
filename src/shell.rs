@@ -583,22 +583,54 @@ pub fn render_srcdoc(static_origin: &str, asset_origin: &str, nonce: &str) -> St
     return (el.closest(".katex-display") !== null || el.getAttribute("data-display") === "true")
       ? ("$$" + tex + "$$") : ("$" + tex + "$");
   }}
+  function collectText(node) {{
+    let out = "";
+    let hasKatex = false;
+    let allKatexExtracted = true;
+    function walk(n) {{
+      if (n.nodeType === Node.TEXT_NODE) {{
+        out += n.textContent || "";
+        return;
+      }}
+      if (n.nodeType === Node.ELEMENT_NODE && n.classList.contains("katex")) {{
+        hasKatex = true;
+        const tex = extractTex(n);
+        if (tex !== null) {{
+          out += tex;
+        }} else {{
+          allKatexExtracted = false;
+        }}
+        return;
+      }}
+      if (n.nodeType === Node.ELEMENT_NODE || n.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {{
+        for (const child of Array.from(n.childNodes)) walk(child);
+      }}
+    }}
+    walk(node);
+    if (hasKatex && !allKatexExtracted) return null;
+    return out;
+  }}
   function enableMathCopyAsTex(el) {{
     const handler = (ev) => {{
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed || !ev.clipboardData) return;
       const range = sel.getRangeAt(0);
       const frag = range.cloneContents();
-      let katexEls = Array.from(frag.querySelectorAll(".katex"));
-      if (katexEls.length === 0) {{
-        const found = findKatexEl(range.startContainer, el);
-        if (!found) return;
-        katexEls = [found];
+      const hasKatexInFrag = frag.querySelector(".katex") !== null;
+      const anchorInKatex = !hasKatexInFrag && findKatexEl(range.startContainer, el) !== null;
+      if (!hasKatexInFrag && !anchorInKatex) return;
+      if (anchorInKatex) {{
+        const katexEl = findKatexEl(range.startContainer, el);
+        const tex = extractTex(katexEl);
+        if (tex === null) return;
+        ev.preventDefault();
+        ev.clipboardData.setData("text/plain", tex);
+        return;
       }}
-      const parts = katexEls.map(extractTex).filter((t) => t !== null);
-      if (parts.length === 0) return;
+      const result = collectText(frag);
+      if (result === null) return;
       ev.preventDefault();
-      ev.clipboardData.setData("text/plain", parts.join(" "));
+      ev.clipboardData.setData("text/plain", result);
     }};
     el.addEventListener("copy", handler);
     return () => el.removeEventListener("copy", handler);
