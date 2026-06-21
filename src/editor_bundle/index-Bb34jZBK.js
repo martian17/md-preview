@@ -19134,84 +19134,6 @@ const Tl = {
   border: "#313244"
 };
 function Jf(r) {
-  return on.define([
-    { tag: g.heading1, fontWeight: "bold", fontSize: "1.6em", color: r.heading },
-    { tag: g.heading2, fontWeight: "bold", fontSize: "1.4em", color: r.heading },
-    { tag: g.heading3, fontWeight: "bold", fontSize: "1.2em", color: r.heading },
-    { tag: g.heading4, fontWeight: "bold", fontSize: "1.1em", color: r.heading },
-    { tag: g.heading5, fontWeight: "bold", color: r.heading },
-    { tag: g.heading6, fontWeight: "bold", color: r.heading },
-    { tag: g.strong, fontWeight: "bold", color: r.strong },
-    { tag: g.emphasis, fontStyle: "italic", color: r.em },
-    { tag: g.strikethrough, textDecoration: "line-through" },
-    { tag: g.link, color: r.link, textDecoration: "underline" },
-    { tag: g.url, color: r.link },
-    { tag: g.monospace, fontFamily: "monospace", color: r.code, backgroundColor: r.codeBg },
-    { tag: g.processingInstruction, color: r.meta },
-    { tag: g.comment, color: r.comment, fontStyle: "italic" },
-    { tag: g.keyword, color: r.keyword },
-    { tag: g.string, color: r.string },
-    { tag: g.number, color: r.number },
-    { tag: g.typeName, color: r.type },
-    { tag: g.operator, color: r.operator },
-    { tag: g.meta, color: r.meta },
-    { tag: g.content, color: r.fg },
-    { tag: g.quote, color: r.quote, fontStyle: "italic" },
-    { tag: g.list, color: r.fg }
-  ]);
-}
-function eu(r, e) {
-  return X.theme(
-    {
-      "&": {
-        color: r.fg,
-        backgroundColor: r.bg,
-        fontFamily: "'Georgia', 'Times New Roman', serif",
-        fontSize: "16px",
-        height: "100%"
-      },
-      ".cm-content": {
-        padding: "12px 16px",
-        caretColor: r.cursor,
-        fontFamily: "inherit"
-      },
-      ".cm-cursor": { borderLeftColor: r.cursor },
-      "&.cm-focused .cm-selectionBackground, .cm-selectionBackground": {
-        backgroundColor: r.selection
-      },
-      ".cm-activeLine": { backgroundColor: r.lineHighlight },
-      ".cm-gutters": {
-        backgroundColor: r.gutterBg,
-        color: r.gutter,
-        borderRight: `1px solid ${r.border}`
-      },
-      ".cm-lineNumbers .cm-gutterElement": { padding: "0 8px" },
-      ".cm-scroller": { overflow: "auto", fontFamily: "inherit" },
-      "&.cm-focused": { outline: `2px solid ${r.link}` },
-      ".cm-code-block": {
-        backgroundColor: r.codeBg,
-        fontFamily: "'Fira Code', 'Cascadia Code', monospace",
-        display: "block",
-        padding: "2px 4px",
-        borderRadius: "3px"
-      },
-      ".cm-fenced-code": {
-        backgroundColor: r.codeBg,
-        fontFamily: "'Fira Code', 'Cascadia Code', monospace",
-        display: "block"
-      }
-    },
-    { dark: e }
-  );
-}
-const mS = Jf(Tl), SS = Jf(Zl), tu = [
-  eu(Tl, !1),
-  oc(mS)
-], iu = [
-  eu(Zl, !0),
-  oc(SS)
-];
-function ru(r) {
   return `
 /* mycelium preview theme */
 .mycelium-preview {
@@ -19273,12 +19195,90 @@ function ru(r) {
 .mycelium-preview .hljs-type { color: ${r.type}; }
 `.trim();
 }
-function QS(r) {
-  return ru(r).replace(".mycelium-preview", ".mycelium-preview.dark");
+function mS(r) {
+  return Jf(r).replace(/\.mycelium-preview/g, ".mycelium-preview.dark");
 }
-const ZS = ru(Tl), XS = QS(Zl), nu = new ti(), su = new ti();
+const ZS = Jf(Tl), XS = mS(Zl);
+function eu(r) {
+  return on.define([
+    { tag: g.heading1, fontWeight: "bold", fontSize: "1.6em", color: r.heading },
+    { tag: g.heading2, fontWeight: "bold", fontSize: "1.4em", color: r.heading },
+    { tag: g.heading3, fontWeight: "bold", fontSize: "1.2em", color: r.heading },
+    { tag: g.heading4, fontWeight: "bold", fontSize: "1.1em", color: r.heading },
+    { tag: g.heading5, fontWeight: "bold", color: r.heading },
+    { tag: g.heading6, fontWeight: "bold", color: r.heading },
+    { tag: g.strong, fontWeight: "bold", color: r.strong },
+    { tag: g.emphasis, fontStyle: "italic", color: r.em },
+    { tag: g.strikethrough, textDecoration: "line-through" },
+    { tag: g.link, color: r.link, textDecoration: "underline" },
+    { tag: g.url, color: r.link },
+    { tag: g.monospace, fontFamily: "monospace", color: r.code, backgroundColor: r.codeBg },
+    { tag: g.processingInstruction, color: r.meta },
+    { tag: g.comment, color: r.comment, fontStyle: "italic" },
+    { tag: g.keyword, color: r.keyword },
+    { tag: g.string, color: r.string },
+    { tag: g.number, color: r.number },
+    { tag: g.typeName, color: r.type },
+    { tag: g.operator, color: r.operator },
+    { tag: g.meta, color: r.meta },
+    { tag: g.content, color: r.fg },
+    { tag: g.quote, color: r.quote, fontStyle: "italic" },
+    { tag: g.list, color: r.fg }
+  ]);
+}
+function tu(r, e) {
+  return X.theme(
+    {
+      "&": {
+        color: r.fg,
+        backgroundColor: r.bg,
+        fontFamily: "'Georgia', 'Times New Roman', serif",
+        fontSize: "16px",
+        height: "100%"
+      },
+      ".cm-content": {
+        padding: "12px 16px",
+        caretColor: r.cursor,
+        fontFamily: "inherit"
+      },
+      ".cm-cursor": { borderLeftColor: r.cursor },
+      "&.cm-focused .cm-selectionBackground, .cm-selectionBackground": {
+        backgroundColor: r.selection
+      },
+      ".cm-activeLine": { backgroundColor: r.lineHighlight },
+      ".cm-gutters": {
+        backgroundColor: r.gutterBg,
+        color: r.gutter,
+        borderRight: `1px solid ${r.border}`
+      },
+      ".cm-lineNumbers .cm-gutterElement": { padding: "0 8px" },
+      ".cm-scroller": { overflow: "auto", fontFamily: "inherit" },
+      "&.cm-focused": { outline: `2px solid ${r.link}` },
+      ".cm-code-block": {
+        backgroundColor: r.codeBg,
+        fontFamily: "'Fira Code', 'Cascadia Code', monospace",
+        display: "block",
+        padding: "2px 4px",
+        borderRadius: "3px"
+      },
+      ".cm-fenced-code": {
+        backgroundColor: r.codeBg,
+        fontFamily: "'Fira Code', 'Cascadia Code', monospace",
+        display: "block"
+      }
+    },
+    { dark: e }
+  );
+}
+const SS = eu(Tl), QS = eu(Zl), iu = [
+  tu(Tl, !1),
+  oc(SS)
+], ru = [
+  tu(Zl, !0),
+  oc(QS)
+], nu = new ti(), su = new ti();
 function yS(r, e, t) {
-  const i = e.theme === "dark" ? iu : tu, n = [
+  const i = e.theme === "dark" ? ru : iu, n = [
     Rd(),
     Mp(),
     kd(),
@@ -19301,7 +19301,7 @@ function yS(r, e, t) {
     const a = e.yText;
     (async () => {
       try {
-        const { yCollab: h } = await import("./index-DrfXmxbD.js"), c = h(a, e.awareness ?? null);
+        const { yCollab: h } = await import("./index-CqghNXUT.js"), c = h(a, e.awareness ?? null);
         o.dispatch({ effects: D.appendConfig.of(c) });
       } catch (h) {
         console.warn("y-codemirror.next not available:", h);
@@ -19368,7 +19368,7 @@ class bS {
   setTheme(e) {
     this.view.dispatch({
       effects: su.reconfigure(
-        e === "dark" ? iu : tu
+        e === "dark" ? ru : iu
       )
     });
   }
@@ -19413,11 +19413,11 @@ export {
   Re as V,
   Wi as W,
   X as a,
-  XS as b,
+  ZS as b,
   AS as c,
   iu as d,
-  tu as e,
-  ZS as m,
+  ru as m,
+  XS as n,
   CS as s
 };
-//# sourceMappingURL=index-DM7jNAaR.js.map
+//# sourceMappingURL=index-Bb34jZBK.js.map

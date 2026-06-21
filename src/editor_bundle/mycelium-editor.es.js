@@ -1,4 +1,4 @@
-import { M as m, c as a, m as r, b as c, d as i, e as l, s as o } from "./index-DM7jNAaR.js";
+import { M as m, c as a, b as r, n as c, m as i, d as l, s as o } from "./index-Bb34jZBK.js";
 import { enableMathCopyAsTex as t } from "./preview-runtime.es.js";
 export {
   m as MyceliumEditorClass,

@@ -9,8 +9,8 @@
 //! `GET /editor-bundle/<filename>` — serves one of the six allowed files:
 //!   - `yjs.es.js`              — shared yjs instance (self-contained; the importmap anchor)
 //!   - `mycelium-editor.es.js`  — the thin ESM facade
-//!   - `index-DM7jNAaR.js`     — the main CodeMirror chunk (748 KB; no yjs inlined)
-//!   - `index-DrfXmxbD.js`     — the yCollab/y-codemirror.next chunk (imports yjs via importmap)
+//!   - `index-Bb34jZBK.js`     — the main CodeMirror chunk (748 KB; no yjs inlined)
+//!   - `index-CqghNXUT.js`     — the yCollab/y-codemirror.next chunk (imports yjs via importmap)
 //!   - `preview-runtime.es.js`  — `enableMathCopyAsTex` export (1.3 KB)
 //!   - `crdt.es.js`             — offline CRDT companion (y-protocols + lib0; externalizes yjs)
 //!
@@ -53,12 +53,12 @@ static ALLOWLIST: &[(&str, &[u8])] = &[
         include_bytes!("editor_bundle/mycelium-editor.es.js"),
     ),
     (
-        "index-DM7jNAaR.js",
-        include_bytes!("editor_bundle/index-DM7jNAaR.js"),
+        "index-Bb34jZBK.js",
+        include_bytes!("editor_bundle/index-Bb34jZBK.js"),
     ),
     (
-        "index-DrfXmxbD.js",
-        include_bytes!("editor_bundle/index-DrfXmxbD.js"),
+        "index-CqghNXUT.js",
+        include_bytes!("editor_bundle/index-CqghNXUT.js"),
     ),
     (
         "preview-runtime.es.js",
@@ -153,7 +153,7 @@ mod tests {
         let bytes = lookup("mycelium-editor.es.js").unwrap();
         let text = std::str::from_utf8(bytes).expect("valid utf-8");
         // The facade imports from the sibling chunk.
-        assert!(text.contains("index-DM7jNAaR.js"), "facade must import main chunk");
+        assert!(text.contains("index-Bb34jZBK.js"), "facade must import main chunk");
     }
 
     #[test]
@@ -168,12 +168,12 @@ mod tests {
 
     #[test]
     fn ycollab_chunk_imports_yjs_as_external() {
-        let bytes = lookup("index-DrfXmxbD.js").unwrap();
+        let bytes = lookup("index-CqghNXUT.js").unwrap();
         let text = std::str::from_utf8(bytes).expect("valid utf-8");
         // The yCollab chunk must import yjs as an external bare specifier.
         // This is what the importmap resolves to the shared yjs instance.
         assert!(text.contains("from \"yjs\"") || text.contains("from 'yjs'"),
-            "index-DrfXmxbD.js must import yjs as external specifier");
+            "index-CqghNXUT.js must import yjs as external specifier");
     }
 
     #[test]

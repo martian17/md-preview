@@ -26,7 +26,7 @@
 //! mycelium-editor externalizes `'yjs'` (bare specifier) in its Vite build, and
 //! `crdt.es.js` does likewise. At runtime the importmap resolves both to the SAME
 //! URL (`/editor-bundle/yjs.es.js`), which the browser caches once. All instanceof
-//! checks across `index-DrfXmxbD.js` (yCollab chunk) and `crdt.es.js` therefore
+//! checks across `index-CqghNXUT.js` (yCollab chunk) and `crdt.es.js` therefore
 //! see the same Y class — no dual-copy problem. This is what enables true
 //! char-level CRDT (not the previous last-write-wins document bridging).
 //!
@@ -387,7 +387,7 @@ class CollabProvider {{
 
 // ── Mount mycelium-editor in CRDT mode ──────────────────────────────────
 // yText: binds y-codemirror.next directly — char-level CRDT, not LWW.
-// The yCollab extension (loaded dynamically from index-DrfXmxbD.js) receives
+// The yCollab extension (loaded dynamically from index-CqghNXUT.js) receives
 // the SAME Y.Text instance from the shared yjs (via importmap), so instanceof
 // checks pass and concurrent edits merge character-by-character.
 const editorPane = document.getElementById('editor-pane');
