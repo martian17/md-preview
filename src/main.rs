@@ -208,6 +208,7 @@ fn main() {
     let req = md_preview::control::Request::Open {
         path: abs.to_string_lossy().into_owned(),
         root,
+        want_edit: edit_mode,
     };
 
     let handle = match connect_or_spawn_daemon(edit_mode) {

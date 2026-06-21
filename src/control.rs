@@ -67,6 +67,12 @@ pub enum Request {
         path: String,
         /// The registered root the path is expected to live under.
         root: String,
+        /// Whether the client wants to open the collaborative editor (`--edit`
+        /// flag on the CLI). When `true` the daemon's `Opened.url` points to
+        /// `/edit?path=…`; when `false` (or absent — older clients) it points
+        /// to `/view?path=…`. Ignored if the daemon is not in edit mode.
+        #[serde(default)]
+        want_edit: bool,
     },
     /// Liveness probe — used by [`bind_or_detect`] to confirm a peer that owns
     /// the socket is actually a live daemon.
@@ -534,6 +540,7 @@ mod tests {
         let req = Request::Open {
             path: "/proj/README.md".into(),
             root: "/proj".into(),
+            want_edit: false,
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(line.contains("\"type\":\"Open\""));
@@ -685,6 +692,7 @@ mod tests {
             .send_request_blocking(&Request::Open {
                 path: "/p/a.md".into(),
                 root: "/p".into(),
+                want_edit: false,
             })
             .unwrap();
         assert_eq!(

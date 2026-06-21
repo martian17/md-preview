@@ -71,7 +71,7 @@ fn process_reuse_same_daemon_same_port() {
                                     version: md_preview::control::build_version().to_string(),
                                     edit_mode: false,
                                 },
-                                Request::Open { path, root: _ } => {
+                                Request::Open { path, root: _, want_edit: _ } => {
                                     let n = nc.fetch_add(1, Ordering::SeqCst);
                                     let nonce = format!("nonce-{n}");
                                     let url =
@@ -100,6 +100,7 @@ fn process_reuse_same_daemon_same_port() {
             .send_request_blocking(&Request::Open {
                 path: "/tmp/a.md".into(),
                 root: "/tmp".into(),
+                want_edit: false,
             })
             .expect("first Open round-trip");
 
@@ -115,6 +116,7 @@ fn process_reuse_same_daemon_same_port() {
             .send_request_blocking(&Request::Open {
                 path: "/tmp/b.md".into(),
                 root: "/tmp".into(),
+                want_edit: false,
             })
             .expect("second Open round-trip");
 

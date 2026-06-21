@@ -2428,7 +2428,7 @@ fn handle_control_request(
                 edit_mode,
             }
         }
-        Request::Open { path, root } => {
+        Request::Open { path, root, want_edit } => {
             // Register the root in the multi-root registry.
             let root_path = std::path::Path::new(&root);
             let file_path = std::path::Path::new(&path);
@@ -2451,8 +2451,10 @@ fn handle_control_request(
                     }
                 }
             };
-            // Build the view URL: the absolute path, encoded, on the daemon's
-            // HTTP address.
+            // Build the landing URL: the absolute path, encoded, on the daemon's
+            // HTTP address. The landing page is determined by the CLIENT's intent
+            // (`want_edit` from the CLI's `--edit` flag), but only if the daemon
+            // actually supports edit mode — a read-only daemon cannot serve /edit.
             let abs_path = if file_path.is_absolute() {
                 file_path.to_path_buf()
             } else {
@@ -2466,7 +2468,8 @@ fn handle_control_request(
                 }
             };
             let encoded = encode_query_value(&abs_path.to_string_lossy());
-            let url = format!("http://{http_addr}/view?path={encoded}");
+            let page = if want_edit && edit_mode { "edit" } else { "view" };
+            let url = format!("http://{http_addr}/{page}?path={encoded}");
             Response::Opened { url, nonce }
         }
     }
@@ -3879,6 +3882,118 @@ mod tests {
             view_resp.status(),
             warp::http::StatusCode::OK,
             "GET /view with valid session cookie must be 200 (was 401 before the SameSite=Lax fix)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test for the `--edit` auth flow.
+    ///
+    /// `handle_control_request` previously always returned `/view?path=…` even in
+    /// edit mode, so the bootstrap PRG flow landed on `/edit` only by accident (it
+    /// didn't). The nonce was consumed and the session cookie issued, but since the
+    /// browser was redirected to `/view` (not `/edit`) the user saw the read-only
+    /// shell instead of the editor.
+    ///
+    /// This test drives the full `--edit` bootstrap:
+    /// 1. `handle_control_request(…, edit_mode=true)` must return `/edit?path=…`.
+    /// 2. `GET /edit` with the cookie issued by the resulting `/claim` call → 200.
+    /// 3. Without the cookie, `/edit` still → 401 (P0 must remain closed).
+    #[tokio::test]
+    async fn edit_flow_opens_edit_page_and_authorizes() {
+        let dir = temp_dir("reg-edit-flow");
+        let pub_abs = write_mode(&dir, "doc.md", "# hello", 0o644);
+        let state = Arc::new(state_for(&dir));
+        state.set_static_base("http://127.0.0.1:8081".to_string());
+        let filter = routes(Arc::clone(&state), true /* edit_mode */);
+
+        // Simulate the CLI: call handle_control_request in edit_mode=true.
+        let http_addr: std::net::SocketAddr = "127.0.0.1:7878".parse().unwrap();
+        let resp = handle_control_request(
+            &state,
+            crate::control::Request::Open {
+                path: pub_abs.clone(),
+                root: dir.to_string_lossy().into_owned(),
+                want_edit: true,
+            },
+            http_addr,
+            true, /* edit_mode */
+        );
+        let (url, nonce) = match resp {
+            crate::control::Response::Opened { url, nonce } => (url, nonce),
+            other => panic!("expected Opened, got {other:?}"),
+        };
+
+        // The URL must point to /edit, not /view.
+        assert!(
+            url.contains("/edit?path="),
+            "--edit: handle_control_request must return /edit?path=…, got {url}"
+        );
+        // The path-only portion (the `next` field in the bootstrap form).
+        let next_path = url
+            .strip_prefix("http://127.0.0.1:7878")
+            .expect("expected loopback URL");
+
+        // POST /claim with the nonce (simulates the bootstrap form submit).
+        let claim_resp = warp::test::request()
+            .method("POST")
+            .path("/claim")
+            .header("host", "127.0.0.1:7878")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(format!("nonce={nonce}&next={next_path}"))
+            .reply(&filter)
+            .await;
+        assert_eq!(
+            claim_resp.status(),
+            warp::http::StatusCode::FOUND,
+            "/claim with valid nonce in --edit flow must 302"
+        );
+        let location = claim_resp
+            .headers()
+            .get("location")
+            .expect("Location header")
+            .to_str()
+            .unwrap();
+        assert!(
+            location.contains("/edit?path="),
+            "/claim must redirect to /edit?path=… in edit flow, got {location}"
+        );
+
+        // Extract the session cookie from the Set-Cookie header.
+        let set_cookie = claim_resp
+            .headers()
+            .get("set-cookie")
+            .expect("Set-Cookie header present")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let cookie_pair = set_cookie.split(';').next().unwrap().trim().to_string();
+
+        // GET /edit carrying the just-issued cookie → 200.
+        let edit_resp = warp::test::request()
+            .method("GET")
+            .path(next_path)
+            .header("host", "127.0.0.1:7878")
+            .header("cookie", &cookie_pair)
+            .reply(&filter)
+            .await;
+        assert_eq!(
+            edit_resp.status(),
+            warp::http::StatusCode::OK,
+            "GET /edit with valid session cookie must be 200 in --edit flow"
+        );
+
+        // Without the cookie → still 401 (P0 bypass must stay closed).
+        let no_cookie = warp::test::request()
+            .method("GET")
+            .path(next_path)
+            .header("host", "127.0.0.1:7878")
+            .reply(&filter)
+            .await;
+        assert_eq!(
+            no_cookie.status(),
+            warp::http::StatusCode::UNAUTHORIZED,
+            "GET /edit without cookie must still be 401 (P0 bypass must remain closed)"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
