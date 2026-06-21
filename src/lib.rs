@@ -1,7 +1,7 @@
 //! md-preview: the binary/daemon crate.
 //!
 //! The pure Markdown → HTML rendering surface now lives in the standalone
-//! [`md_render`] crate (`crates/md-render`); it is re-exported here so existing
+//! [`mycelium_render`] crate (`crates/mycelium-render`); it is re-exported here so existing
 //! `md_preview::render_page`-style call sites (the `md` binary, the daemon,
 //! integration tests) keep compiling unchanged. This crate adds the document
 //! model (CRDT) and the feature-gated live-preview daemon on top.
@@ -10,7 +10,7 @@
 // `crate::render_page_with`, etc. resolve exactly as before the crate split.
 // The renderer carries ZERO web/async/CRDT deps, so `--no-default-features`
 // builds still drop the entire daemon stack.
-pub use md_render::{
+pub use mycelium_render::{
     render_editor_page, render_markdown, render_mermaid_block, render_page, render_page_with,
 };
 
@@ -33,7 +33,7 @@ pub mod server;
 // Web-free filesystem-confinement kernel (ADR-0008 Phase 2): the multi-root
 // registry (`roots`) and the single hardened confinement funnel (`confine`) now
 // live in the standalone `fs-confine` crate (`crates/fs-confine`), an
-// independent DAG leaf with no edge to doc-core/md-render. Re-exported here as
+// independent DAG leaf with no edge to doc-core/mycelium-render. Re-exported here as
 // `md_preview::{roots, confine}` so existing call sites (`crate::roots::…`,
 // `crate::confine::confine_read`, the daemon, tests) resolve exactly as before
 // the split. fs-confine carries std + libc only — ZERO web deps — so

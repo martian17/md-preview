@@ -841,7 +841,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "libc",
- "md-render",
+ "mycelium-render",
  "serde",
  "serde_json",
  "sha2",
@@ -852,15 +852,6 @@ dependencies = [
  "ureq",
  "warp",
  "webbrowser",
-]
-
-[[package]]
-name = "md-render"
-version = "0.1.0"
-source = "git+https://github.com/hibiki-automatic/md-render?rev=b924996d0235c24d38df61f18565f9ef4e8850e0#b924996d0235c24d38df61f18565f9ef4e8850e0"
-dependencies = [
- "pulldown-cmark",
- "syntect",
 ]
 
 [[package]]
@@ -923,6 +914,15 @@ dependencies = [
  "mime",
  "spin",
  "version_check",
+]
+
+[[package]]
+name = "mycelium-render"
+version = "0.1.0"
+source = "git+https://github.com/hibiki-automatic/mycelium-render?rev=e1e90f999baf5c009ec1d21d3f403dd600147435#e1e90f999baf5c009ec1d21d3f403dd600147435"
+dependencies = [
+ "pulldown-cmark",
+ "syntect",
 ]
 
 [[package]]
