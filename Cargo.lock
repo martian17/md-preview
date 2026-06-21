@@ -241,7 +241,7 @@ dependencies = [
 [[package]]
 name = "doc-core"
 version = "0.1.0"
-source = "git+ssh://git@github.com/hibiki-automatic/doc-core.git?rev=1501e20e0903c9d8d88fe375902e3adccafacc63#1501e20e0903c9d8d88fe375902e3adccafacc63"
+source = "git+ssh://git@github.com/hibiki-automatic/doc-core.git?rev=7bcab5e1b5ba5314123894da73b730fdd58c4074#7bcab5e1b5ba5314123894da73b730fdd58c4074"
 dependencies = [
  "base64 0.22.1",
  "notify",
@@ -338,7 +338,7 @@ dependencies = [
 [[package]]
 name = "fs-confine"
 version = "0.1.0"
-source = "git+ssh://git@github.com/hibiki-automatic/fs-confine.git?rev=01eaa35bff8cb5f6fe999622595a02f8611947c6#01eaa35bff8cb5f6fe999622595a02f8611947c6"
+source = "git+ssh://git@github.com/hibiki-automatic/fs-confine.git?rev=97775f25837d2f0afe176ffdb75287d2afd8e4ae#97775f25837d2f0afe176ffdb75287d2afd8e4ae"
 dependencies = [
  "libc",
 ]
@@ -919,7 +919,7 @@ dependencies = [
 [[package]]
 name = "mycelium-render"
 version = "0.1.0"
-source = "git+ssh://git@github.com/hibiki-automatic/mycelium-render.git?rev=e1e90f999baf5c009ec1d21d3f403dd600147435#e1e90f999baf5c009ec1d21d3f403dd600147435"
+source = "git+ssh://git@github.com/hibiki-automatic/mycelium-render.git?rev=9022198d4a9291fee6b0a9a37c033044d7d5ae99#9022198d4a9291fee6b0a9a37c033044d7d5ae99"
 dependencies = [
  "pulldown-cmark",
  "syntect",

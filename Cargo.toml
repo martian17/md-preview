@@ -1,5 +1,5 @@
 # Workspace root. The three split leaf crates (md-render, doc-core, fs-confine)
-# are now CANONICAL standalone PUBLIC repos under the `hibiki-automatic` org and
+# are now CANONICAL standalone repos under the `hibiki-automatic` org and
 # are consumed as pinned git dependencies below — they are no longer built
 # in-workspace (see ADR-0008 / ADR-0011: this supersedes the in-repo-workspace
 # crate-split step). This `md-preview` package is the binary/daemon crate.
@@ -52,16 +52,16 @@ yrs-weak = ["doc-core/yrs-weak"]
 yrs-v2-collab = ["doc-core/yrs-v2-collab"]
 
 [dependencies]
-# Pure Markdown renderer, now its own canonical public repo. Re-exported
+# Pure Markdown renderer, now its own canonical repo. Re-exported
 # from `lib.rs`; carries no web/async/CRDT deps (pulldown-cmark + syntect live
 # there now), so `--no-default-features` still drops the whole daemon stack.
-mycelium-render = { git = "ssh://git@github.com/hibiki-automatic/mycelium-render.git", rev = "e1e90f999baf5c009ec1d21d3f403dd600147435" }
+mycelium-render = { git = "ssh://git@github.com/hibiki-automatic/mycelium-render.git", rev = "9022198d4a9291fee6b0a9a37c033044d7d5ae99" }
 # Web-free document/CRDT kernel (ADR-0008 Phase 1): the CRDT doc model, diff,
 # session + UB validator, the pure collab wire codec, and the `FilePeer` bridge.
 # Carries yrs/similar/notify but ZERO web/async deps, so `--no-default-features`
 # still drops the whole daemon stack. The `watch` feature (notify filewatcher) is
 # on by default — md-preview's watch thread uses `FilePeer::watch`.
-doc-core = { git = "ssh://git@github.com/hibiki-automatic/doc-core.git", rev = "1501e20e0903c9d8d88fe375902e3adccafacc63" }
+doc-core = { git = "ssh://git@github.com/hibiki-automatic/doc-core.git", rev = "7bcab5e1b5ba5314123894da73b730fdd58c4074" }
 # Web-free filesystem-confinement kernel (ADR-0008 Phase 2): the multi-root
 # registry + the single hardened confinement funnel (canonicalize + O_NOFOLLOW +
 # fstat on a held fd, dirfd-relative atomic save, sensitive-path denylist).
@@ -69,7 +69,7 @@ doc-core = { git = "ssh://git@github.com/hibiki-automatic/doc-core.git", rev = "
 # so `cargo tree -p fs-confine -e normal` shows no web/kernel crates. Re-exported
 # as `md_preview::{roots, confine}`. Daemon-gated (optional) — the funnel was a
 # daemon-only module, so `--no-default-features` still drops it with the web stack.
-fs-confine = { git = "ssh://git@github.com/hibiki-automatic/fs-confine.git", rev = "01eaa35bff8cb5f6fe999622595a02f8611947c6", optional = true }
+fs-confine = { git = "ssh://git@github.com/hibiki-automatic/fs-confine.git", rev = "97775f25837d2f0afe176ffdb75287d2afd8e4ae", optional = true }
 
 # Daemon-only (optional): the async server stack. Picked per ADR-0003 so
 # `yrs-warp` (y-sync + awareness) drops in for Phase 3.
