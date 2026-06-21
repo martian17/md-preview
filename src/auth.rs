@@ -670,11 +670,22 @@ pub const SESSION_COOKIE_NAME: &str = "mdp_session";
 
 /// Build a `Set-Cookie` header value carrying the session `token`.
 ///
-/// Always emits `HttpOnly`, `SameSite=Strict`, `Path=/`. The `secure`
+/// Always emits `HttpOnly`, `SameSite=Lax`, `Path=/`. The `secure`
 /// parameter controls the `Secure` attribute:
 /// - `false` today (loopback `http://` — `Secure` would prevent the cookie from
 ///   ever being sent over plain http);
 /// - `true` for a future `https`/WAN exposure.
+///
+/// `SameSite=Lax` (not Strict) is deliberate: the browser bootstrap is a
+/// `file://` page (opaque/null origin = cross-site to 127.0.0.1). After
+/// POST `/claim` sets the cookie and 302-redirects to GET `/view`, the
+/// browser treats the chain as cross-site-initiated. A `Strict` cookie is
+/// NOT sent on the resulting top-level navigation (the redirect landing),
+/// so every `/view` request would return 401. `Lax` IS sent on top-level
+/// navigations while still being withheld from cross-site subrequests
+/// (fetch/iframe/form), which is the correct threat model here. The
+/// cookieless-bypass protection is independent: it lives in `require_session`
+/// and cannot be opened by the SameSite attribute.
 ///
 /// The option is deliberately a parameter (not hardcoded) so the WAN path is a
 /// one-line caller change rather than a code edit here. An optional `max_age`
@@ -683,7 +694,7 @@ pub const SESSION_COOKIE_NAME: &str = "mdp_session";
 #[must_use]
 pub fn build_set_cookie(token: &str, secure: bool, max_age: Option<u64>) -> String {
     let mut s = format!(
-        "{name}={token}; HttpOnly; SameSite=Strict; Path=/",
+        "{name}={token}; HttpOnly; SameSite=Lax; Path=/",
         name = SESSION_COOKIE_NAME,
     );
     if secure {
@@ -701,7 +712,7 @@ pub fn build_set_cookie(token: &str, secure: bool, max_age: Option<u64>) -> Stri
 #[must_use]
 pub fn build_clear_cookie(secure: bool) -> String {
     let mut s = format!(
-        "{name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",
+        "{name}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0",
         name = SESSION_COOKIE_NAME,
     );
     if secure {
@@ -1104,7 +1115,10 @@ mod tests {
         let c = build_set_cookie("tok123", false, None);
         assert!(c.starts_with("mdp_session=tok123"));
         assert!(c.contains("HttpOnly"));
-        assert!(c.contains("SameSite=Strict"));
+        // SameSite=Lax (not Strict): Strict is not sent on cross-site-initiated
+        // top-level navigations (e.g. file:// → /claim 302 → GET /view).
+        assert!(c.contains("SameSite=Lax"));
+        assert!(!c.contains("SameSite=Strict"), "Strict breaks the file:// bootstrap PRG flow");
         assert!(c.contains("Path=/"));
         assert!(!c.contains("Secure"), "loopback cookie must not be Secure");
         assert!(!c.contains("Max-Age"));

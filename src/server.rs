@@ -833,8 +833,10 @@ const SHELL_COEP_HEADER: (&str, &str) = ("cross-origin-embedder-policy", crate::
 ///
 /// Only the network guard runs here: the shell serves NO file bytes (the floor
 /// is enforced by `/content`/`/ws`, which the shell fetches same-origin carrying
-/// the cookie — which is what makes `SameSite=Strict` work post-bootstrap). The
-/// `?path=` is consumed entirely client-side by the shell bootstrap.
+/// the cookie). The `?path=` is consumed entirely client-side by the shell
+/// bootstrap. The session cookie is `SameSite=Lax` so it is sent on the
+/// top-level navigation landing from the `/claim` 302 redirect (which is
+/// cross-site-initiated from the `file://` bootstrap page).
 fn view_page(state: &AppState, ctx: &ReqContext) -> warp::reply::Response {
     use warp::reply::Reply;
 
@@ -2800,7 +2802,11 @@ mod tests {
             .to_string();
         assert!(set_cookie.contains("mdp_session="));
         assert!(set_cookie.contains("HttpOnly"));
-        assert!(set_cookie.contains("SameSite=Strict"));
+        // SameSite=Lax: Strict breaks the file:// bootstrap PRG flow (the
+        // browser won't send a Strict cookie on the cross-site-initiated redirect
+        // landing from file:// → /claim(302) → GET /view).
+        assert!(set_cookie.contains("SameSite=Lax"));
+        assert!(!set_cookie.contains("SameSite=Strict"));
         assert!(set_cookie.contains("Path=/"));
         assert!(!set_cookie.contains("Secure"), "loopback cookie not Secure");
 
@@ -3770,6 +3776,110 @@ mod tests {
             .await;
         assert_eq!(save_bad.status(), warp::http::StatusCode::UNAUTHORIZED);
         assert_eq!(std::fs::read_to_string(&pub_abs).unwrap(), "# pub");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression test for the SameSite=Strict → SameSite=Lax fix.
+    ///
+    /// Drive the full file:// bootstrap flow through the real `routes()` filter:
+    /// mint a nonce → POST /claim → extract the Set-Cookie → GET /view carrying
+    /// that cookie → 200. Without the Lax fix this would 401 because the browser
+    /// (and this test, which simulates it) only sends the cookie when explicitly
+    /// presented — the regression was that the Strict attribute caused browsers
+    /// to withhold the cookie on the cross-site-initiated redirect landing.
+    ///
+    /// Also re-asserts that cookieless and invalid-cookie requests are still 401
+    /// (the P0 bypass must remain closed).
+    #[tokio::test]
+    async fn claim_cookie_to_view_full_route_flow_works() {
+        let dir = temp_dir("reg-samesite-lax");
+        let state = Arc::new(state_for(&dir));
+        state.set_static_base("http://127.0.0.1:8081".to_string());
+        let filter = routes(Arc::clone(&state), true);
+
+        // Still rejected without a cookie (P0 must remain closed).
+        let no_cookie = warp::test::request()
+            .method("GET")
+            .path("/view")
+            .header("host", "127.0.0.1:7878")
+            .reply(&filter)
+            .await;
+        assert_eq!(
+            no_cookie.status(),
+            warp::http::StatusCode::UNAUTHORIZED,
+            "cookieless /view must still be 401 (P0 bypass must remain closed)"
+        );
+
+        // Still rejected with an invalid cookie (P0 must remain closed).
+        let bad_cookie = warp::test::request()
+            .method("GET")
+            .path("/view")
+            .header("host", "127.0.0.1:7878")
+            .header("cookie", "mdp_session=invalid-garbage-token")
+            .reply(&filter)
+            .await;
+        assert_eq!(
+            bad_cookie.status(),
+            warp::http::StatusCode::UNAUTHORIZED,
+            "invalid-cookie /view must still be 401 (P0 bypass must remain closed)"
+        );
+
+        // Mint a nonce (normally done by the control plane / CLI).
+        let nonce = mint_claim_nonce(&state).expect("mint nonce");
+
+        // POST /claim with the nonce → 302 + Set-Cookie.
+        // Nonce tokens are URL-safe-no-pad (alphanumeric/-/_) so no encoding needed.
+        let claim_resp = warp::test::request()
+            .method("POST")
+            .path("/claim")
+            .header("host", "127.0.0.1:7878")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(format!("nonce={nonce}&next=/view"))
+            .reply(&filter)
+            .await;
+        assert_eq!(
+            claim_resp.status(),
+            warp::http::StatusCode::FOUND,
+            "/claim with valid nonce must 302"
+        );
+        let set_cookie = claim_resp
+            .headers()
+            .get("set-cookie")
+            .expect("Set-Cookie header present after /claim")
+            .to_str()
+            .unwrap()
+            .to_string();
+        // The cookie must be SameSite=Lax (the regression fix).
+        assert!(
+            set_cookie.contains("SameSite=Lax"),
+            "cookie must be SameSite=Lax so the PRG redirect landing sends it: {set_cookie}"
+        );
+        assert!(
+            !set_cookie.contains("SameSite=Strict"),
+            "SameSite=Strict breaks the file:// bootstrap PRG flow"
+        );
+        assert!(
+            !set_cookie.contains("Secure"),
+            "loopback http cookie must not be Secure"
+        );
+
+        // Extract the bare name=value pair to simulate the browser echoing it back.
+        let cookie_pair = set_cookie.split(';').next().unwrap().trim().to_string();
+
+        // GET /view carrying the just-issued cookie → 200 (the shell page).
+        let view_resp = warp::test::request()
+            .method("GET")
+            .path("/view")
+            .header("host", "127.0.0.1:7878")
+            .header("cookie", &cookie_pair)
+            .reply(&filter)
+            .await;
+        assert_eq!(
+            view_resp.status(),
+            warp::http::StatusCode::OK,
+            "GET /view with valid session cookie must be 200 (was 401 before the SameSite=Lax fix)"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
